@@ -1,0 +1,18 @@
+# Dedicated build container for Warden. Nothing is ever compiled on the
+# host: this image has the Rust toolchain, the host does not. Based on
+# RockyLinux 9 deliberately - it has the oldest glibc (2.34) among the
+# distros in our test matrix (Debian/Ubuntu/Fedora/Rocky/Alma/Arch/openSUSE
+# Tumbleweed all ship >= 2.34), so a binary built here stays forward
+# compatible with the newer-glibc distros without needing a fully static
+# musl build.
+FROM rockylinux:9
+
+RUN dnf install -y --allowerasing gcc pkgconf-pkg-config make curl git && dnf clean all
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /build

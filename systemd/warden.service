@@ -1,0 +1,39 @@
+[Unit]
+Description=Warden autonomous EDR agent for Linux workstations
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/warden --config /etc/warden/config.toml
+Restart=on-failure
+RestartSec=2
+NotifyAccess=main
+
+# Warden needs CAP_SYS_ADMIN for fanotify (filesystem-wide marks), CAP_KILL
+# to neutralize offending processes in Enforce mode, and CAP_DAC_OVERRIDE
+# to actually read/traverse the target user's $HOME - which on every
+# mainstream distro's default (`useradd -m` -> 0700) is not world-readable,
+# so plain root without this capability gets EACCES on the very directories
+# it's supposed to protect (caught by testing against a real 0700 $HOME in
+# a container, not assumed). Everything else root would normally have is
+# dropped from the process's capability set entirely, not just left unused
+# - so even a full compromise of the agent can't leverage capabilities like
+# CAP_SYS_PTRACE or CAP_NET_ADMIN that root implicitly has but this daemon
+# never needs.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+ProtectSystem=strict
+# Only the config directory is writable from the base unit. The install
+# script computes the rest (quarantine dir, the target user's watched
+# directories - honeypot files are created there) from the actual config
+# and adds them via a /etc/systemd/system/warden.service.d/ drop-in rather
+# than editing this file - if you install by hand instead, add your own
+# ReadWritePaths= drop-in or the agent will fail to quarantine files and
+# provision honeypots. Connecting to the target user's D-Bus session socket
+# under /run/user/<uid>/bus needs no extra write access: ProtectSystem=strict
+# only blocks writes, and connecting to an existing socket isn't one.
+ReadWritePaths=/etc/warden
+
+[Install]
+WantedBy=multi-user.target

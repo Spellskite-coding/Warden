@@ -1,0 +1,31 @@
+# Warden agent configuration.
+# Copy to /etc/warden/config.toml and adjust - see install.sh, which
+# generates this automatically for the user it's run for.
+
+# "monitor": log and desktop-notify only, nothing is touched.
+# "enforce": also kill the offending process and quarantine files it wrote.
+# Start in monitor mode, review real activity for a while, then switch.
+mode = "monitor"
+
+# Username of the desktop user Warden protects (its $HOME is watched) and
+# notifies (desktop popups land in this user's session). Warden itself
+# always runs as root.
+target_user = "changeme"
+
+[ransomware]
+# Left unset, defaults to the existing subdirectories among Documents,
+# Desktop, Downloads, Pictures, Videos, Music under target_user's $HOME.
+# watch_dirs = ["~/Documents", "~/code"]
+
+# entropy_threshold = 7.5
+# burst_file_count = 15
+# burst_window_secs = 10
+# require_directory_baseline = true
+
+# Executables exempt from the burst/entropy heuristic (e.g. a disk backup
+# tool that legitimately rewrites many files as compressed/encrypted
+# archives). Anchored on path + SHA-256, so replacing the binary revokes
+# trust automatically.
+# [[ransomware.trusted_executables]]
+# path = "/usr/bin/restic"
+# sha256 = "..."

@@ -1,0 +1,18 @@
+# Minimal smoke-test image: runs the already-built warden binary directly
+# (no systemd/PID1 dance yet - that comes with the full multi-distro test
+# matrix later). Purpose: confirm the agent starts, resolves the target
+# user, marks the filesystem, and reacts to a simulated ransomware burst -
+# all inside a disposable container, never on the host.
+FROM debian:stable-slim
+
+RUN useradd -m -u 1500 tester \
+    && mkdir -p /home/tester/Documents /home/tester/Desktop \
+    && echo "just a normal text document, nothing suspicious here" > /home/tester/Documents/notes.txt \
+    && echo "another ordinary plaintext file" > /home/tester/Documents/todo.txt \
+    && chown -R tester:tester /home/tester
+
+COPY target/release/warden /usr/local/bin/warden
+COPY docker/test-config.toml /etc/warden/config.toml
+RUN mkdir -p /var/lib/warden/quarantine
+
+CMD ["/usr/local/bin/warden", "--config", "/etc/warden/config.toml", "--verbose"]

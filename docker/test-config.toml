@@ -1,0 +1,7 @@
+mode = "monitor"
+target_user = "tester"
+
+[ransomware]
+burst_file_count = 5
+burst_window_secs = 10
+entropy_threshold = 7.5
