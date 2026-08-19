@@ -1,0 +1,40 @@
+# Build container for the future eBPF-based modules (exec/network/privesc
+# via aya). Separate from Dockerfile.build (the RockyLinux/glibc-2.34
+# container used for the regular userspace agent) because this one needs a
+# nightly Rust toolchain, rust-src, and a specific LLVM version matching
+# what bpf-linker links against - a heavier, more fragile toolchain that
+# has no business being a dependency of the everyday userspace build.
+FROM debian:bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg lsb-release software-properties-common build-essential pkg-config \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# bpf-linker must link against the exact LLVM major version the active
+# Rust nightly's rustc is itself built against (rustc emits LLVM bitcode in
+# its own bundled LLVM's format; a mismatched bpf-linker fails with cryptic
+# "ERROR llvm: Invalid record" bitcode-parsing errors, found by testing
+# LLVM 21 against a nightly whose `rustc --version --verbose` reported
+# "LLVM version: 23.1.0" - check that before assuming this pinned version
+# still matches whatever nightly channel install picks up later). Debian
+# bookworm's own apt repos only go up to LLVM 16, so apt.llvm.org's
+# installer script is used to get a current one.
+RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh 23 \
+    && apt-get install -y --no-install-recommends libpolly-23-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/lib/llvm-23/bin:$PATH \
+    LLVM_SYS_231_PREFIX=/usr/lib/llvm-23
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+    && rustup toolchain install nightly --profile minimal --component rust-src \
+    && rustup component add rust-src --toolchain nightly
+
+RUN cargo install bpf-linker --no-default-features --features llvm-23
+
+WORKDIR /build

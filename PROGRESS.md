@@ -179,15 +179,88 @@ Testé dans `docker/Dockerfile.test.debian` (conteneur Debian, utilisateur
 diff persistence) : OK. `cargo clippy --all-targets` sur tout le workspace :
 propre, 0 warning après corrections.
 
-## Ce qui n'est PAS fait
+## Toolchain eBPF — validé de bout en bout (docker/Dockerfile.build-ebpf)
 
-- **eBPF (exec/network/ptrace/privesc) via `aya`** : toolchain pas encore
-  installé. Le blocage constaté était côté HÔTE (pas de rustup) — ça ne
-  bloque PAS dans un conteneur Docker dédié. Prochaine étape en cours ou à
-  reprendre : `docker/Dockerfile.build-ebpf` avec rustup + nightly +
-  `bpf-linker` (`cargo install bpf-linker`) + `aya-tool`, puis une probe
-  minimale (tracepoint `sched_process_exec`) pour valider le pipeline
-  avant de construire un vrai module réseau/exec/privesc dessus.
+Le blocage initial était côté HÔTE uniquement (pas de rustup) ; aucun
+blocage réel dans un conteneur Docker dédié. Toolchain fonctionnel construit
+et **validé par un chargement réel dans le kernel**, pas juste compilé :
+
+- Base Debian bookworm, LLVM 23 installé via `apt.llvm.org` (script `llvm.sh
+  23`), rustup avec toolchain stable (pour `bpf-linker`) + nightly +
+  `rust-src` (pour compiler la cible `bpfel-unknown-none` via `-Z
+  build-std=core`), `cargo install bpf-linker --no-default-features
+  --features llvm-23`.
+- **Piège découvert par test, pas évident à l'avance** : `bpf-linker` doit
+  être lié contre la MÊME version majeure de LLVM que celle embarquée dans
+  le rustc nightly actif (`rustup run nightly rustc --version --verbose` →
+  `LLVM version: 23.1.0`), sinon erreur cryptique `ERROR llvm: Invalid
+  record` au link. Comme les toolchains nightly changent de version LLVM
+  interne au fil du temps, **revérifier cette correspondance avant de
+  réutiliser cette image après une longue pause** (voir section
+  "Maintenance" plus bas).
+- **Piège Docker découvert par test** : ne jamais monter les volumes
+  `warden-cargo-home`/`warden-rustup-home` (ceux du conteneur RockyLinux
+  stable) sur le conteneur `warden-build:ebpf` — ça masque le nightly +
+  bpf-linker installés dans l'image avec un volume vide d'un autre
+  toolchain. Pour ce conteneur, monter uniquement `warden-cargo-registry`
+  (cache de paquets, sans rapport avec le toolchain, sans risque).
+- Crates : `aya` 0.14.0 / `aya-ebpf` 0.2.1 / `aya-build` 0.2.0 (gère la
+  compilation croisée de la crate eBPF via `build.rs`, voir
+  `ebpf-probe/warden-exec/build.rs`).
+- **`aya-log`/`aya-log-ebpf` (0.3.0/0.2.0) cassent le chargement** :
+  `BPF_PROG_LOAD` échoue avec `fd 10 is not pointing to valid bpf_map`
+  (vérifié par test, pas juste supposé). Contournement adopté pour la
+  probe de validation : pas de `aya-log`, une simple map `Array<u64>`
+  incrémentée côté kernel et lue en polling côté userspace. Marche
+  parfaitement. À creuser avant d'utiliser `aya-log` dans un vrai module
+  (bug de version, ou map créée dans le mauvais ordre - pas encore
+  diagnostiqué).
+- **Probe de preuve de concept** : `ebpf-probe/` (workspace séparé, PAS
+  encore intégré au workspace principal de warden) - `warden-exec-ebpf`
+  (programme kernel, tracepoint `sched:sched_process_exec`, incrémente un
+  compteur) + `warden-exec` (loader userspace, charge/attache/poll le
+  compteur). **Testé en conditions réelles** : chargé dans un conteneur
+  `--privileged` avec `/sys/kernel/debug` et `/sys/kernel/tracing` montés,
+  le compteur a suivi en temps réel de vrais événements exec déclenchés
+  depuis CE conteneur ET depuis un conteneur Docker totalement séparé
+  (`alpine`, `docker run --rm`) - preuve que la probe voit tout le kernel
+  hôte, pas juste son propre cgroup, exactement le comportement attendu
+  d'eBPF (kernel partagé entre conteneurs).
+- Capacités utilisées pour le test : `--privileged` (large, pour aller
+  vite). Pas encore réduit à l'ensemble minimal réel (`CAP_BPF` +
+  `CAP_PERFMON` + accès tracefs probablement suffisant sur kernel 5.8+) -
+  à déterminer avant d'écrire l'unit systemd du futur module exec.
+- Prochaine étape logique : intégrer un vrai module `warden-exec` dans le
+  workspace principal (pas juste `ebpf-probe/`), lisant le nom du
+  fichier exécuté depuis le tracepoint + `/proc/<pid>/cmdline` /
+  `/proc/<pid>/exe` côté userspace pour le contexte complet (le tracepoint
+  `sched_process_exec` seul ne donne pas les arguments complets), branché
+  sur le même pipeline `DetectionEvent`/dispatcher que ransomware et
+  persistence. Utile immédiatement pour la détection fileless (exec depuis
+  `/tmp`, `~/Downloads`, `/dev/shm`) et une brique de détection privesc.
+
+## Maintenance et mises à jour (question posée par l'utilisateur, à traiter sérieusement)
+
+Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
+- **Dépendances Rust** : `Cargo.lock` est committé exprès pour des builds
+  reproductibles ; toute mise à jour doit être délibérée (bump +
+  re-test complet sur la matrice de conteneurs), jamais un `cargo update`
+  aveugle sur un outil qui tourne en root. `aya` est encore pré-1.0 (0.14.x)
+  et casse son API entre versions mineures - étudier le changelog avant de
+  bumper.
+- **Pin LLVM/nightly pour le toolchain eBPF** : le plus fragile des deux
+  toolchains. Avant de reconstruire `warden-build:ebpf` après une longue
+  pause, revérifier `rustup run nightly rustc --version --verbose` contre
+  la version LLVM installée dans le Dockerfile - un nightly plus récent
+  peut embarquer une version LLVM différente et recasser `bpf-linker`.
+- **Tâche restant à faire** (demandée explicitement par l'utilisateur) :
+  un mécanisme simple pour vérifier rapidement "y a-t-il une mise à jour à
+  appliquer" et l'appliquer vite. Idée pas encore implémentée : un script
+  `scripts/check-updates.sh` qui lance `cargo outdated`/`cargo audit` sur
+  le workspace principal ET sur `ebpf-probe/`, et vérifie la correspondance
+  LLVM/nightly ci-dessus automatiquement (compare la version LLVM du
+  nightly actif à celle indiquée dans `Dockerfile.build-ebpf`). Pas encore
+  écrit - à faire.
 - Module privesc dédié (au-delà de sudoers/sudoers.d déjà couverts par
   persistence) — SUID/SGID bit changes, capabilities via `setcap`,
   transitions uid inattendues — pas commencé, dépend probablement d'eBPF

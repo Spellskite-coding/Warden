@@ -1,0 +1,16 @@
+[package]
+name = "warden-exec-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "warden-exec"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1

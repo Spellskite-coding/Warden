@@ -1,0 +1,16 @@
+[package]
+name = "warden-exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = "0.14.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+[build-dependencies]
+aya-build = "0.2.0"
+anyhow = "1"
+cargo_metadata = "0.23"
