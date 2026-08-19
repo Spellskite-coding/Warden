@@ -30,7 +30,7 @@ pub fn handle_detection(
 
     if mode == Mode::Monitor {
         return DetectionEvent::new(module, severity, reason, "monitor mode: process and files left untouched")
-            .with_response(pid, affected_paths, false);
+            .with_response(Some(pid), affected_paths, false);
     }
 
     if let Err(e) = process::stop_then_kill(pid) {
@@ -47,5 +47,43 @@ pub fn handle_detection(
     }
 
     let detail = format!("process killed, {} file(s) quarantined", quarantined.len());
-    DetectionEvent::new(module, severity, reason, detail).with_response(pid, quarantined, true)
+    DetectionEvent::new(module, severity, reason, detail).with_response(Some(pid), quarantined, true)
+}
+
+/// Response path for modules with no associated process to act on (e.g.
+/// persistence: inotify never reports who wrote a file, unlike fanotify).
+/// Quarantines a single standalone file - never call this for something a
+/// legitimate process might still have open or depend on existing, since
+/// there's no PID to stop first. `pid` in the resulting event is always
+/// `None`, not a sentinel like `0`: passing `0` to a kill-capable path
+/// elsewhere would signal an entire process group, so this function
+/// deliberately never touches `process::stop_then_kill` at all.
+pub fn handle_file_only_detection(
+    mode: Mode,
+    module: &'static str,
+    severity: Severity,
+    summary: &str,
+    detail: &str,
+    file: &std::path::Path,
+    quarantine: &Quarantine,
+) -> DetectionEvent {
+    warn!(module, summary, detail, path = %file.display(), "suspicious file change detected");
+
+    if mode == Mode::Monitor {
+        return DetectionEvent::new(module, severity, summary, format!("{detail} (monitor mode: file left untouched)"))
+            .with_response(None, vec![file.to_path_buf()], false);
+    }
+
+    match quarantine.take(file, module, -1, summary) {
+        Ok(Some(dest)) => {
+            let full_detail = format!("{detail} (quarantined to {})", dest.display());
+            DetectionEvent::new(module, severity, summary, full_detail).with_response(None, vec![dest], true)
+        }
+        Ok(None) => DetectionEvent::new(module, severity, summary, format!("{detail} (file already gone, nothing to quarantine)"))
+            .with_response(None, vec![], false),
+        Err(e) => {
+            warn!(module, path = %file.display(), error = %e, "failed to quarantine file");
+            DetectionEvent::new(module, severity, summary, format!("{detail} (failed to quarantine: {e})")).with_response(None, vec![], false)
+        }
+    }
 }

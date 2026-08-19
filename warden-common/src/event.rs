@@ -75,8 +75,8 @@ impl DetectionEvent {
         }
     }
 
-    pub fn with_response(mut self, pid: i32, affected_paths: Vec<PathBuf>, action_taken: bool) -> Self {
-        self.pid = Some(pid);
+    pub fn with_response(mut self, pid: Option<i32>, affected_paths: Vec<PathBuf>, action_taken: bool) -> Self {
+        self.pid = pid;
         self.affected_paths = affected_paths;
         self.action_taken = action_taken;
         self

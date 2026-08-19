@@ -1202,7 +1202,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warden-common",
+ "warden-persistence",
  "warden-ransomware",
+]
+
+[[package]]
+name = "warden-persistence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix 0.31.3",
+ "tokio",
+ "tracing",
+ "warden-common",
 ]
 
 [[package]]

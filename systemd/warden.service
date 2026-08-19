@@ -24,16 +24,18 @@ AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
 NoNewPrivileges=true
 ProtectSystem=strict
-# Only the config directory is writable from the base unit. The install
-# script computes the rest (quarantine dir, the target user's watched
-# directories - honeypot files are created there) from the actual config
-# and adds them via a /etc/systemd/system/warden.service.d/ drop-in rather
-# than editing this file - if you install by hand instead, add your own
-# ReadWritePaths= drop-in or the agent will fail to quarantine files and
-# provision honeypots. Connecting to the target user's D-Bus session socket
-# under /run/user/<uid>/bus needs no extra write access: ProtectSystem=strict
-# only blocks writes, and connecting to an existing socket isn't one.
-ReadWritePaths=/etc/warden
+# Nothing is writable from the base unit: the agent only ever reads
+# /etc/warden/config.toml (ProtectSystem=strict still permits reads
+# everywhere, it just blocks writes), so that directory needs no
+# ReadWritePaths entry. The install script computes what DOES need write
+# access - the quarantine dir and the target user's watched directories,
+# where honeypot files are created - from the actual config and adds it via
+# a /etc/systemd/system/warden.service.d/ drop-in rather than editing this
+# file. If you install by hand instead, add your own ReadWritePaths= drop-in
+# or the agent will fail to quarantine files and provision honeypots.
+# Connecting to the target user's D-Bus session socket under
+# /run/user/<uid>/bus needs no extra write access either: that's a connect(),
+# not a write to the filesystem.
 
 [Install]
 WantedBy=multi-user.target
