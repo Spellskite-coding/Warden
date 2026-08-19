@@ -215,29 +215,86 @@ et **validé par un chargement réel dans le kernel**, pas juste compilé :
   parfaitement. À creuser avant d'utiliser `aya-log` dans un vrai module
   (bug de version, ou map créée dans le mauvais ordre - pas encore
   diagnostiqué).
-- **Probe de preuve de concept** : `ebpf-probe/` (workspace séparé, PAS
-  encore intégré au workspace principal de warden) - `warden-exec-ebpf`
-  (programme kernel, tracepoint `sched:sched_process_exec`, incrémente un
-  compteur) + `warden-exec` (loader userspace, charge/attache/poll le
-  compteur). **Testé en conditions réelles** : chargé dans un conteneur
-  `--privileged` avec `/sys/kernel/debug` et `/sys/kernel/tracing` montés,
-  le compteur a suivi en temps réel de vrais événements exec déclenchés
-  depuis CE conteneur ET depuis un conteneur Docker totalement séparé
-  (`alpine`, `docker run --rm`) - preuve que la probe voit tout le kernel
-  hôte, pas juste son propre cgroup, exactement le comportement attendu
-  d'eBPF (kernel partagé entre conteneurs).
-- Capacités utilisées pour le test : `--privileged` (large, pour aller
-  vite). Pas encore réduit à l'ensemble minimal réel (`CAP_BPF` +
-  `CAP_PERFMON` + accès tracefs probablement suffisant sur kernel 5.8+) -
-  à déterminer avant d'écrire l'unit systemd du futur module exec.
-- Prochaine étape logique : intégrer un vrai module `warden-exec` dans le
-  workspace principal (pas juste `ebpf-probe/`), lisant le nom du
-  fichier exécuté depuis le tracepoint + `/proc/<pid>/cmdline` /
-  `/proc/<pid>/exe` côté userspace pour le contexte complet (le tracepoint
-  `sched_process_exec` seul ne donne pas les arguments complets), branché
-  sur le même pipeline `DetectionEvent`/dispatcher que ransomware et
-  persistence. Utile immédiatement pour la détection fileless (exec depuis
-  `/tmp`, `~/Downloads`, `/dev/shm`) et une brique de détection privesc.
+## Module exec (`ebpf-probe/`) — implémenté et validé end-to-end
+
+`ebpf-probe/` reste un **workspace séparé** de celui principal de warden
+(voir "Pourquoi `ebpf-probe/` reste un workspace séparé" plus bas pour la
+raison structurelle - ce n'est pas un oubli). Deux crates :
+
+- `warden-exec-ebpf` (programme kernel) : tracepoint
+  `sched:sched_process_exec`, parse le champ `__data_loc filename` du
+  format tracepoint (vérifié via `/sys/kernel/tracing/events/sched/
+  sched_process_exec/format` - offset 8 = `__data_loc` du filename, offset
+  12 = pid) via `bpf_probe_read_kernel_str_bytes` (pas la variante
+  `bpf_probe_read_kernel_str`, dépréciée), pousse `{pid, filename}` dans
+  une `RingBuf`.
+- `warden-exec` (loader userspace) : charge/attache la probe, lit la
+  `RingBuf` en async via `tokio::io::unix::AsyncFd`, résout `target_user`
+  (config TOML partagée avec le `warden` principal - seuls `mode` et
+  `target_user` sont lus, le reste ignoré par serde), flague toute
+  exécution depuis un chemin suspect (`warden_common::heuristics`,
+  factorisé et réutilisé aussi par le module persistence) ou depuis
+  `~/Downloads` du `target_user`, puis appelle
+  `warden_common::response::handle_detection` (kill + quarantine du
+  binaire exécuté) - **contrairement à persistence, ce module A un PID
+  fiable** (fourni par le tracepoint), donc peut légitimement tuer le
+  process, pas juste observer.
+
+**Testé en conditions réelles**, pas juste compilé :
+- `cargo test -p warden-exec` : 6/6 (parsing d'event, détection de
+  chemin suspect).
+- `cargo clippy` propre sur les deux crates (le crate kernel avec son
+  toolchain/target propres : `rustup run nightly cargo clippy --target
+  bpfel-unknown-none -Z build-std=core`, sinon clippy tente de le
+  compiler pour l'hôte et échoue - "unwinding panics are not supported
+  without std", pas un vrai bug).
+- Chargé dans un vrai conteneur privilégié avec `/sys/kernel/debug` et
+  `/sys/kernel/tracing` montés : exécution d'un faux malware depuis
+  `/tmp` → tué + binaire quarantiné en quelques millisecondes ; exécutions
+  normales (`whoami`, `ls`, `cat`) jamais touchées.
+- **Piège de test découvert et documenté** : sans `--pid=host` sur le
+  conteneur de test, le kill échoue avec `ESRCH` - eBPF rapporte le PID
+  *global de l'hôte* (le kernel n'est pas namespace-aware pour les
+  tracepoints), alors que le process warden-exec tournant dans un
+  conteneur voit son PROPRE PID namespace. Sur un vrai déploiement
+  (systemd sur la machine hôte, sans conteneur), ce problème n'existe pas
+  puisqu'il n'y a qu'un seul PID namespace - mais tout test futur de ce
+  module doit utiliser `--pid=host` pour être représentatif.
+
+**Capacités utilisées pour le test** : `--privileged` (large, pour aller
+vite). Pas encore réduit à l'ensemble minimal réel (`CAP_BPF` +
+`CAP_PERFMON` + `CAP_KILL` + accès tracefs probablement suffisant sur
+kernel 5.8+) - à déterminer avant d'écrire l'unit systemd de ce module.
+
+**`aya-log` toujours cassé** (voir plus haut, `fd 10 is not pointing to
+valid bpf_map`) - non utilisé, pas nécessaire pour ce module qui pousse
+des données structurées via sa propre `RingBuf`, pas des logs texte.
+
+### Pourquoi `ebpf-probe/` reste un workspace séparé (pas un oubli)
+
+`warden-exec-ebpf` est `#![no_std]` et ne peut être compilé QUE pour la
+cible `bpfel-unknown-none` via nightly + `-Z build-std=core` - le
+compiler pour la cible hôte (ce qu'un `cargo build --release` nu à la
+racine d'un workspace ferait pour TOUS ses membres) échoue purement et
+simplement. Si `warden-exec-ebpf`/`warden-exec` rejoignaient le workspace
+principal (celui de `warden-build:rockylinux`, toolchain stable
+uniquement, pas de nightly/bpf-linker), la commande de build habituelle
+`cargo build --release` casserait. `warden-exec` dépend bien de
+`warden-common` par chemin relatif (`../../warden-common`) et se compile
+très bien avec le toolchain stable de `warden-build:ebpf` (Debian
+bookworm a aussi un rustc stable normal) - seul le crate kernel a besoin
+du nightly, via le `build.rs` de `warden-exec` (`aya-build`) qui shell-out
+vers `rustup run nightly cargo build --target bpfel-unknown-none`,
+une invocation cargo totalement séparée qui ne pollue jamais la
+résolution du workspace principal.
+
+**Prochaine étape** : soit garder `warden-exec` comme binaire/service
+systemd autonome (notifie via son propre `Notifier`, pas de bus
+d'événements partagé avec `warden-core` pour l'instant - duplication
+mineure et acceptée pour l'instant), soit construire un bus d'événements
+local (socket Unix, JSON ligne par ligne) une fois que 2-3 modules eBPF
+de plus existent et que la duplication commence à peser - pas fait
+maintenant, noté comme refacto propre à venir.
 
 ## Maintenance et mises à jour (question posée par l'utilisateur, à traiter sérieusement)
 

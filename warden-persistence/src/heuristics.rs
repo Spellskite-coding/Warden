@@ -30,16 +30,11 @@ fn score_line(line: &str) -> Option<(Severity, &'static str)> {
         return Some((Severity::Medium, "makes a file broadly executable"));
     }
 
-    if mentions_suspicious_exec_path(&l) {
+    if warden_common::heuristics::mentions_suspicious_exec_path(&l) {
         return Some((Severity::High, "references an executable in a world-writable or hidden location"));
     }
 
     None
-}
-
-/// Locations nothing legitimate normally executes *from* on a workstation.
-fn mentions_suspicious_exec_path(text: &str) -> bool {
-    ["/tmp/", "/dev/shm/", "/var/tmp/", "/.cache/"].iter().any(|p| text.contains(p))
 }
 
 /// Scores a full set of newly-added lines, returning the worst severity
