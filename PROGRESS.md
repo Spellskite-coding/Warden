@@ -10,6 +10,28 @@ tout) sans notifier chaque avancée dans le chat — un point d'étape complet
 suffit. Priorité explicite : **finir tous les agents de détection + le core
 d'abord, GUI ensuite, `install.sh` en tout dernier.**
 
+## Point d'arrêt exact (session mise en pause pour extinction de la machine)
+
+Dernier commit : `aca94f2` ("Implement warden-exec: real eBPF-based
+fileless-execution detection"). `git status` propre, rien en attente,
+aucun conteneur Docker laissé en cours d'exécution, aucune tâche en
+arrière-plan active - safe pour une extinction/redémarrage de la machine.
+
+En cours au moment de la coupure : installation de `cargo-audit` (première
+étape du SAST) via `cargo install cargo-audit` dans le conteneur
+`warden-build:rockylinux` - interrompue volontairement (pas terminée,
+rien de cassé, juste pas commencé pour de vrai). À relancer en premier à
+la reprise :
+```
+docker run --rm -v warden-cargo-registry:/usr/local/cargo/registry \
+  -v warden-cargo-home:/usr/local/cargo -v warden-rustup-home:/usr/local/rustup \
+  warden-build:rockylinux cargo install cargo-audit
+```
+Puis l'intégrer (`cargo audit` sur le workspace principal et sur
+`ebpf-probe/`), documenter les résultats ici, avant de passer au module
+réseau (prochaine grosse pièce, probablement en eBPF vu que le toolchain
+est maintenant validé - voir section eBPF plus haut).
+
 ## Règle absolue de workflow
 
 **Rien ne compile ni ne s'exécute jamais sur l'hôte.** Le code est écrit et
