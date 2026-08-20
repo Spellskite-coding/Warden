@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 200">
+  <rect width="560" height="200" fill="#101114"/>
+  <rect x="24" y="40" width="120" height="120" rx="26" fill="#8c1f1b"/>
+  <g transform="translate(24,40) scale(0.47)">
+    <path d="M128,50 L190,74 L190,140 C190,178 162,200 128,214 C94,200 66,178 66,140 L66,74 Z" fill="#c33a2e"/>
+    <circle cx="128" cy="118" r="17" fill="#d9a441"/>
+    <path d="M119,129 L137,129 L144,162 L112,162 Z" fill="#d9a441"/>
+  </g>
+  <text x="172" y="108" font-family="JetBrains Mono, monospace" font-size="46" font-weight="700"
+        letter-spacing="6" fill="#f2f0ec">WARDEN</text>
+  <text x="173" y="134" font-family="JetBrains Mono, monospace" font-size="14" letter-spacing="3"
+        fill="#8a8d94">AUTONOMOUS LINUX EDR</text>
+</svg>

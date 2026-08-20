@@ -603,10 +603,22 @@ pouvoir attaquer la vraie GUI :
 Toolkit GUI pas encore tranché - GTK4/libadwaita pressenti pour un look
 natif GNOME, à confirmer quand on y sera vraiment.
 
-**Branding demandé par l'utilisateur** : logo + direction graphique du
-projet. Piste proposée par l'utilisateur : rouge + une ou deux couleurs
-d'appoint, bouclier comme symbole (rouge et jaune/marron évoqué). Pas
-encore fait.
+**Branding — fait et validé par l'utilisateur.** 4 pistes explorées via
+un canvas de design (bouclier plein+serrure, contour minimal, écrou
+hexagonal "clin d'œil Rust", lockup+palette). L'utilisateur a choisi :
+- **Logo officiel** = concept 1 "Solid + Keyhole" (bouclier rouge plein,
+  serrure ambre au centre) → `branding/logo.svg` + `branding/logo.png`.
+- **Bannière** = concept 4 "Lockup" (le logo + wordmark "WARDEN" en
+  JetBrains Mono + tagline "AUTONOMOUS LINUX EDR") → `branding/banner.svg`
+  + `branding/banner.png`.
+
+Palette retenue : `#8c1f1b` (fond de tuile), `#c33a2e` (bouclier),
+`#d9a441` (accent ambre/serrure), `#101114` (fond sombre). Les 4 concepts
+explorés restent dans `branding/` sous leurs noms d'origine
+(`1-solid-keyhole`, `2-outline`, `3-rustnod`, `4-lockup`) pour référence/
+archivage. Pas encore fait : export multi-résolutions (16/32/48/64/128/256
+px) pour l'icône d'appli GNOME/KDE - à faire quand la GUI sera vraiment
+attaquée, pas urgent maintenant.
 
 ## Prochaine session : par où reprendre
 
@@ -616,8 +628,8 @@ encore fait.
    notifications actionnables, historique persistant) - c'est encore du
    "core", pas la GUI elle-même, donc compatible avec la priorité
    "agents + core d'abord".
-4. Logo/direction graphique (rouge + bouclier, voir ci-dessus).
-5. GUI de contrôle proprement dite (après le point 3).
-6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
+4. GUI de contrôle proprement dite (après le point 3). Logo déjà prêt
+   (`branding/logo.svg`), à intégrer comme icône d'appli à ce moment-là.
+5. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
    (repoussé en tout dernier sur directive explicite de l'utilisateur).
-7. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
