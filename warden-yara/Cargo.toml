@@ -1,0 +1,32 @@
+[package]
+name = "warden-yara"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+warden-common = { path = "../warden-common" }
+# Default features pull in the PE/Mach-O/.NET/DEX/CRX/LNK file-format
+# modules - RSA/X.509/ECDSA crypto, zip, uuid, roxmltree and more - none
+# of which this Linux workstation EDR's built-in string/regex-only rules
+# reference. wasmtime itself can't be dropped (yara-x JIT-compiles rule
+# conditions to WASM as its core execution model, not an optional module),
+# but the unused file-format parsers can be. Kept: elf-module (relevant on
+# Linux), string/hash/math/time-module (lightweight, no extra crypto/parse
+# deps), the performance/build-plumbing features already in `default`.
+yara-x = { version = "1", default-features = false, features = [
+    "constant-folding",
+    "exact-atoms",
+    "fast-regexp",
+    "generate-proto-code",
+    "elf-module",
+    "string-module",
+    "hash-module",
+    "math-module",
+    "time-module",
+] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }

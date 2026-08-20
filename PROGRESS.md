@@ -130,6 +130,69 @@ la valeur de retour de la tâche elle-même, donc `JoinSet::join_next`
 identifie directement quel module vient de se terminer sans table de
 correspondance séparée à tenir à jour.
 
+## Module YARA — fait et validé
+
+Nouveau crate `warden-yara` (workspace principal), même pattern fanotify
+que ransomware (`FAN_CLOSE_WRITE`, mount-dedup, filtrage userspace) mais
+scanne le fichier fermé avec `yara-x` (réimplémentation pure Rust de YARA,
+compile les conditions de règles en WASM exécuté via `wasmtime` en interne
+- pas quelque chose qu'on pilote directement) au lieu de calculer
+l'entropie. Watch dirs par défaut : `Downloads`, `Desktop`, `Documents`
+sous `$HOME`, + `/tmp`. Jamais de kill (contrairement à ransomware) : le
+process qui a fermé le fichier (navigateur, `curl`, gestionnaire de
+téléchargement) n'a fait qu'écrire le contenu, il ne l'exécute pas -
+`response::handle_file_only_detection` (quarantine seule) suffit et évite
+de tuer un programme par ailleurs parfaitement légitime.
+
+**Règles intégrées** (`warden-yara/rules/builtin.yar`, testées
+individuellement contre des échantillons réalistes avant intégration, pas
+juste écrites à l'aveugle) : fichier de test EICAR (le standard de
+l'industrie AV, inoffensif par design), reverse shell bash
+(`/dev/tcp`+`exec`), reverse shell netcat (`-e`), reverse shell Python
+(`socket`+`dup2`+`pty.spawn`), webshell PHP obfusqué
+(`eval`/`system`+`base64_decode`+`$_POST`), pipe base64→shell. Extensible
+via `/etc/warden/yara-rules/*.yar` (custom_rules_dir configurable),
+compilés en plus du set intégré au démarrage.
+
+**Dépendances allégées, un vrai souci trouvé et corrigé** : les features
+par défaut de `yara-x` tirent les modules PE/Mach-O/.NET/DEX/CRX/LNK
+(parsers de formats binaires Windows/macOS/Android) et leur crypto
+associée (RSA, X.509, ECDSA, DSA) - rien de pertinent pour un EDR
+workstation Linux dont les règles ne référencent que du texte/regex.
+Compilé avec `default-features = false` + seulement
+`constant-folding, exact-atoms, fast-regexp, generate-proto-code,
+elf-module, string-module, hash-module, math-module, time-module` -
+confirmé par test que ça retire bien `rsa`/`x509-parser`/`ecdsa`/`dsa`/
+`zip`/`uuid`/`roxmltree` de l'arbre de dépendances sans casser la
+compilation ni les règles. `wasmtime` reste : ce n'est pas un module
+optionnel, c'est le moteur d'exécution central de yara-x pour TOUTE
+condition de règle, impossible à retirer.
+
+**Finding SAST réel traité, pas juste ignoré** : `cargo audit` a remonté
+`RUSTSEC-2026-0222` (wasmtime "Stores can mix up type indices between
+engines", CVSS 3.8 bas, `AV:L/AC:H/PR:H/UI:R` - accès local, complexité
+et privilèges élevés ET interaction utilisateur requis) tiré
+transitivement par `yara-x` 1.19.0 (déjà la dernière version disponible,
+pas de fix à obtenir en bumpant). Le bug ne se manifeste que si
+l'application mélange plusieurs instances `wasmtime::Engine` - yara-x
+n'en utilise qu'une en interne, donc pas atteignable via notre usage.
+Décision documentée (pas un silence) dans `.cargo/audit.toml` avec le
+raisonnement complet et un rappel de réévaluer dès qu'une nouvelle
+version de `yara-x` sort. Un warning "unmaintained" séparé sur `bincode`
+(transitif via wasmtime aussi) reste affiché mais ne fait pas échouer le
+check (politique par défaut de `cargo audit` pour les advisories de type
+"warning").
+
+**Testé en conditions réelles** (conteneur, `mode=enforce`) : fichier
+EICAR déposé dans `Downloads` → détecté (`Eicar_Test_File`), quarantiné,
+retiré du dossier. Script reverse-shell bash déposé → détecté
+(`Bash_Dev_Tcp_Reverse_Shell`), quarantiné. Fichier texte ordinaire →
+jamais touché. Confirmé aussi que plusieurs modules fanotify indépendants
+(ransomware ET yara, groupes fanotify séparés) peuvent surveiller le même
+mount avec des masques d'events différents sans conflit - le honeypot de
+ransomware (`.warden_canary`) reste intact et non perturbé par le module
+yara tournant en parallèle sur le même dossier.
+
 ## Règle absolue de workflow
 
 **Rien ne compile ni ne s'exécute jamais sur l'hôte.** Le code est écrit et
@@ -152,7 +215,7 @@ Clippy (une fois par volume neuf) : `rustup component add clippy` puis
 
 ## Architecture générale
 
-Workspace Cargo principal à 5 crates (plus le workspace séparé
+Workspace Cargo principal à 6 crates (plus le workspace séparé
 `ebpf-probe/` pour les modules exec/network, voir plus bas) :
 - `warden-common` — types partagés (`DetectionEvent`, `Severity`, `Mode`),
   et les briques réutilisables par tout module de détection :
@@ -170,6 +233,8 @@ Workspace Cargo principal à 5 crates (plus le workspace séparé
   ld.so.preload). Détails complets plus bas.
 - `warden-privesc` — détection SUID/SGID par polling (pas fanotify, voir
   section dédiée plus haut pour pourquoi).
+- `warden-yara` — scan YARA (`yara-x`) des fichiers nouvellement écrits
+  dans Downloads/Desktop/Documents/tmp, par fanotify.
 - `warden-core` — binaire `warden` : config TOML, résolution de
   l'utilisateur cible, orchestrateur multi-module (`tokio::task::JoinSet`),
   dispatcher d'events.
@@ -511,13 +576,48 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
   opensuse/tumbleweed sont toutes déjà pull. Alpine dispo mais hors
   périmètre officiel (musl + OpenRC, pas systemd).
 
+## Vision GUI de l'utilisateur (à garder en tête, pas encore commencé)
+
+Décrite explicitement par l'utilisateur : une appli GUI **séparée** du
+démon (démon = root, GUI = utilisateur normal), qui apparaît dans le menu
+applications/recherche du DE (fichier `.desktop`), montre l'état/historique,
+permet des actions live (quarantaine manuelle, whitelist, changement de
+mode). Les notifications desktop doivent être **actionnables** : cliquer
+dessus ouvre la GUI directement sur le détail de cet incident précis, puis
+on peut revenir au tableau de bord et naviguer vers d'autres menus.
+
+Trois prérequis côté démon identifiés (pas encore construits) avant de
+pouvoir attaquer la vraie GUI :
+1. **Socket de contrôle** (`/run/warden/control.sock`) - la GUI doit
+   pouvoir interroger le démon root et déclencher des actions. Bien
+   restreindre les permissions à l'utilisateur cible.
+2. **Notifications actionnables** - `Notifier` ne fait actuellement que
+   `Notify()` fire-and-forget. Il faudra écouter le signal D-Bus
+   `ActionInvoked` du serveur de notifications et faire le lien avec
+   l'ID de l'incident correspondant.
+3. **Historique persistant des events** - actuellement chaque détection
+   part dans les logs journald uniquement. Il faut un stockage
+   (SQLite ou JSONL) alimenté par le dispatcher pour que la GUI ait
+   quelque chose à interroger.
+
+Toolkit GUI pas encore tranché - GTK4/libadwaita pressenti pour un look
+natif GNOME, à confirmer quand on y sera vraiment.
+
+**Branding demandé par l'utilisateur** : logo + direction graphique du
+projet. Piste proposée par l'utilisateur : rouge + une ou deux couleurs
+d'appoint, bouclier comme symbole (rouge et jaune/marron évoqué). Pas
+encore fait.
+
 ## Prochaine session : par où reprendre
 
-1. Évaluer YARA (crate `yara-x` ou bindings officiels) et une détection
-   Sigma simplifiée.
-2. Réseau : étendre au UDP et aux ports en écoute (backdoor).
-3. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-4. GUI de contrôle (après épuisement raisonnable des agents de détection).
-5. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
+1. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
+2. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
+3. Commencer les 3 prérequis GUI ci-dessus (socket de contrôle,
+   notifications actionnables, historique persistant) - c'est encore du
+   "core", pas la GUI elle-même, donc compatible avec la priorité
+   "agents + core d'abord".
+4. Logo/direction graphique (rouge + bouclier, voir ci-dessus).
+5. GUI de contrôle proprement dite (après le point 3).
+6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
    (repoussé en tout dernier sur directive explicite de l'utilisateur).
-6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+7. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).

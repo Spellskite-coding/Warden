@@ -24,6 +24,9 @@ pub struct Config {
 
     #[serde(default)]
     pub privesc: warden_privesc::PrivescConfig,
+
+    #[serde(default)]
+    pub yara: warden_yara::YaraConfig,
 }
 
 fn default_mode() -> Mode {

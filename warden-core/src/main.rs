@@ -99,6 +99,11 @@ async fn main() -> Result<()> {
         warden_privesc::run(privesc_cfg, &privesc_home, mode, privesc_tx, ready_tx)
     });
 
+    let yara_cfg = cfg.yara.clone();
+    let yara_home = home.clone();
+    let yara_tx = event_tx.clone();
+    let yara_ready = spawn_module(&mut modules, "yara", move |ready_tx| warden_yara::run(yara_cfg, &yara_home, mode, yara_tx, ready_tx));
+
     // Only tell systemd (and Restart=on-failure) we're up once at least one
     // module actually initialized - not just once its thread was spawned.
     // If every module fails to init, the host is silently unprotected, so
@@ -107,13 +112,14 @@ async fn main() -> Result<()> {
     // running, logged loudly above by wait_ready, rather than fatal - e.g.
     // a workstation with no /etc/cron.d yet shouldn't lose ransomware
     // protection over it.
-    let (ransomware_ok, persistence_ok, privesc_ok) = tokio::join!(
+    let (ransomware_ok, persistence_ok, privesc_ok, yara_ok) = tokio::join!(
         wait_ready("ransomware", ransomware_ready),
         wait_ready("persistence", persistence_ready),
         wait_ready("privesc", privesc_ready),
+        wait_ready("yara", yara_ready),
     );
 
-    if !ransomware_ok && !persistence_ok && !privesc_ok {
+    if !ransomware_ok && !persistence_ok && !privesc_ok && !yara_ok {
         dispatcher.abort();
         modules.abort_all();
         anyhow::bail!("every detection module failed to initialize, refusing to report ready");

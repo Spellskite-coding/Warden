@@ -1,0 +1,24 @@
+# Advisories deliberately acknowledged and accepted, with the reasoning
+# recorded here so the decision stays visible instead of a silent ignore.
+# Re-evaluate each one whenever `scripts/check-updates.sh` flags it again -
+# don't just re-ignore without checking whether the underlying situation
+# (a newer fixed version, a changed severity, a new understanding of
+# exploitability) has changed.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0222 - wasmtime "Stores can mix up type indices between
+    # engines". Pulled in transitively via yara-x 1.19.0 (yara-x compiles
+    # rule conditions to WASM and evaluates them via wasmtime as its core
+    # execution engine - not something warden-yara touches directly).
+    # CVSS 3.8 (low): AV:L/AC:H/PR:H/UI:R - local access, high attack
+    # complexity, high privileges *and* user interaction required. The bug
+    # itself only manifests when an application creates and mixes
+    # multiple wasmtime::Engine/Store instances incorrectly; yara-x uses a
+    # single internal engine per compiled rule set, so this isn't
+    # reachable through warden-yara's usage. No newer yara-x release
+    # exists yet to pull a patched wasmtime (1.19.0 is the latest as of
+    # this check). Accepted for now; re-check when yara-x bumps its
+    # wasmtime dependency.
+    "RUSTSEC-2026-0222",
+]
