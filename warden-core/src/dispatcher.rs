@@ -32,7 +32,7 @@ pub async fn run(mut rx: tokio::sync::mpsc::UnboundedReceiver<DetectionEvent>, n
         // Notify on anything Medium and above - Info/Low are for the log
         // and GUI history only, not worth interrupting the user.
         if evt.severity >= Severity::Medium {
-            notifier.notify(evt.severity, &evt.summary, &evt.detail).await;
+            notifier.notify(evt.severity, &evt.summary, &evt.detail, &evt.id).await;
         }
     }
 }

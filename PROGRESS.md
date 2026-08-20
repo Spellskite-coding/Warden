@@ -267,9 +267,10 @@ Workspace Cargo principal à 6 crates (plus le workspace séparé
 4. **Notification desktop via zbus, connexion explicite au bus de session
    de l'utilisateur cible** (`unix:path=/run/user/<uid>/bus`), jamais de
    découverte auto via `DBUS_SESSION_BUS_ADDRESS` (pointerait vers rien
-   pour un service root). Testé : échoue proprement (log warn, pas de
-   crash) sans session graphique — comportement attendu, pas encore
-   revalidé avec un vrai DE simulé.
+   pour un service root). Échoue proprement (log warn, pas de crash) -
+   **mais l'hypothèse initiale "comportement attendu car pas de session
+   graphique" était incomplète, corrigée après un vrai test avec DE
+   simulé, voir la section dédiée plus bas.**
 
 5. **`target_user` explicite en config, pas d'auto-détection.** Root n'a
    pas de `$HOME` personnel à protéger. Résolu via
@@ -575,6 +576,84 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
   de test : debian, ubuntu, fedora, rockylinux, almalinux, archlinux,
   opensuse/tumbleweed sont toutes déjà pull. Alpine dispo mais hors
   périmètre officiel (musl + OpenRC, pas systemd).
+
+## Historique persistant + notifications actionnables (2 des 3 prérequis GUI) — faits
+
+**Historique** : `warden_common::history::HistoryStore` - chaque
+`DetectionEvent` a désormais un `id` stable (module + timestamp
+nanoseconde, pas besoin de compteur partagé entre modules qui tournent
+chacun sur leur propre thread, ni de dépendance uuid/rand en plus).
+Chaque event est append-only en JSONL dans `/var/lib/warden/history.jsonl`
+via le dispatcher. Testé en conteneur : deux détections persistence
+atterrissent bien dans le fichier avec des ids distincts.
+
+**Notifications actionnables** : `Notifier` déclare maintenant une action
+D-Bus (`"default"`, "View details") sur chaque `Notify()`, capture l'id
+de notification retourné, et un thread de fond persistant écoute le
+signal `ActionInvoked` sur le bus de session de l'utilisateur cible pour
+faire le lien avec l'`id` de l'incident (corrélation en mémoire, purge
+après 24h si jamais cliqué). Le lancement effectif de la GUI au clic est
+un `TODO` explicite (`warden_common::notify::run_action_listener`) tant
+que `warden-gui` n'existe pas - la corrélation elle-même est du code
+fonctionnel, pas un stub.
+
+### Investigation approfondie : le round-trip D-Bus n'a PAS pu être validé en direct dans ce sandbox - limitation d'environnement identifiée avec certitude, pas un bug Warden
+
+Suite à la demande explicite de l'utilisateur de tester en environnement
+DE réel : conteneur Debian avec Xvfb + bus D-Bus de session + `dunst`
+(démon de notifications) monté de toutes pièces. Après plusieurs vrais
+faux départs corrigés en testant (mauvais flag `dbus-send --address` au
+lieu de `--bus`, process en arrière-plan tué par erreur par mon propre
+wrapper `sleep`, `/etc/machine-id` manquant) - une fois le DE simulé
+réellement opérationnel (`dbus-send` fonctionne, `dunst` enregistré comme
+`org.freedesktop.Notifications`), **la connexion zbus échoue de façon
+reproductible à 100%**, alors que `dbus-send` (libdbus, l'implémentation
+C de référence) fonctionne parfaitement contre le même bus.
+
+**Root cause identifiée avec certitude, pas supposée** : `strace` sur le
+handshake montre que `zbus` envoie `NEGOTIATE_UNIX_FD\r\nBEGIN\r\n` suivi
+immédiatement (même paquet) du message binaire `Hello` pipeliné, sans
+attendre la réponse `AGREE_UNIX_FD`. Le démon répond `AGREE_UNIX_FD` puis
+ferme la connexion sans jamais traiter le `Hello`. Écarté un par un par
+test réel (pas supposition) : pas un bug de `machine-id` manquant (corrigé,
+même échec), pas une histoire de version zbus (identique sur 4.4.0 ET
+5.19.0, testées côte à côte), pas un problème TCP-vs-unix-socket
+spécifique (testé, erreur différente mais non concluante côté TCP faute
+du bon mécanisme d'auth). **Confirmé par un test isolé, indépendant de
+D-Bus** : un script Python minimal passant un file descriptor entre deux
+process via `SCM_RIGHTS` sur socket Unix (`socket.send_fds`/`recv_fds`)
+montre que le fd reçu est **invalide** (`OSError: Bad file descriptor`)
+dans ce sandbox, alors que le nombre de fds transmis est rapporté correct.
+**Le passage de descripteurs de fichiers sur socket Unix est cassé dans
+cet environnement sandboxé** (probablement la couche d'isolation externe
+de ce runtime d'agent, au-delà de ce que `--privileged` sur le conteneur
+interne peut lever) - ce qui casse `NEGOTIATE_UNIX_FD`, ce qui casse toute
+connexion D-Bus via `zbus` (v4 et v5) sur socket Unix, quel que soit le
+démon en face. Pas de flag `zbus` pour désactiver la négociation FD côté
+client (vérifié dans le source des deux versions - `cap_unix_fd` est
+auto-détecté depuis les capacités de la socket, pas configurable).
+
+**Ce que ça signifie concrètement** :
+- Ce n'est PAS un bug dans le code de Warden ni dans `zbus` - c'est une
+  limitation de CET environnement de test précis. Sur une vraie
+  workstation Linux (bus de session géré par systemd/elogind, sans
+  sandboxing imbriqué), le FD-passing fonctionne normalement et cette
+  chaîne de connexion devrait marcher (zbus est utilisé en production par
+  de nombreuses applications desktop Rust).
+- **Corrige une hypothèse antérieure** (section architecture, point 4) :
+  j'avais noté "échec sans session graphique = comportement attendu" -
+  c'était vrai en apparence (échec propre, pas de crash) mais la VRAIE
+  cause n'était pas "pas de session graphique", c'est cette limitation
+  sandbox - je ne l'ai découverte qu'en montant un vrai DE et en creusant
+  pourquoi ça échouait encore.
+- **Conséquence honnête** : le round-trip complet (popup réel affiché +
+  clic + corrélation d'incident) n'a jamais pu être validé en conditions
+  réelles, dans aucun environnement disponible ici. Il faudra le
+  valider sur une vraie machine/VM (pas de conteneurs imbriqués dans ce
+  sandbox) avant de considérer cette fonctionnalité comme prod-ready.
+  Le code est écrit et compilé/testé unitairement, mais PAS validé
+  end-to-end avec un vrai serveur de notifications qui reçoit et affiche
+  réellement le popup.
 
 ## Vision GUI de l'utilisateur (à garder en tête, pas encore commencé)
 

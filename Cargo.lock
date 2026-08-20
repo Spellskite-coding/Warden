@@ -2240,6 +2240,7 @@ name = "warden-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "nix 0.31.3",
  "serde",
  "serde_json",

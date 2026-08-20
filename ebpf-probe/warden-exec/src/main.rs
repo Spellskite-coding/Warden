@@ -64,7 +64,7 @@ async fn handle_exec(pid: i32, filename: &str, mode: Mode, quarantine: &Quaranti
         vec![std::path::PathBuf::from(filename)],
         quarantine,
     );
-    notifier.notify(evt.severity, &evt.summary, &evt.detail).await;
+    notifier.notify(evt.severity, &evt.summary, &evt.detail, &evt.id).await;
 }
 
 #[tokio::main]

@@ -88,7 +88,7 @@ async fn handle_event(event: &ConnectEvent, exe_path: &str, mode: Mode, quaranti
     // live process is what matters, and response::handle_detection still
     // kills it by pid either way.
     let evt = response::handle_detection(mode, MODULE, Severity::High, event.pid, &reason, vec![PathBuf::from(exe_path)], quarantine);
-    notifier.notify(evt.severity, &evt.summary, &evt.detail).await;
+    notifier.notify(evt.severity, &evt.summary, &evt.detail, &evt.id).await;
 }
 
 #[tokio::main]

@@ -12,3 +12,4 @@ tracing = { workspace = true }
 nix = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }

@@ -29,6 +29,7 @@ sd-notify = "0.5"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 zbus = { version = "4", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = true
