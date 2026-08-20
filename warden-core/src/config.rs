@@ -21,6 +21,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ransomware: warden_ransomware::RansomwareConfig,
+
+    #[serde(default)]
+    pub privesc: warden_privesc::PrivescConfig,
 }
 
 fn default_mode() -> Mode {

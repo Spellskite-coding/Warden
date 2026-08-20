@@ -4,6 +4,7 @@ members = [
     "warden-common",
     "warden-ransomware",
     "warden-persistence",
+    "warden-privesc",
     "warden-core",
 ]
 

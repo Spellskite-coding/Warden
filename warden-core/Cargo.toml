@@ -12,6 +12,7 @@ path = "src/main.rs"
 warden-common = { path = "../warden-common" }
 warden-ransomware = { path = "../warden-ransomware" }
 warden-persistence = { path = "../warden-persistence" }
+warden-privesc = { path = "../warden-privesc" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

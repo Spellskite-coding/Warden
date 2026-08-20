@@ -45,6 +45,21 @@ async fn wait_ready(module: &'static str, ready_rx: tokio::sync::oneshot::Receiv
     }
 }
 
+/// Spawns one detection module on its own blocking thread (each module's
+/// `run` blocks on a kernel read loop) and returns the oneshot receiver
+/// the caller awaits for readiness. Threading the module name through the
+/// task's own return value (rather than a side table) is what lets
+/// `JoinSet::join_next` in `main` identify which module just ended without
+/// a separate bookkeeping structure to keep in sync.
+fn spawn_module<F>(modules: &mut tokio::task::JoinSet<(&'static str, Result<()>)>, name: &'static str, run: F) -> tokio::sync::oneshot::Receiver<std::result::Result<(), String>>
+where
+    F: FnOnce(tokio::sync::oneshot::Sender<std::result::Result<(), String>>) -> Result<()> + Send + 'static,
+{
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    modules.spawn_blocking(move || (name, run(ready_tx)));
+    ready_rx
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -59,35 +74,48 @@ async fn main() -> Result<()> {
     let dispatcher = tokio::spawn(dispatcher::run(event_rx, notifier));
 
     let mode = cfg.mode;
+    let home = target.home.clone();
 
-    let (ransomware_ready_tx, ransomware_ready_rx) = tokio::sync::oneshot::channel();
+    let mut modules: tokio::task::JoinSet<(&'static str, Result<()>)> = tokio::task::JoinSet::new();
+
     let ransomware_cfg = cfg.ransomware.clone();
-    let ransomware_home = target.home.clone();
-    let ransomware_event_tx = event_tx.clone();
-    let mut ransomware = tokio::task::spawn_blocking(move || {
-        warden_ransomware::run(ransomware_cfg, &ransomware_home, mode, ransomware_event_tx, ransomware_ready_tx)
+    let ransomware_home = home.clone();
+    let ransomware_tx = event_tx.clone();
+    let ransomware_ready = spawn_module(&mut modules, "ransomware", move |ready_tx| {
+        warden_ransomware::run(ransomware_cfg, &ransomware_home, mode, ransomware_tx, ready_tx)
     });
 
-    let (persistence_ready_tx, persistence_ready_rx) = tokio::sync::oneshot::channel();
-    let persistence_home = target.home.clone();
+    let persistence_home = home.clone();
     let persistence_user = cfg.target_user.clone();
-    let persistence_event_tx = event_tx.clone();
-    let mut persistence = tokio::task::spawn_blocking(move || {
-        warden_persistence::run(persistence_home, persistence_user, mode, persistence_event_tx, persistence_ready_tx)
+    let persistence_tx = event_tx.clone();
+    let persistence_ready = spawn_module(&mut modules, "persistence", move |ready_tx| {
+        warden_persistence::run(persistence_home, persistence_user, mode, persistence_tx, ready_tx)
+    });
+
+    let privesc_cfg = cfg.privesc.clone();
+    let privesc_home = home.clone();
+    let privesc_tx = event_tx.clone();
+    let privesc_ready = spawn_module(&mut modules, "privesc", move |ready_tx| {
+        warden_privesc::run(privesc_cfg, &privesc_home, mode, privesc_tx, ready_tx)
     });
 
     // Only tell systemd (and Restart=on-failure) we're up once at least one
     // module actually initialized - not just once its thread was spawned.
     // If every module fails to init, the host is silently unprotected, so
     // that case is fatal rather than reporting READY=1 anyway. A single
-    // module failing while another comes up is treated as degraded-but-
+    // module failing while others come up is treated as degraded-but-
     // running, logged loudly above by wait_ready, rather than fatal - e.g.
     // a workstation with no /etc/cron.d yet shouldn't lose ransomware
     // protection over it.
-    let (ransomware_ok, persistence_ok) = tokio::join!(wait_ready("ransomware", ransomware_ready_rx), wait_ready("persistence", persistence_ready_rx));
+    let (ransomware_ok, persistence_ok, privesc_ok) = tokio::join!(
+        wait_ready("ransomware", ransomware_ready),
+        wait_ready("persistence", persistence_ready),
+        wait_ready("privesc", privesc_ready),
+    );
 
-    if !ransomware_ok && !persistence_ok {
+    if !ransomware_ok && !persistence_ok && !privesc_ok {
         dispatcher.abort();
+        modules.abort_all();
         anyhow::bail!("every detection module failed to initialize, refusing to report ready");
     }
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
@@ -95,36 +123,28 @@ async fn main() -> Result<()> {
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    // If either module's loop ends (its own internal fatal error, not just
-    // an init failure already handled above), treat it as fatal for the
-    // whole process rather than trying to keep running half-blind: exit
-    // non-zero so systemd's Restart=on-failure gives every module a clean
-    // full re-init, instead of building a more complex per-module
-    // supervisor that can restart just the failed one (a reasonable future
+    // If any module's loop ends (its own internal fatal error, not just an
+    // init failure already handled above), treat it as fatal for the whole
+    // process rather than trying to keep running half-blind: exit non-zero
+    // so systemd's Restart=on-failure gives every module a clean full
+    // re-init, instead of building a more complex per-module supervisor
+    // that can restart just the failed one (a reasonable future
     // improvement, not done yet - see PROGRESS.md).
     tokio::select! {
-        res = &mut ransomware => {
+        joined = modules.join_next() => {
             dispatcher.abort();
-            persistence.abort();
-            return match res {
-                Ok(Ok(())) => { info!("ransomware module loop exited"); Ok(()) }
-                Ok(Err(e)) => { error!(error = %e, "ransomware module failed"); Err(e) }
-                Err(e) => { error!(error = %e, "ransomware module task panicked"); Err(anyhow::anyhow!(e)) }
-            };
-        }
-        res = &mut persistence => {
-            dispatcher.abort();
-            ransomware.abort();
-            return match res {
-                Ok(Ok(())) => { info!("persistence module loop exited"); Ok(()) }
-                Ok(Err(e)) => { error!(error = %e, "persistence module failed"); Err(e) }
-                Err(e) => { error!(error = %e, "persistence module task panicked"); Err(anyhow::anyhow!(e)) }
+            modules.abort_all();
+            return match joined {
+                Some(Ok((name, Ok(())))) => { info!(module = name, "module loop exited"); Ok(()) }
+                Some(Ok((name, Err(e)))) => { error!(module = name, error = %e, "module failed"); Err(e) }
+                Some(Err(e)) => { error!(error = %e, "module task panicked"); Err(anyhow::anyhow!(e)) }
+                None => { error!("all modules already ended"); anyhow::bail!("no modules left running") }
             };
         }
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
-            // Both modules' threads are parked in blocking kernel read()
-            // syscalls with no way to interrupt them cleanly; dropping the
+            // Every module's thread is parked in a blocking kernel read()
+            // syscall with no way to interrupt it cleanly; dropping the
             // tokio runtime at the end of main() would wait for those
             // spawn_blocking tasks forever. There is no in-flight work
             // worth draining, so exit immediately.
@@ -136,3 +156,4 @@ async fn main() -> Result<()> {
         }
     }
 }
+

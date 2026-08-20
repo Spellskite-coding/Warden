@@ -1203,6 +1203,7 @@ dependencies = [
  "tracing-subscriber",
  "warden-common",
  "warden-persistence",
+ "warden-privesc",
  "warden-ransomware",
 ]
 
@@ -1212,6 +1213,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nix 0.31.3",
+ "tokio",
+ "tracing",
+ "warden-common",
+]
+
+[[package]]
+name = "warden-privesc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix 0.31.3",
+ "serde",
  "tokio",
  "tracing",
  "warden-common",

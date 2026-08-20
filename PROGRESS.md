@@ -65,6 +65,71 @@ Résultat actuel : **0 vulnérabilité connue**, toolchain eBPF toujours
 aligné (LLVM 23/LLVM 23). À relancer périodiquement, surtout après tout
 `cargo update` ou changement de toolchain.
 
+## Module privesc — fait, mais PAS en fanotify (limitation kernel réelle, pas un choix)
+
+Nouveau crate `warden-privesc` (dans le workspace principal, pas
+`ebpf-probe/` - pas besoin d'eBPF pour celui-ci). Détecte l'apparition
+d'un bit setuid/setgid : sur un binaire système déjà connu (technique
+GTFOBins, ex. `chmod +s /usr/bin/find`) → le bit est retiré (Enforce),
+le binaire n'est jamais supprimé ; sur un fichier tout nouveau dans
+`/tmp`, `/var/tmp`, `/dev/shm` ou `$HOME` (ex. copie de bash + `chmod +s`)
+→ mis en quarantaine comme les autres modules "nouveau fichier".
+
+**Tentative fanotify abandonnée après un vrai test, pas une supposition** :
+`FAN_ATTRIB` échoue systématiquement avec `EINVAL`, quel que soit le scope
+du mark (filesystem-wide OU un simple dossier non-récursif) - confirmé en
+isolant le test (`FAN_MODIFY` marche en contrôle, `FAN_ATTRIB` échoue
+systématiquement, y compris combiné à `FAN_EVENT_ON_CHILD`/`FAN_ONDIR`).
+Raison : `FAN_ATTRIB` fait partie des "directory entry events" du kernel
+qui nécessitent que le groupe fanotify soit initialisé avec
+`FAN_REPORT_FID` - un flag que les bindings `nix` 0.31.3 n'exposent PAS
+dans `InitFlags` (vérifié dans le source de la crate). Contourner ça
+demanderait soit des appels syscall bruts (et `nix` ne sait de toute façon
+pas parser le format d'event FID différent que ça produirait), soit un
+hook eBPF sur la famille de syscalls `chmod`. Les deux sont plus lourds
+que ce qu'une surface privesc (pas aussi time-critique qu'un ransomware
+actif ou un exec/connexion en direct) justifie pour une première version.
+
+**Solution retenue : polling toutes les 5 secondes.** Plus simple, correct,
+sans acrobaties sur les syscalls. Modèle d'état à deux ensembles :
+`baseline` (immuable, établi une fois au démarrage - tout ce qui est déjà
+setuid/setgid à ce moment-là est présumé légitime pour toujours) et
+`already_flagged` (mutable, évite de re-notifier à chaque tick de 5s pour
+une même anomalie non résolue, réinitialisé dès que le fichier disparaît
+du scan - une vraie ré-infection après remédiation redevient un incident
+neuf).
+
+**Bug réel trouvé et corrigé en testant** : `/bin` et `/sbin` sont des
+symlinks vers `/usr/bin`/`/usr/sbin` sur toute distro usr-merge (la
+plupart des distros modernes). Sans déduplication, le même fichier
+physique était scanné deux fois sous deux chemins différents,
+produisant deux détections pour un seul `chmod +s` (`/usr/bin/find` ET
+`/bin/find` flagués séparément, vu en pratique). Corrigé en canonicalisant
+et dédupliquant les dossiers de watch avant le scan (`known_suid_sgid`
+est passé de 22 à 11 après le fix - preuve que le doublon existait bel et
+bien, pas juste une hypothèse).
+
+**Testé en conditions réelles** (conteneur `--privileged`, `mode=enforce`) :
+- Binaire déjà setuid au démarrage (`/usr/bin/passwd`) re-touché →
+  jamais flagué (baseline).
+- Binaire système gagnant le bit pour la première fois
+  (`chmod +s /usr/bin/find`, technique GTFOBins) → détecté Critical, bit
+  retiré, binaire toujours présent et fonctionnel.
+- Nouveau fichier setuid dans `/tmp` (bash copié + `chmod +s`) → détecté
+  Critical, **mis en quarantaine** (jamais de kill pour ce module : le
+  polling ne fournit aucun PID, contrairement à fanotify), fichier
+  effectivement retiré de `/tmp`.
+
+**`warden-core/src/main.rs` refactorisé** : avec un 3ème module, dupliquer
+le pattern manuel "spawn + oneshot ready + branche `select!`" par module
+devenait source d'erreurs (exactement le genre de bug que je viens de
+corriger dans la logique privesc elle-même). Remplacé par un superviseur
+générique basé sur `tokio::task::JoinSet<(&'static str, Result<()>)>` +
+une fonction `spawn_module` réutilisable - le nom du module transite dans
+la valeur de retour de la tâche elle-même, donc `JoinSet::join_next`
+identifie directement quel module vient de se terminer sans table de
+correspondance séparée à tenir à jour.
+
 ## Règle absolue de workflow
 
 **Rien ne compile ni ne s'exécute jamais sur l'hôte.** Le code est écrit et
@@ -87,21 +152,27 @@ Clippy (une fois par volume neuf) : `rustup component add clippy` puis
 
 ## Architecture générale
 
-Workspace Cargo à 4 crates :
+Workspace Cargo principal à 5 crates (plus le workspace séparé
+`ebpf-probe/` pour les modules exec/network, voir plus bas) :
 - `warden-common` — types partagés (`DetectionEvent`, `Severity`, `Mode`),
   et les briques réutilisables par tout module de détection :
   `process::stop_then_kill`, `quarantine::Quarantine`,
-  `response::handle_detection` (réponse avec PID, kill+quarantine),
-  `response::handle_file_only_detection` (réponse SANS PID, quarantine
-  seule — voir point 6 ci-dessous), `notify::Notifier`.
+  `permissions::strip_setuid_setgid`, `heuristics` (localisations
+  suspectes, partagé entre plusieurs modules), `target::resolve` (résolution
+  de l'utilisateur cible), `response::handle_detection` (réponse avec PID,
+  kill+quarantine), `response::handle_file_only_detection` (réponse SANS
+  PID, quarantine seule — voir point 6 ci-dessous), `notify::Notifier`.
 - `warden-ransomware` — détection ransomware par fanotify, porté et adapté
   de RansomShield (`/home/user/ransomshield`, projet séparé, jamais modifié
   par Warden).
 - `warden-persistence` — détection de persistance par inotify (bashrc,
   cron, autostart XDG, unités systemd, sudoers, authorized_keys,
   ld.so.preload). Détails complets plus bas.
+- `warden-privesc` — détection SUID/SGID par polling (pas fanotify, voir
+  section dédiée plus haut pour pourquoi).
 - `warden-core` — binaire `warden` : config TOML, résolution de
-  l'utilisateur cible, orchestrateur multi-module, dispatcher d'events.
+  l'utilisateur cible, orchestrateur multi-module (`tokio::task::JoinSet`),
+  dispatcher d'events.
 
 ### Décisions d'architecture importantes (et pourquoi)
 
@@ -373,11 +444,13 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
   LLVM/nightly ci-dessus automatiquement (compare la version LLVM du
   nightly actif à celle indiquée dans `Dockerfile.build-ebpf`). Pas encore
   écrit - à faire.
-- Module privesc dédié (au-delà de sudoers/sudoers.d déjà couverts par
-  persistence) — SUID/SGID bit changes, capabilities via `setcap`,
-  transitions uid inattendues — pas commencé, dépend probablement d'eBPF
-  pour une vraie couverture (fanotify `FAN_ATTRIB` pourrait couvrir les
-  changements de permissions sans eBPF, à évaluer).
+- Module privesc : **fait pour SUID/SGID** (voir plus haut, polling 5s -
+  fanotify `FAN_ATTRIB` s'est révélé impossible avec les bindings `nix`
+  actuels, pas juste "pas encore évalué"). Pas encore couvert :
+  capabilities Linux via `setcap` (`getcap`/`setcap` sur un binaire,
+  vecteur privesc équivalent au SUID mais orthogonal, même limitation
+  fanotify probable), transitions uid inattendues (nécessiterait eBPF,
+  voir le module exec pour le pattern à réutiliser).
 - Module réseau : **fait** (voir plus haut) - couvre les connexions TCP
   sortantes (IPv4/IPv6) depuis un binaire en localisation suspecte. Pas
   encore couvert : UDP, connexions entrantes/écoute (utile pour détecter
@@ -440,11 +513,10 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
 
 ## Prochaine session : par où reprendre
 
-1. Module privesc dédié (SUID/SGID, capabilities `setcap`) - fanotify
-   `FAN_ATTRIB` à évaluer en premier (pas besoin d'eBPF a priori).
-2. Évaluer YARA (crate `yara-x` ou bindings officiels) et une détection
+1. Évaluer YARA (crate `yara-x` ou bindings officiels) et une détection
    Sigma simplifiée.
-3. Réseau : étendre au UDP et aux ports en écoute (backdoor).
+2. Réseau : étendre au UDP et aux ports en écoute (backdoor).
+3. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
 4. GUI de contrôle (après épuisement raisonnable des agents de détection).
 5. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
    (repoussé en tout dernier sur directive explicite de l'utilisateur).

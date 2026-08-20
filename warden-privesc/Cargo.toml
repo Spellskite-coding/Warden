@@ -1,0 +1,13 @@
+[package]
+name = "warden-privesc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+warden-common = { path = "../warden-common" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
