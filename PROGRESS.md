@@ -10,27 +10,60 @@ tout) sans notifier chaque avancée dans le chat — un point d'étape complet
 suffit. Priorité explicite : **finir tous les agents de détection + le core
 d'abord, GUI ensuite, `install.sh` en tout dernier.**
 
-## Point d'arrêt exact (session mise en pause pour extinction de la machine)
+## Module réseau + SAST — faits et validés (reprise après pause)
 
-Dernier commit : `aca94f2` ("Implement warden-exec: real eBPF-based
-fileless-execution detection"). `git status` propre, rien en attente,
-aucun conteneur Docker laissé en cours d'exécution, aucune tâche en
-arrière-plan active - safe pour une extinction/redémarrage de la machine.
+**Module réseau** (`ebpf-probe/warden-network-ebpf` + `warden-network`,
+même structure que le module exec) : hook sur le tracepoint
+`sock:inet_sock_set_state`, ne traite que la transition vers
+`TCP_SYN_SENT` (pas `TCP_ESTABLISHED` - cette dernière est souvent
+atteinte de façon asynchrone dans un contexte softirq quand le SYN-ACK
+arrive, où le pid "courant" n'est plus celui qui a initié la connexion).
+Résout `/proc/<pid>/exe` côté userspace et applique la même heuristique de
+localisation suspecte que le module exec (`warden_common::heuristics::is_suspicious_exec_location`,
+maintenant partagée par les deux modules) - défense en profondeur : si un
+process depuis `/tmp` ouvre une connexion sortante, tué + binaire
+quarantiné, même si le module exec ne l'avait pas déjà attrapé au
+lancement.
 
-En cours au moment de la coupure : installation de `cargo-audit` (première
-étape du SAST) via `cargo install cargo-audit` dans le conteneur
-`warden-build:rockylinux` - interrompue volontairement (pas terminée,
-rien de cassé, juste pas commencé pour de vrai). À relancer en premier à
-la reprise :
-```
-docker run --rm -v warden-cargo-registry:/usr/local/cargo/registry \
-  -v warden-cargo-home:/usr/local/cargo -v warden-rustup-home:/usr/local/rustup \
-  warden-build:rockylinux cargo install cargo-audit
-```
-Puis l'intégrer (`cargo audit` sur le workspace principal et sur
-`ebpf-probe/`), documenter les résultats ici, avant de passer au module
-réseau (prochaine grosse pièce, probablement en eBPF vu que le toolchain
-est maintenant validé - voir section eBPF plus haut).
+**Bug réel trouvé et corrigé par test** : le champ `common_pid` du
+tracepoint (offset 4, documenté dans son propre format) donnait une valeur
+absurde (négative, et IDENTIQUE pour deux process pourtant différents) une
+fois lu côté eBPF - alors que `dport`/`daddr` lus depuis le même tracepoint
+étaient corrects, écartant un bug d'offset généralisé. Remplacé par
+`bpf_get_current_pid_tgid() >> 32`, lu depuis la tâche en cours plutôt que
+depuis l'enregistrement de trace - l'approche standard qu'utilisent aussi
+bcc/bpftrace pour ce tracepoint précis. Revalidé par test : pid correct
+pour deux connexions simultanées distinctes.
+
+**Bug structurel réel trouvé et corrigé dans `ebpf-probe/Cargo.toml`** :
+un `cargo build`/`test`/`clippy` NU (sans `-p`) à la racine du workspace
+tentait de compiler les crates `*-ebpf` (`#![no_std]`/`#![no_main]`) pour
+la cible hôte par défaut - échec direct ("unwinding panics are not
+supported without std" en build, "undefined symbol: main" en test), plus
+une collision de nom de binaire de sortie entre `warden-exec` (userspace)
+et le bin du crate `warden-exec-ebpf` qui porte le même nom. L'hypothèse
+initiale ("un build nu ne les touche jamais, seul le build.rs les
+compile") était fausse et corrigée en le testant réellement. Fix :
+`default-members = ["warden-exec", "warden-network"]` dans
+`ebpf-probe/Cargo.toml` - les crates `*-ebpf` restent des `members`
+(donc toujours accessibles via `-p` explicite ou via le `build.rs`), mais
+un `cargo build`/`test`/`clippy` sans arguments ne cible plus qu'elles.
+
+**Testé en conditions réelles** (conteneur `--privileged --pid=host`,
+tracefs monté, listener `nc -l` local) : connexion depuis `/usr/bin/nc`
+(légitime) jamais flaguée ; le même binaire copié vers `/tmp` et utilisé
+pour se connecter → détecté, tué, quarantiné en Enforce. `cargo test`
+(9 tests sur tout `ebpf-probe/` : 6 exec + 3 network) et `cargo clippy`
+propres sur les 4 crates (2 userspace + 2 kernel, ces derniers avec leur
+target/toolchain propres).
+
+**SAST intégré** : `cargo-audit` installé (persisté dans le volume
+`warden-cargo-home`), `scripts/check-updates.sh` écrit et testé de bout
+en bout - vérifie la correspondance LLVM/nightly (voir plus haut) ET lance
+`cargo audit` sur les deux workspaces (le principal ET `ebpf-probe/`).
+Résultat actuel : **0 vulnérabilité connue**, toolchain eBPF toujours
+aligné (LLVM 23/LLVM 23). À relancer périodiquement, surtout après tout
+`cargo update` ou changement de toolchain.
 
 ## Règle absolue de workflow
 
@@ -345,13 +378,20 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
   transitions uid inattendues — pas commencé, dépend probablement d'eBPF
   pour une vraie couverture (fanotify `FAN_ATTRIB` pourrait couvrir les
   changements de permissions sans eBPF, à évaluer).
-- Module réseau — pas commencé. Piste sans eBPF : sockets netlink
-  `NETLINK_INET_DIAG` en polling ; piste eBPF : meilleure visibilité
-  temps réel + attribution process.
+- Module réseau : **fait** (voir plus haut) - couvre les connexions TCP
+  sortantes (IPv4/IPv6) depuis un binaire en localisation suspecte. Pas
+  encore couvert : UDP, connexions entrantes/écoute (utile pour détecter
+  un binaire malveillant qui ouvre un port en backdoor), et une liste
+  blanche pour les faux positifs légitimes (ex. un vrai outil de backup
+  qui tournerait depuis un chemin inhabituel).
 - YARA / Sigma / signatures binaires — pas commencé (explicitement
   "si trop difficile, on skip" selon l'utilisateur, mais à tenter).
-- Détection fileless (navigateur, documents piégés) — pas commencé,
-  dépend d'une visibilité exec (eBPF ou audit netlink).
+- Détection fileless (navigateur, documents piégés) — **partiellement
+  couvert** par les modules exec + réseau (exécution et connexions
+  sortantes depuis `/tmp`, `/dev/shm`, `~/Downloads`). Ce qui manque
+  encore : visibilité sur la chaîne parent→enfant (ex. navigateur qui
+  spawn un shell) et sur le contenu réellement piégé d'un document avant
+  exécution (couverture a priori, pas juste a posteriori).
 - Gap connu et documenté (pas un bug) : un dossier persistence qui
   n'existe pas au démarrage (`/etc/cron.d`, `/etc/sudoers.d`, etc. sur un
   système qui ne les a pas encore) n'est surveillé qu'après un redémarrage
@@ -371,18 +411,28 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
   à faire une fois `install.sh` repris.
 - Test de la notif desktop avec une vraie session graphique/DE simulée —
   seul le cas "pas de session" (échec propre) a été testé.
-- SAST (cargo-audit / cargo-deny pour les dépendances) — pas fait.
+- SAST : **fait pour cargo-audit** (voir plus haut,
+  `scripts/check-updates.sh`). `cargo-deny` (licences + bans de crates,
+  au-delà des seules CVE) pas encore ajouté - amélioration possible mais
+  pas critique.
 - GUI de contrôle — explicitement après les agents/core.
 - Intégration GitHub (repo distant, CI) — pas abordé.
 
 ## Images et volumes Docker déjà créés sur cette machine
 
-- `warden-build:rockylinux` — conteneur de build (rustc 1.97.1 stable,
-  clippy installé dans le volume `warden-rustup-home`)
+- `warden-build:rockylinux` — conteneur de build principal (rustc 1.97.1
+  stable, clippy + **cargo-audit** installés dans le volume
+  `warden-rustup-home`/`warden-cargo-home`)
+- `warden-build:ebpf` — conteneur de build eBPF (Debian bookworm, nightly +
+  rust-src + bpf-linker(LLVM 23) + clippy pour les deux toolchains,
+  baked-in dans l'image elle-même, ne PAS monter
+  `warden-cargo-home`/`warden-rustup-home` dessus - voir la section
+  toolchain eBPF plus haut pour pourquoi)
 - `warden-test:debian` — smoke test (reconstruire après tout changement de
   code : `docker build -t warden-test:debian -f docker/Dockerfile.test.debian .`)
-- volumes : `warden-cargo-registry`, `warden-cargo-home`,
-  `warden-rustup-home` — toujours monter les 3 ensemble
+- volumes : `warden-cargo-registry` (partagé, sans risque sur tous les
+  conteneurs), `warden-cargo-home` + `warden-rustup-home` (réservés à
+  `warden-build:rockylinux`, jamais montés sur `warden-build:ebpf`)
 - Images de distro déjà disponibles pour construire les futurs Dockerfiles
   de test : debian, ubuntu, fedora, rockylinux, almalinux, archlinux,
   opensuse/tumbleweed sont toutes déjà pull. Alpine dispo mais hors
@@ -390,12 +440,12 @@ Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
 
 ## Prochaine session : par où reprendre
 
-1. Toolchain eBPF dans un conteneur dédié (`Dockerfile.build-ebpf`), probe
-   minimale exec via `aya`, puis un vrai module exec/fileless.
-2. Module réseau (netlink en attendant eBPF, ou directement en eBPF si le
-   toolchain est prêt).
-3. Évaluer YARA (crate `yara-x` ou bindings officiels) et une détection
+1. Module privesc dédié (SUID/SGID, capabilities `setcap`) - fanotify
+   `FAN_ATTRIB` à évaluer en premier (pas besoin d'eBPF a priori).
+2. Évaluer YARA (crate `yara-x` ou bindings officiels) et une détection
    Sigma simplifiée.
-4. SAST : `cargo audit`/`cargo deny` intégré au build.
-5. GUI de contrôle (après le point ci-dessus).
-6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros.
+3. Réseau : étendre au UDP et aux ports en écoute (backdoor).
+4. GUI de contrôle (après épuisement raisonnable des agents de détection).
+5. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
+   (repoussé en tout dernier sur directive explicite de l'utilisateur).
+6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).

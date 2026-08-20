@@ -12,7 +12,6 @@ use warden_common::event::{Mode, Severity};
 use warden_common::notify::Notifier;
 use warden_common::quarantine::Quarantine;
 use warden_common::response;
-use warden_common::target::TargetUser;
 
 const MODULE: &str = "exec";
 const MAX_FILENAME: usize = 128;
@@ -46,17 +45,6 @@ fn parse_event(bytes: &[u8]) -> Option<(i32, String)> {
     let raw = &bytes[4..4 + MAX_FILENAME];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     Some((pid, String::from_utf8_lossy(&raw[..end]).into_owned()))
-}
-
-/// Whether `filename` is a location nothing legitimate executes from on a
-/// workstation: world-writable/hidden scratch space, or the target user's
-/// own Downloads folder - the classic drop point for a browser- or
-/// document-exploit-delivered fileless payload.
-fn is_suspicious_location(filename: &str, target: &TargetUser) -> bool {
-    if warden_common::heuristics::mentions_suspicious_exec_path(filename) {
-        return true;
-    }
-    std::path::Path::new(filename).starts_with(target.home.join("Downloads"))
 }
 
 async fn handle_exec(pid: i32, filename: &str, mode: Mode, quarantine: &Quarantine, notifier: &Notifier) {
@@ -118,7 +106,7 @@ async fn main() -> Result<()> {
                     if pid == own_pid {
                         continue;
                     }
-                    if is_suspicious_location(&filename, &target) {
+                    if warden_common::heuristics::is_suspicious_exec_location(&filename, &target) {
                         handle_exec(pid, &filename, cfg.mode, &quarantine, &notifier).await;
                     }
                 }
@@ -133,6 +121,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use warden_common::target::TargetUser;
 
     fn test_target() -> TargetUser {
         TargetUser { uid: 1000, home: PathBuf::from("/home/tester") }
@@ -155,22 +144,22 @@ mod tests {
 
     #[test]
     fn flags_tmp_execution() {
-        assert!(is_suspicious_location("/tmp/payload", &test_target()));
+        assert!(warden_common::heuristics::is_suspicious_exec_location("/tmp/payload", &test_target()));
     }
 
     #[test]
     fn flags_downloads_execution() {
-        assert!(is_suspicious_location("/home/tester/Downloads/invoice.exe", &test_target()));
+        assert!(warden_common::heuristics::is_suspicious_exec_location("/home/tester/Downloads/invoice.exe", &test_target()));
     }
 
     #[test]
     fn does_not_flag_system_binaries() {
-        assert!(!is_suspicious_location("/usr/bin/whoami", &test_target()));
-        assert!(!is_suspicious_location("/bin/cat", &test_target()));
+        assert!(!warden_common::heuristics::is_suspicious_exec_location("/usr/bin/whoami", &test_target()));
+        assert!(!warden_common::heuristics::is_suspicious_exec_location("/bin/cat", &test_target()));
     }
 
     #[test]
     fn does_not_flag_documents_execution() {
-        assert!(!is_suspicious_location("/home/tester/Documents/script.sh", &test_target()));
+        assert!(!warden_common::heuristics::is_suspicious_exec_location("/home/tester/Documents/script.sh", &test_target()));
     }
 }

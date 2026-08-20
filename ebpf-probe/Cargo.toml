@@ -1,3 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["warden-exec", "warden-exec-ebpf"]
+members = ["warden-exec", "warden-exec-ebpf", "warden-network", "warden-network-ebpf"]
+# The *-ebpf crates are #![no_std]/#![no_main] and can only be built for
+# the bpfel-unknown-none target via nightly + -Z build-std=core - trying to
+# build/test/clippy them for the host target (what a bare `cargo build`
+# with no `-p` does for every workspace member by default) fails outright
+# ("unwinding panics are not supported without std", or "undefined symbol:
+# main" for `cargo test`, found by testing, not assumed). default-members
+# restricts the no-args commands to the userspace crates, which is what
+# anyone running a plain `cargo build`/`test`/`clippy` here actually wants;
+# the *-ebpf crates are still reachable via explicit `-p`, and via the
+# separate nested `cargo build --target bpfel-unknown-none` invocation each
+# userspace crate's build.rs (aya-build) already shells out to.
+default-members = ["warden-exec", "warden-network"]

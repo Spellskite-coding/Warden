@@ -1,0 +1,21 @@
+[package]
+name = "warden-network"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = "0.14.0"
+warden-common = { path = "../../warden-common" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+sd-notify = "0.5"
+
+[build-dependencies]
+aya-build = "0.2.0"
+anyhow = "1"
+cargo_metadata = "0.23"

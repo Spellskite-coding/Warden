@@ -1422,6 +1422,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "warden-network"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "aya-build",
+ "cargo_metadata",
+ "clap",
+ "sd-notify",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "warden-common",
+]
+
+[[package]]
+name = "warden-network-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

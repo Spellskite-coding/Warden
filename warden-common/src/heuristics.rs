@@ -10,3 +10,17 @@ pub const SUSPICIOUS_EXEC_PATH_FRAGMENTS: &[&str] = &["/tmp/", "/dev/shm/", "/va
 pub fn mentions_suspicious_exec_path(text: &str) -> bool {
     SUSPICIOUS_EXEC_PATH_FRAGMENTS.iter().any(|p| text.contains(p))
 }
+
+/// Whether `exe_path` is a location nothing legitimate executes from on a
+/// workstation: world-writable/hidden scratch space, or the target user's
+/// own Downloads folder - the classic drop point for a browser- or
+/// document-exploit-delivered fileless payload. Shared between the exec
+/// module (checking the tracepoint-reported filename directly) and the
+/// network module (checking a `/proc/<pid>/exe` resolved after the fact),
+/// so both modules treat "suspicious binary location" identically.
+pub fn is_suspicious_exec_location(exe_path: &str, target: &crate::target::TargetUser) -> bool {
+    if mentions_suspicious_exec_path(exe_path) {
+        return true;
+    }
+    std::path::Path::new(exe_path).starts_with(target.home.join("Downloads"))
+}
