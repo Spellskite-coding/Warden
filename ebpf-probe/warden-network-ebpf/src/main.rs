@@ -20,30 +20,40 @@ use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::{map, tracepoint}, map
 /// (the same one bcc/bpftrace's own tcpconnect tools use) and was
 /// confirmed correct by testing.
 const NEWSTATE_FIELD: usize = 20;
+const SPORT_FIELD: usize = 24;
 const DPORT_FIELD: usize = 26;
 const FAMILY_FIELD: usize = 28;
 const DADDR_FIELD: usize = 36;
 const DADDR_V6_FIELD: usize = 56;
 
-/// Only the SYN_SENT transition is used, not ESTABLISHED: SYN_SENT happens
-/// synchronously inside the connect() syscall, in the calling process's own
-/// context, so the tracepoint's pid is reliable. ESTABLISHED is often
-/// reached asynchronously when the SYN-ACK arrives, processed in a
-/// softirq/ksoftirqd context where the "current pid" is not the process
-/// that initiated the connection at all - a well-known gotcha for this
-/// tracepoint (the same reason bcc/bpftrace's own tcpconnect tools hook
-/// SYN_SENT, not ESTABLISHED).
+/// Both transitions happen synchronously in the initiating syscall's own
+/// process context (`connect()` for SYN_SENT, `listen()` for LISTEN), so
+/// `bpf_get_current_pid_tgid()` is reliable for both - unlike
+/// TCP_ESTABLISHED, often reached asynchronously when a SYN-ACK arrives in
+/// a softirq/ksoftirqd context where "current" is not the connecting
+/// process at all (a well-known gotcha for this tracepoint, the same
+/// reason bcc/bpftrace's own tcpconnect tools hook SYN_SENT, not
+/// ESTABLISHED).
 const TCP_SYN_SENT: i32 = 2;
+const TCP_LISTEN: i32 = 10;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+
+pub const KIND_CONNECT: u8 = 0;
+pub const KIND_LISTEN: u8 = 1;
 
 #[repr(C)]
 pub struct ConnectEvent {
     pub pid: i32,
-    pub dport: u16,
+    /// The remote port for a connection attempt, or the local port a
+    /// socket started listening on, depending on `kind`.
+    pub port: u16,
     pub family: u16,
-    /// IPv4 address left-justified in the first 4 bytes when family is
-    /// AF_INET, full 16 bytes used when AF_INET6.
+    pub kind: u8,
+    /// Remote address for a connection attempt; unused (all zero) for a
+    /// listening socket, which has no single peer. IPv4 left-justified in
+    /// the first 4 bytes when family is AF_INET, full 16 bytes used when
+    /// AF_INET6.
     pub daddr: [u8; 16],
 }
 
@@ -60,30 +70,40 @@ pub fn warden_connect(ctx: TracePointContext) -> u32 {
 
 fn try_warden_connect(ctx: TracePointContext) -> Result<u32, u32> {
     let newstate: i32 = unsafe { ctx.read_at(NEWSTATE_FIELD) }.map_err(|_| 1u32)?;
-    if newstate != TCP_SYN_SENT {
-        return Ok(0);
-    }
+    let kind = match newstate {
+        TCP_SYN_SENT => KIND_CONNECT,
+        TCP_LISTEN => KIND_LISTEN,
+        _ => return Ok(0),
+    };
 
     let family: u16 = unsafe { ctx.read_at(FAMILY_FIELD) }.map_err(|_| 1u32)?;
     let mut daddr = [0u8; 16];
-    match family {
-        AF_INET => {
-            let v4: [u8; 4] = unsafe { ctx.read_at(DADDR_FIELD) }.map_err(|_| 1u32)?;
-            daddr[..4].copy_from_slice(&v4);
+    if kind == KIND_CONNECT {
+        match family {
+            AF_INET => {
+                let v4: [u8; 4] = unsafe { ctx.read_at(DADDR_FIELD) }.map_err(|_| 1u32)?;
+                daddr[..4].copy_from_slice(&v4);
+            }
+            AF_INET6 => {
+                daddr = unsafe { ctx.read_at(DADDR_V6_FIELD) }.map_err(|_| 1u32)?;
+            }
+            _ => return Ok(0),
         }
-        AF_INET6 => {
-            daddr = unsafe { ctx.read_at(DADDR_V6_FIELD) }.map_err(|_| 1u32)?;
-        }
-        _ => return Ok(0),
+    } else if family != AF_INET && family != AF_INET6 {
+        return Ok(0);
     }
 
     let pid = (bpf_get_current_pid_tgid() >> 32) as i32;
-    let dport: u16 = unsafe { ctx.read_at(DPORT_FIELD) }.map_err(|_| 1u32)?;
+    let port: u16 = if kind == KIND_CONNECT {
+        unsafe { ctx.read_at(DPORT_FIELD) }.map_err(|_| 1u32)?
+    } else {
+        unsafe { ctx.read_at(SPORT_FIELD) }.map_err(|_| 1u32)?
+    };
 
     let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) else {
         return Ok(0);
     };
-    entry.write(ConnectEvent { pid, dport, family, daddr });
+    entry.write(ConnectEvent { pid, port, family, kind, daddr });
     entry.submit(0);
 
     Ok(0)
