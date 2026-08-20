@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info};
+use warden_common::history::HistoryStore;
 use warden_common::notify::Notifier;
 
 #[derive(Parser, Debug)]
@@ -71,7 +72,8 @@ async fn main() -> Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let notifier = Notifier::new(target.uid);
-    let dispatcher = tokio::spawn(dispatcher::run(event_rx, notifier));
+    let history = HistoryStore::new(std::path::Path::new("/var/lib/warden/history.jsonl"))?;
+    let dispatcher = tokio::spawn(dispatcher::run(event_rx, notifier, history));
 
     let mode = cfg.mode;
     let home = target.home.clone();

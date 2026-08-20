@@ -51,6 +51,15 @@ impl std::fmt::Display for Severity {
 /// did here, purely for observability.
 #[derive(Debug, Clone)]
 pub struct DetectionEvent {
+    /// Stable identifier a future GUI can reference - e.g. from a desktop
+    /// notification's click action, to jump straight to this incident's
+    /// detail view without re-matching on summary text. Nanosecond-precision
+    /// timestamp plus module name: unique enough for how often a single
+    /// module can realistically raise events (a collision would only ever
+    /// merge two history rows cosmetically, never a security concern), and
+    /// needs no shared counter or extra dependency across modules that each
+    /// run on their own thread.
+    pub id: String,
     pub module: &'static str,
     pub severity: Severity,
     pub summary: String,
@@ -63,7 +72,9 @@ pub struct DetectionEvent {
 
 impl DetectionEvent {
     pub fn new(module: &'static str, severity: Severity, summary: impl Into<String>, detail: impl Into<String>) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         Self {
+            id: format!("{module}-{}", now.as_nanos()),
             module,
             severity,
             summary: summary.into(),
@@ -71,7 +82,7 @@ impl DetectionEvent {
             pid: None,
             affected_paths: Vec::new(),
             action_taken: false,
-            timestamp_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            timestamp_unix: now.as_secs(),
         }
     }
 

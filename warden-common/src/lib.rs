@@ -1,5 +1,6 @@
 pub mod event;
 pub mod heuristics;
+pub mod history;
 pub mod notify;
 pub mod permissions;
 pub mod process;
