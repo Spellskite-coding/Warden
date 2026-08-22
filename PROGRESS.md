@@ -264,13 +264,14 @@ Workspace Cargo principal à 6 crates (plus le workspace séparé
    `~/.ssh`, `/etc`, `/etc/cron.d`, etc.) et on filtre par nom de fichier
    côté userspace, exactement le même principe que le filtrage fanotify.
 
-4. **Notification desktop via zbus, connexion explicite au bus de session
-   de l'utilisateur cible** (`unix:path=/run/user/<uid>/bus`), jamais de
-   découverte auto via `DBUS_SESSION_BUS_ADDRESS` (pointerait vers rien
-   pour un service root). Échoue proprement (log warn, pas de crash) -
-   **mais l'hypothèse initiale "comportement attendu car pas de session
-   graphique" était incomplète, corrigée après un vrai test avec DE
-   simulé, voir la section dédiée plus bas.**
+4. **Notification desktop : jamais de connexion D-Bus directe depuis le
+   démon root.** dbus-daemon refuse par construction qu'un uid étranger
+   au bus de session complète le `Hello` (confirmé sur vraie VM, voir la
+   section dédiée plus bas) - donc `Notifier` spawn un binaire séparé,
+   `warden-notify-helper`, avec privilèges tombés à l'uid/gid de
+   l'utilisateur cible (`Command::uid()/gid()`), qui lui seul se connecte
+   au bus (`unix:path=/run/user/<uid>/bus`) et communique avec le démon
+   parent en JSON sur stdin/stdout. Validé end-to-end sur VM réelle.
 
 5. **`target_user` explicite en config, pas d'auto-détection.** Root n'a
    pas de `$HOME` personnel à protéger. Résolu via
@@ -597,63 +598,59 @@ un `TODO` explicite (`warden_common::notify::run_action_listener`) tant
 que `warden-gui` n'existe pas - la corrélation elle-même est du code
 fonctionnel, pas un stub.
 
-### Investigation approfondie : le round-trip D-Bus n'a PAS pu être validé en direct dans ce sandbox - limitation d'environnement identifiée avec certitude, pas un bug Warden
+### Investigation D-Bus : root cause réelle trouvée sur vraie VM Kali, corrigée, et round-trip validé de bout en bout
 
-Suite à la demande explicite de l'utilisateur de tester en environnement
-DE réel : conteneur Debian avec Xvfb + bus D-Bus de session + `dunst`
-(démon de notifications) monté de toutes pièces. Après plusieurs vrais
-faux départs corrigés en testant (mauvais flag `dbus-send --address` au
-lieu de `--bus`, process en arrière-plan tué par erreur par mon propre
-wrapper `sleep`, `/etc/machine-id` manquant) - une fois le DE simulé
-réellement opérationnel (`dbus-send` fonctionne, `dunst` enregistré comme
-`org.freedesktop.Notifications`), **la connexion zbus échoue de façon
-reproductible à 100%**, alors que `dbus-send` (libdbus, l'implémentation
-C de référence) fonctionne parfaitement contre le même bus.
+L'hypothèse "limitation de sandbox" notée précédemment ici était
+**incomplète et en partie fausse** - corrigée après test sur une vraie VM
+Kali fournie par l'utilisateur (pas de conteneurs imbriqués). Le même
+échec de connexion `zbus` s'est reproduit à l'identique sur dbus-daemon
+1.16.2 (Kali) comme sur 1.14.10 (sandbox d'origine), ce qui écartait
+définitivement "artefact de sandbox" comme explication complète.
 
-**Root cause identifiée avec certitude, pas supposée** : `strace` sur le
-handshake montre que `zbus` envoie `NEGOTIATE_UNIX_FD\r\nBEGIN\r\n` suivi
-immédiatement (même paquet) du message binaire `Hello` pipeliné, sans
-attendre la réponse `AGREE_UNIX_FD`. Le démon répond `AGREE_UNIX_FD` puis
-ferme la connexion sans jamais traiter le `Hello`. Écarté un par un par
-test réel (pas supposition) : pas un bug de `machine-id` manquant (corrigé,
-même échec), pas une histoire de version zbus (identique sur 4.4.0 ET
-5.19.0, testées côte à côte), pas un problème TCP-vs-unix-socket
-spécifique (testé, erreur différente mais non concluante côté TCP faute
-du bon mécanisme d'auth). **Confirmé par un test isolé, indépendant de
-D-Bus** : un script Python minimal passant un file descriptor entre deux
-process via `SCM_RIGHTS` sur socket Unix (`socket.send_fds`/`recv_fds`)
-montre que le fd reçu est **invalide** (`OSError: Bad file descriptor`)
-dans ce sandbox, alors que le nombre de fds transmis est rapporté correct.
-**Le passage de descripteurs de fichiers sur socket Unix est cassé dans
-cet environnement sandboxé** (probablement la couche d'isolation externe
-de ce runtime d'agent, au-delà de ce que `--privileged` sur le conteneur
-interne peut lever) - ce qui casse `NEGOTIATE_UNIX_FD`, ce qui casse toute
-connexion D-Bus via `zbus` (v4 et v5) sur socket Unix, quel que soit le
-démon en face. Pas de flag `zbus` pour désactiver la négociation FD côté
-client (vérifié dans le source des deux versions - `cap_unix_fd` est
-auto-détecté depuis les capacités de la socket, pas configurable).
+**Root cause réelle, confirmée par `strace` comparatif côte à côte** :
+quand le process qui se connecte a un uid différent du propriétaire du
+bus de session (ex. root, uid 0, essayant de joindre le bus de `kali`,
+uid 1000), dbus-daemon accepte le `AUTH EXTERNAL` (root peut ouvrir le
+socket 0700 malgré les permissions, les vérifications DAC ne s'appliquant
+pas à root), négocie même `AGREE_UNIX_FD`, puis **ferme silencieusement
+la connexion sans jamais traiter le `Hello` pipeliné** - confirmé
+identique sur les deux versions de dbus-daemon testées. À l'inverse, une
+connexion **même uid** (testé : `kali` se connectant à son propre bus)
+réussit avec exactement le même pattern de négociation pipelinée. Un
+troisième test avec un uid tiers non-root (`wardentest`, 1001) échoue
+encore plus tôt, avec un `EACCES` au niveau du socket lui-même (les
+permissions fichier 0700 bloquent tout uid non-root et non-propriétaire).
+La policy XML de session (`session.conf`) est entièrement permissive
+(`allow send_destination="*"`, `allow own="*"`) - ce n'est donc pas une
+policy XML qui bloque, c'est un contrôle interne de dbus-daemon,
+indépendant de toute configuration, qui refuse silencieusement le `Hello`
+d'un uid étranger au bus. **Conclusion : ce n'est ni un bug Warden, ni un
+bug zbus, ni un artefact de sandbox - c'est un durcissement volontaire de
+dbus-daemon qui empêche par construction un process root de rejoindre le
+bus de session d'un autre utilisateur.**
 
-**Ce que ça signifie concrètement** :
-- Ce n'est PAS un bug dans le code de Warden ni dans `zbus` - c'est une
-  limitation de CET environnement de test précis. Sur une vraie
-  workstation Linux (bus de session géré par systemd/elogind, sans
-  sandboxing imbriqué), le FD-passing fonctionne normalement et cette
-  chaîne de connexion devrait marcher (zbus est utilisé en production par
-  de nombreuses applications desktop Rust).
-- **Corrige une hypothèse antérieure** (section architecture, point 4) :
-  j'avais noté "échec sans session graphique = comportement attendu" -
-  c'était vrai en apparence (échec propre, pas de crash) mais la VRAIE
-  cause n'était pas "pas de session graphique", c'est cette limitation
-  sandbox - je ne l'ai découverte qu'en montant un vrai DE et en creusant
-  pourquoi ça échouait encore.
-- **Conséquence honnête** : le round-trip complet (popup réel affiché +
-  clic + corrélation d'incident) n'a jamais pu être validé en conditions
-  réelles, dans aucun environnement disponible ici. Il faudra le
-  valider sur une vraie machine/VM (pas de conteneurs imbriqués dans ce
-  sandbox) avant de considérer cette fonctionnalité comme prod-ready.
-  Le code est écrit et compilé/testé unitairement, mais PAS validé
-  end-to-end avec un vrai serveur de notifications qui reçoit et affiche
-  réellement le popup.
+**Fix appliqué** : `Notifier` (`warden_common::notify`) ne se connecte
+plus jamais lui-même à un bus D-Bus. Il spawn désormais un nouveau
+binaire, `warden-notify-helper` (nouveau crate), avec ses privilèges
+tombés à l'uid/gid de l'utilisateur cible via
+`tokio::process::Command::uid()/gid()` - ce qui fait que la connexion se
+fait bien avec le même uid que le propriétaire du bus, cas qui marche.
+Le helper est entièrement non-privilégié, communique avec le démon root
+parent via stdin/stdout en JSON ligne-par-ligne (requêtes de notification
+dans un sens, clics `ActionInvoked` corrélés dans l'autre), et reprend
+telle quelle la logique de reconnexion/écoute qui existait déjà côté
+`Notifier` avant ce changement.
+
+**Validé en conditions réelles, de bout en bout, sur la VM Kali** : après
+déploiement du nouveau binaire, déclenchement d'une vraie détection
+persistence (ajout d'une clé dans `~/.ssh/authorized_keys`), le log
+confirme `warden_notify_helper: listening for desktop notification
+clicks` (connexion réussie, plus d'erreur), puis 3 secondes plus tard
+`notification clicked ... incident_id=... action="default"` - et
+l'utilisateur a confirmé de visu avoir vu la popup apparaître en haut à
+droite de son écran Kali et l'avoir cliquée. C'est la toute première
+validation end-to-end réelle (popup affiché + clic + corrélation
+d'incident) de tout le projet, sur une vraie session graphique.
 
 ## Vision GUI de l'utilisateur (à garder en tête, pas encore commencé)
 
@@ -699,16 +696,375 @@ archivage. Pas encore fait : export multi-résolutions (16/32/48/64/128/256
 px) pour l'icône d'appli GNOME/KDE - à faire quand la GUI sera vraiment
 attaquée, pas urgent maintenant.
 
+## GUI, socket de contrôle, exceptions, scan à la demande — faits (session du 22 août, pas encore committés au moment d'écrire ceci)
+
+Les 3 prérequis GUI listés dans la section précédente sont faits : socket
+de contrôle (`warden-core/src/control.rs` + `warden-common/src/
+control_protocol.rs`, `/run/warden/control.sock`, 0600 chowné à
+`target_user`), notifications actionnables (voir plus haut, résolu via
+`warden-notify-helper`), historique persistant (`HistoryStore`, déjà
+documenté plus haut). `warden-gui` (GTK4) existe et consomme le socket.
+Nouveau système d'exceptions ancré SHA-256 (`warden-common/src/
+exceptions.rs`, `/etc/warden/exceptions.toml`), jamais modifiable par le
+démon ni par le socket - uniquement via `warden --add-exception`/
+`--remove-exception` en `pkexec`. `QuarantineFile`/`RestoreQuarantine`
+ont été délibérément exclus du protocole du socket après qu'une revue a
+trouvé qu'ils permettaient à n'importe quel process au même uid de
+désactiver la protection sans authentification réelle - voir les
+commentaires dans `control_protocol.rs`. Scan YARA à la demande
+(`warden-core/src/scan.rs`, `warden-yara/src/scan.rs`) ajouté aussi,
+report-only par construction. Pas encore committé - faire un commit par
+lot logique avant la prochaine coupure de session plutôt que de laisser
+~2800 lignes non versionnées.
+
+## Audit red team du 22 août - deux bypass réels trouvés et corrigés
+
+Contexte : l'utilisateur a demandé un audit red team poussé sur cette
+même vague de fonctionnalités dans une session séparée ("EDR Rust pour
+Linux workstations"), qui a fini par être flaguée pour être allée trop
+loin dans l'intensité de l'audit demandé - pas un problème dans le code
+produit, qui est resté propre et bien documenté (voir les commentaires de
+review déjà présents dans `control_protocol.rs`, `quarantine.rs`,
+`process.rs`). Infra de test laissée en place et vérifiée vivante dans
+cette session : deux VMs libvirt/KVM (`debian13` locale FR, `ubuntu25.10`
+locale EN, toutes deux avec un compte `claude:claude` sudo dédié, warden
+installé et actif en Enforce) + un conteneur Docker `warden-redteam`
+(Kali) comme poste attaquant. Deux scripts de PoC red team trouvés sur
+`debian13` (`/home/claude/test_pkgmgr_spoof.sh`,
+`/home/claude/test_ransomware_bypass.sh`) - reproduits et validés dans
+cette session, pas juste relus :
+
+**Bypass 1 - `package_manager::is_active()` spoofable par emplacement**
+(`warden-common/src/package_manager.rs`). L'ancienne version vérifiait
+`comm` ET le basename de `/proc/<pid>/exe`, mais jamais le RÉPERTOIRE du
+binaire - `cp /bin/sleep /tmp/apt && /tmp/apt 300 &` satisfait les deux
+checks sans être le vrai gestionnaire de paquets. Confirmé exploitable en
+direct sur `debian13` : un `/etc/cron.d/redteam_v3` a échappé à la
+quarantaine automatique en Enforce pendant que le faux `/tmp/apt`
+tournait (`persistence: package manager active, leaving file untouched`
+dans le journal). **Fix** : le répertoire de l'exécutable doit en plus
+canonicaliser vers un des `SYSTEM_BIN_DIRS` connus (même liste que
+`warden-privesc`). Testé : nouveau test unitaire reproduisant exactement
+la technique (`decoy_binary_outside_system_bin_dirs_does_not_count_as_active`),
+ET revalidé en conditions réelles - build redéployé sur `debian13`,
+`test_pkgmgr_spoof.sh` relancé, `ATTACK RESULT: file gone -> quarantined
+despite spoofing, bypass NOT effective`.
+
+**Bypass 2 - détecteur ransomware contournable par fork-per-file +
+répartition multi-dossiers** (`warden-ransomware/src/detector.rs`). Le
+détecteur trackait déjà un compteur par PID ET un compteur par dossier
+(ce dernier ajouté lors d'une revue précédente, justement pour contrer le
+fork-per-file simple) - mais aucun compteur global tous-PID/tous-dossiers
+confondus. Résultat : 8 fichiers par dossier × 6 dossiers surveillés,
+chacun avec son propre PID éphémère, reste sous le seuil (15) sur les
+deux axes existants alors que 48 fichiers au total sont chiffrés en
+quelques secondes. Confirmé exploitable en direct sur `debian13` **après
+correction d'un faux négatif du script de test lui-même** : la première
+tentative (dossiers anglais `Desktop`/`Downloads`/`Pictures`/`Videos`/
+`Music`) donnait 0 fichier restant, mais c'était un faux positif du
+test - cette VM est en locale FR (`Bureau`/`Téléchargements`/`Images`/
+`Vidéos`/`Musique`), donc 5 des 6 dossiers ciblés par le script n'étaient
+simplement pas surveillés. Refait avec les vrais noms localisés : 48/48
+fichiers laissés intacts, zéro entrée dans le journal - bypass bien réel.
+**Fix** : troisième compteur `recent_writes_global`/
+`recent_container_format_writes_global` (clé unique, tous PID/dossiers
+confondus), même seuil que les compteurs existants. Testé : 3 nouveaux
+tests unitaires (burst simple toujours détecté, technique fork-per-file
+multi-dossiers désormais détectée, activité légitime à faible volume
+répartie sur plusieurs dossiers toujours laissée tranquille) + workspace
+entier (`cargo test --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`) propre.
+
+**Leçon retenue sur la méthodologie de test elle-même** : un script de
+red team qui hardcode des noms de dossiers XDG doit être vérifié contre
+la vraie locale de la VM cible avant de faire confiance à un résultat
+"pas de détection" - sinon un vrai bypass et un simple dossier non
+surveillé sont indiscernables sans creuser.
+
+Les deux binaires corrigés sont redéployés et revalidés sur les DEUX VMs
+(build depuis `warden-build:rockylinux`, transfert SFTP vers le compte
+`claude`, copie en root sur `/usr/local/bin/warden`, `systemctl restart
+warden`) : `test_pkgmgr_spoof.sh` relancé sur `debian13` ET une variante
+sur `ubuntu25.10` (`ATTACK RESULT: ... bypass NOT effective` dans les
+deux cas), technique fork-per-file multi-dossiers relancée sur les deux
+(dossiers localisés FR sur `debian13`, EN sur `ubuntu25.10`) - burst
+détecté et 48/48 fichiers quarantinés dans les deux cas, avec des
+`affected_paths` qui mélangent bien plusieurs dossiers différents,
+preuve que c'est le nouveau compteur global qui a déclenché. Reste à
+faire : un nouvel audit red team complet (pas juste ces deux PoC ciblés)
+avant de considérer cette vague de fonctionnalités prête.
+
+## Campagne SAST + relecture multi-agents (22 août, soir) — 7 findings critiques corrigés et validés en direct
+
+Suite à l'audit red team ci-dessus, l'utilisateur a demandé une passe SAST
+poussée (agent dédié) + une relecture de code anti-régression (6 agents en
+parallèle, un par sous-système) sur tout le lot de fonctionnalités non
+committé. **36 findings remontés au total**, triés par sévérité réelle
+(surface atteignable par un process tournant déjà en tant qu'utilisateur
+cible - le modèle de menace réaliste pour un EDR, pas un attaquant distant).
+Décision utilisateur : corriger les 7 critiques ce soir, documenter le
+reste (HIGH/MEDIUM/LOW) comme backlog pour une session dédiée plutôt que
+tout traiter d'un coup.
+
+**Les 7 findings critiques, tous corrigés et validés en direct sur
+`debian13`** (build → `cargo test --workspace` + clippy propres → déploiement
+→ scénario red team rejoué avec le fix en place, pas juste relu) :
+
+1. **`ebpf-probe/warden-exec` quarantinait le mauvais binaire** - la
+   résolution `/proc/<pid>/exe` (ajoutée cette session pour contrer
+   l'évasion par symlink) renvoyait l'INTERPRÉTEUR pour un script
+   (`/bin/bash`), pas le script - un script flagué en `/tmp` faisait
+   quarantiner `/bin/bash` lui-même, cassant le système pour tout le
+   monde. **Fix** : résolution du symlink faite directement sur `filename`
+   (readlink/canonicalize si `filename` EST un symlink), plus jamais via
+   l'état du process live - élimine à la fois la confusion interpréteur/
+   script et la race TOCTOU pid-reuse. Testé en direct : script flagué →
+   le script est quarantiné, hash de `/bin/bash` inchangé avant/après,
+   bash reste fonctionnel ; cas légitime (symlink vers un vrai payload en
+   `/tmp`) → le payload réel est bien quarantiné, le symlink intact.
+2. **Honeypot ransomware - privesc locale via symlink** -
+   `honeypot::provision` ne vérifiait jamais si le dossier PARENT du
+   honeypot était un symlink avant de faire `chmod 0755`+`chown` dessus.
+   Un process tournant en tant qu'utilisateur cible pouvait remplacer le
+   dossier honeypot par un symlink vers `/etc/cron.d` et se faire donner
+   la propriété d'un répertoire root par le démon lui-même au redémarrage
+   suivant. **Fix** : même refus explicite que pour le fichier honeypot
+   (déjà protégé). Testé en direct : symlink `Encrypted_Finances ->
+   /etc/cron.d`, redémarrage, `/etc/cron.d` reste `755 root:root`
+   inchangé, warning loggé, le honeypot se re-provisionne normalement une
+   fois le symlink retiré.
+3. **Honeypot énumérable par préfixe fixe** (trouvé par le SAST, pas dans
+   les 7 "critiques" mais corrigé en même temps par cohérence) -
+   `Confidential_Backup_<seed>`/`Banque_<seed>` : le préfixe public et
+   fixe rendait tout l'aléatoire du suffixe inutile face à un glob. **Fix** :
+   nom entier (adjectif+nom) tiré d'une combinatoire de mots-thèmes
+   (15x15, décorrélée pour le honeypot `$HOME` vs les honeypots par
+   dossier) dérivée du seed - ferme le cas trivial (un seul grep), honnête
+   dans les commentaires sur le fait que ça ne ferme pas le cas d'un
+   attaquant motivé prêt à énumérer les 225 combinaisons.
+4. **Résolution XDG non validée - bypass Downloads + DoS quarantaine** -
+   `xdg::resolve_dir` faisait confiance sans limite à
+   `~/.config/user-dirs.dirs` (fichier appartenant à l'utilisateur cible),
+   permettant de faire pointer un dossier surveillé vers `/` entier.
+   **Fix** : refuse explicitement le cas `/` exact (aucune config XDG
+   légitime ne pointe jamais littéralement sur la racine), retombe sur le
+   défaut sûr avec un warning. Testé en direct : `XDG_DOWNLOAD_DIR="/"` →
+   warning loggé 3x (une fois par module qui résout Downloads), aucun
+   module ne watch `/`, `Téléchargements` simplement absent de
+   `watch_dirs` au lieu de planter ou tout surveiller. Limite documentée
+   et assumée : rediriger vers un AUTRE chemin (pas `/`) pour faire
+   disparaître le vrai Downloads du radar reste possible - tension
+   inhérente avec le support légitime des locales/points de montage
+   personnalisés, pas résolue ce soir.
+5. **Bypass permanent du privesc via le cache `already_flagged`** - un
+   setuid déposé pendant qu'un vrai gestionnaire de paquets tourne
+   (fenêtre légitime) était suppressé UNE FOIS puis plus jamais
+   réévalué, même après la fin de l'update - porte dérobée root
+   persistante jamais détectée en Enforce. **Fix** : `handle_system_binary`/
+   `handle_new_file` retournent maintenant `(event, sticky)` - seule
+   l'exemption (`is_exempt`) reste permanente, "package manager actif"
+   n'est plus jamais sticky, donc réévalué à chaque tick (2s). Testé en
+   direct : backdoor setuid déposé pendant qu'un faux `apt` tourne depuis
+   un vrai `SYSTEM_BIN_DIR` (`/usr/local/bin/apt`, seul moyen légitime de
+   déclencher `is_active()` depuis le fix du point 6 ci-dessous) → event
+   "package manager active" à chaque tick tant qu'il tourne, PUIS dès que
+   le faux apt est tué, le tick suivant tente réellement l'action (voir
+   point 7, un second bug caché découvert PENDANT ce test).
+6. **`package_manager::is_active()` spoofable par emplacement** (détail
+   complet plus haut, retrouvé confirmé) - déjà fixé et redéployé plus
+   tôt dans la soirée, revalidé une fois de plus par le test du point 5.
+7. **Socket de contrôle - DoS mémoire qui tue tout le démon** -
+   `AsyncBufReadExt::lines()` n'avait aucune limite de taille de ligne ;
+   un client au même uid pouvait streamer sans `\n` jusqu'à l'OOM du
+   process `warden` entier (les 4 modules cœur partagent l'adresse
+   process). **Fix** : `read_capped_line` (lecture octet par octet sur un
+   `BufReader` déjà tamponné, donc pas de coût syscall réel), plafond
+   64KiB, erreur (connexion fermée) au-delà. 3 tests unitaires via
+   `tokio::io::duplex` (ligne normale, EOF propre, dépassement du
+   plafond).
+8. **`ProtectSystem=strict` disparu du service systemd** - le démon root,
+   avec ses capacités élargies (voir plus bas), n'avait plus aucun
+   confinement filesystem. **Fix** : directive restaurée + `RuntimeDirectory=warden`
+   (pour `/run/warden`, tmpfs recréé à chaque démarrage) + génération d'un
+   drop-in `/etc/systemd/system/warden.service.d/10-paths.conf` par
+   `install.sh` (calculé à l'installation : `$STATE_DIR`, le `$HOME` de
+   l'utilisateur cible, `/tmp`/`/var/tmp`/`/dev/shm`, les dossiers
+   binaires système, les dossiers `UnitDir` de persistence - chaque entrée
+   préfixée `-` pour ignorer un chemin absent selon la distro). Vérifié
+   par `systemd-analyze verify` (exit 0) et déploiement réel sur
+   `debian13` : les 3 services démarrent proprement, honeypots
+   provisionnés, socket de contrôle actif.
+9. **`install.sh` - écriture root via un chemin `/tmp` prévisible** -
+   `2>/tmp/warden-gui-build.log` : classique attaque symlink local (un
+   utilisateur non privilégié pré-crée le fichier comme symlink vers une
+   cible arbitraire avant que root ne lance l'install). **Fix** :
+   `mktemp` à la place. Vérifié : `shellcheck` propre (exit 0) sur tout
+   `install.sh`.
+
+**Bug supplémentaire trouvé EN VALIDANT le point 5, pas dans la liste des
+7 initiaux mais critique et corrigé dans la foulée** : sous
+`ProtectSystem=strict` fraîchement activé (point 8), `rename()` entre
+`/tmp` et le dossier de quarantaine échoue maintenant systématiquement
+(chaque entrée `ReadWritePaths=` devient son propre bind mount, donc
+`/tmp` et `/var/lib/warden` paraissent être des devices différents au
+noyau même si c'est le même filesystem physique) - `Quarantine::take`
+retombe donc TOUJOURS sur son fallback `fs::copy`, qui préserve les bits
+de permission de la source, y compris setuid/setgid - bloqué par
+`RestrictSUIDSGID=true` (déjà présent dans l'unit, pas ajouté ce soir).
+Résultat : mettre en quarantaine un backdoor setuid échouait en boucle
+avec `error=copying ... to quarantine`, silencieusement, à chaque tick -
+exactement le scénario que le point 5 vient de corriger. **Fix** :
+nouvelle fonction `Quarantine::copy_contents_without_preserving_mode`
+(copie le contenu à la main, laisse le mode par défaut de
+`File::create` - jamais setuid - sur la copie en quarantaine, plutôt que
+`fs::copy` qui tente de reproduire le mode source). Testé (nouveau test
+unitaire + revalidé en direct après redéploiement) : le fichier setuid
+finit bien par disparaître/être neutralisé une fois retesté.
+
+**Findings HIGH/MEDIUM restants (documentés, pas corrigés ce soir)** -
+retrouvables dans les rapports complets des agents SAST + code-review de
+cette session, à traiter dans une session dédiée avant de considérer
+cette vague de fonctionnalités prête pour la prod :
+- TOCTOU rescan-by-path dans `warden-yara::fanotify_monitor` et dans
+  l'échantillonnage d'entropie `warden-ransomware::fanotify_monitor`
+  (réouverture par chemin au lieu d'utiliser le fd de l'event fanotify).
+- `pidfd_open` qui échoue (hors "process déjà mort") ne retente plus rien
+  du tout - régression par rapport à l'ancien `kill(pid)` best-effort.
+- `control::run`'s `accept()` qui échoue une fois tue le listener IPC en
+  permanence (DoS complémentaire à celui déjà fixé ce soir).
+- Contournement par forgerie de format container (`PK\x03\x04`+ciphertext)
+  plus large que documenté : perd le tracking par-PID entièrement, pas
+  juste un seuil x3.
+- `warden-yara::scan.rs` : pas de vérification symlink sur les racines de
+  scan (`StartScan` via le socket peut être pointé dans `/proc` via un
+  symlink), pas de plafond de taille de fichier avant `scan_file`.
+- Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding
+  (`filesize < 65536` gate tout le fichier au lieu de juste borner la
+  recherche du motif).
+- Dossier de règles YARA custom illisible (pas juste absent) fait échouer
+  tout le module au lieu de dégrader vers les règles builtin seules.
+- **Confirmé en direct** : `StartScan` n'a aucune restriction de chemin -
+  connecté au socket en tant qu'utilisateur `test` (uid non-root, exactement
+  le modèle de menace), une requête `StartScan(["/root"])` est acceptée
+  et exécutée sans broncher (`files_scanned=106` dans `ScanStatus` juste
+  après), alors que `test` ne peut lui-même pas lister `/root` (0700
+  root:root). Oracle réel : même sans root direct, un process compromis
+  au même uid peut faire lire par le démon des fichiers qu'il ne peut pas
+  lire lui-même, et en déduire des choses (existence, correspondance à
+  une règle YARA) via `ScanStatus`/`History`. Pas de DoS testé (aurait
+  fallu un fichier énorme/lent, pas fait pour rester dans le scope
+  "sonde", pas "casse la VM").
+- `NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui` malgré
+  la chute de privilèges (pas de `env_remove` avant `pre_exec`).
+- `--quarantine-file` : le check d'exemption utilise un chemin non
+  canonicalisé (contrairement à `--add-exception`/`--remove-exception`).
+- TOCTOU sur les permissions du socket de contrôle entre `bind()` et
+  `chmod`/`chown` (fenêtre théorique, dépend de l'umask).
+- Fichiers manifest de quarantaine pas durcis à `0600` (incohérence avec
+  le fix appliqué à `history.rs` dans le même lot).
+- Perte d'entrées manifest sous accès concurrent `take()`/`restore()`
+  (6 process différents partagent le même répertoire de quarantaine).
+- **Confirmé en direct** (installé via `apt install unattended-upgrades`,
+  pas juste lu dans le code) : `unattended-upgrade` n'est JAMAIS reconnu
+  par `is_active()`, et la cause réelle est plus profonde que la simple
+  troncature `comm` soupçonnée au départ - c'est un script Python
+  (`#!/usr/bin/python3`), donc `/proc/<pid>/exe` résout vers
+  `/usr/bin/python3.13` (l'interpréteur), pas vers
+  `/usr/bin/unattended-upgrade` du tout - exactement la même classe de
+  bug interpréteur-vs-script que le fix `warden-exec` de ce soir, mais pas
+  encore appliquée ici. Testé : un faux setuid déposé pendant qu'un vrai
+  `unattended-upgrade --debug` tourne est quarantiné immédiatement au lieu
+  d'être suppressé - faux positif garanti sur toute mise à jour
+  automatique programmée (`unattended-upgrades` est activé par défaut sur
+  Debian/Ubuntu).
+- Drip-feed lent (rester sous le seuil sur une fenêtre plus longue que
+  `burst_window_secs`) contourne toujours les 3 compteurs - limitation
+  structurelle inhérente à une détection par fenêtre glissante, pas un
+  bug introduit ce soir.
+- Kill symbolique pour un process fork-per-file déjà mort au moment de la
+  détection (la quarantaine des fichiers reste le vrai mécanisme de
+  protection dans ce cas, pas le kill).
+
+## Backlog HIGH traité (22 août, suite) - 2 TOCTOU + l'oracle StartScan
+
+Sur directive explicite de l'utilisateur ("traite le backlog HIGH, surtout
+les deux TOCTOU et l'oracle StartScan"), 3 findings HIGH corrigés,
+testés, et en cours de validation live :
+
+**TOCTOU `warden-yara::fanotify_monitor`** - le code relisait le fichier
+en réouvrant par CHEMIN (`scanner.scan_file(&path)`) après avoir résolu
+ce chemin depuis le fd de l'event fanotify, jetant ce fd au passage. Entre
+l'event `FAN_CLOSE_WRITE` et la réouverture, un attaquant avec accès
+écriture au dossier surveillé peut substituer le contenu (ou un symlink) -
+faisant scanner à root un contenu différent de ce qui a réellement été
+fermé. **Fix** : nouvelle fonction `read_via_fd` (dup(2) du fd de l'event,
+lecture complète via ce dup, jamais de réouverture par chemin) + bascule
+de `scanner.scan_file(path)` vers `scanner.scan(&bytes)` (existe déjà dans
+l'API yara-x, scanne des données en mémoire). Nécessite `libc` en
+dépendance directe de `warden-yara` (déjà dans le workspace, juste pas
+déclaré dans ce crate).
+
+**TOCTOU `warden-ransomware::fanotify_monitor`** - exactement le même
+défaut, sur le chemin d'échantillonnage d'entropie ("matches
+`warden-yara`'s own fanotify listener... works reliably" disait
+l'ancien commentaire - vrai uniquement parce que warden-yara avait
+exactement le même bug à l'époque, pas parce que réouvrir par chemin
+était sûr). **Fix** : même schéma, `read_sample_via_fd` (dup + lecture
+bornée à `sample_bytes`, pas tout le fichier - direction opposée à YARA
+qui a besoin du contenu complet pour le matching de règles).
+
+**Oracle `StartScan`** (confirmé en direct la nuit dernière : `test`
+demandait un scan de `/root` et le démon le faisait, alors que `test` ne
+peut pas lire `/root` lui-même) - **fix** : `control::run`/
+`handle_connection` reçoivent maintenant `target_home: PathBuf` (déjà
+résolu dans `main.rs`, juste jamais passé jusqu'ici), et
+`is_scannable_path` refuse toute requête `StartScan` dont un chemin ne
+canonicalise pas sous `target_home` OU `/tmp` (déjà lisible/inscriptible
+par n'importe quel utilisateur local, déjà surveillé en direct par YARA -
+pas un nouveau privilège). Le placeholder du champ de saisie GUI
+(`/home/you/Downloads, /tmp, ...`) correspondait déjà exactement à ce
+périmètre, aucun changement nécessaire côté `warden-gui`.
+
+Testé : `cargo test --workspace` + `cargo clippy --workspace --all-targets
+-- -D warnings` propres (nouveaux tests : `is_scannable_path` refuse
+`/root`/`/etc`, accepte le home et `/tmp`).
+
+**Validé en direct sur les deux VMs** : `StartScan(["/root"])` en tant
+qu'utilisateur `test` → refusé (`path not allowed`) ; `StartScan` sur son
+propre `Documents` → toujours accepté. Non-régression fonctionnelle
+confirmée pour les deux TOCTOU corrigés : reverse shell déposé → toujours
+détecté et quarantiné par YARA sur les deux VMs ; burst de 16 fichiers
+haute-entropie (avec le seed de baseline plaintext requis par
+`require_directory_baseline`, oublié puis corrigé dans le test lui-même
+sur `ubuntu25.10` - pas une vraie régression, juste un test mal formé la
+première fois) → 15-16/16 fichiers quarantinés sur les deux VMs.
+
 ## Prochaine session : par où reprendre
 
-1. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
-2. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-3. Commencer les 3 prérequis GUI ci-dessus (socket de contrôle,
-   notifications actionnables, historique persistant) - c'est encore du
-   "core", pas la GUI elle-même, donc compatible avec la priorité
-   "agents + core d'abord".
-4. GUI de contrôle proprement dite (après le point 3). Logo déjà prêt
-   (`branding/logo.svg`), à intégrer comme icône d'appli à ce moment-là.
-5. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
+1. ~~Redéployer les fixes critiques + la découverte setuid sur
+   `ubuntu25.10`~~ **fait** - les 8 fixes (7 critiques + la découverte
+   setuid faite en validant le point 5) sont déployés et revalidés en
+   direct sur les DEUX VMs (`systemd-analyze verify` exit 0 sur les deux,
+   scénarios setuid-sous-ProtectSystem=strict et script-vs-interpréteur
+   revalidés sur `ubuntu25.10` aussi, pas juste `debian13`). Reste : un
+   nouvel audit red team complet sur les deux VMs (dans le conteneur
+   `warden-redteam`/les VMs uniquement - directive utilisateur : rien
+   téléchargé depuis internet/GitHub pour le red team, uniquement des
+   paquets `apt` et des outils écrits maison).
+2. Traiter les findings HIGH/MEDIUM listés ci-dessus.
+3. Committer le travail (actuellement ~37 fichiers modifiés + nouveaux,
+   jamais committé depuis le début de cette vague de fonctionnalités) -
+   par lots logiques.
+4. Terminer la passe SAST + relecture anti-régression en cours sur toute
+   la nouvelle surface (socket de contrôle, exceptions, GUI,
+   notify-helper) avant de committer.
+2. Redéployer sur `ubuntu25.10` (déjà fait sur `debian13`), refaire un
+   audit red team complet sur les deux VMs une fois la passe SAST
+   traitée.
+3. Committer le travail non versionné par lots logiques (voir section
+   GUI/socket/exceptions ci-dessus).
+4. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
+5. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
+6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
    (repoussé en tout dernier sur directive explicite de l'utilisateur).
-6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+7. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
