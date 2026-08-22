@@ -4,13 +4,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use aya::maps::RingBuf;
+use aya::maps::{PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 use clap::Parser;
 use tokio::io::unix::AsyncFd;
-use tracing::info;
+use tracing::{error, info, warn};
 use warden_common::event::{Mode, Severity};
 use warden_common::heuristics::is_suspicious_exec_location;
+use warden_common::history::HistoryStore;
 use warden_common::notify::Notifier;
 use warden_common::quarantine::Quarantine;
 use warden_common::response;
@@ -74,7 +75,11 @@ fn format_daddr(event: &ConnectEvent) -> String {
     }
 }
 
-async fn handle_event(event: &ConnectEvent, exe_path: &str, mode: Mode, quarantine: &Quarantine, notifier: &Notifier) {
+async fn handle_event(event: &ConnectEvent, exe_path: &str, mode: Mode, quarantine: &Quarantine, notifier: &Notifier, history: &HistoryStore) {
+    if warden_common::exceptions::is_exempt(std::path::Path::new(exe_path)) {
+        return;
+    }
+
     let reason = match event.kind {
         KIND_CONNECT => format!(
             "process at {exe_path} (a suspicious location) opened an outbound connection to {}:{}",
@@ -88,6 +93,9 @@ async fn handle_event(event: &ConnectEvent, exe_path: &str, mode: Mode, quaranti
     // live process is what matters, and response::handle_detection still
     // kills it by pid either way.
     let evt = response::handle_detection(mode, MODULE, Severity::High, event.pid, &reason, vec![PathBuf::from(exe_path)], quarantine);
+    if let Err(e) = history.record(&evt) {
+        error!(id = evt.id, error = %e, "failed to persist detection event to history");
+    }
     notifier.notify(evt.severity, &evt.summary, &evt.detail, &evt.id).await;
 }
 
@@ -111,8 +119,15 @@ async fn main() -> Result<()> {
     let ring_buf = RingBuf::try_from(ring_map).context("EVENTS is not a ring buffer")?;
     let mut poll = AsyncFd::new(ring_buf).context("registering ring buffer for async polling")?;
 
+    // See `warden-exec`'s identical addition for the full rationale.
+    let dropped_map = ebpf.take_map("DROPPED_EVENTS").context("DROPPED_EVENTS map missing")?;
+    let dropped_events: PerCpuArray<_, u64> = PerCpuArray::try_from(dropped_map).context("DROPPED_EVENTS is not a per-CPU array")?;
+    let mut last_dropped: u64 = 0;
+    let mut drop_check = tokio::time::interval(std::time::Duration::from_secs(30));
+
     let quarantine = Quarantine::new(std::path::Path::new("/var/lib/warden/quarantine")).context("initializing quarantine")?;
-    let notifier = Notifier::new(target.uid);
+    let notifier = Notifier::new(target.uid, target.gid);
+    let history = HistoryStore::new(std::path::Path::new("/var/lib/warden/history.jsonl")).context("initializing history store")?;
     let own_pid = std::process::id() as i32;
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
@@ -140,10 +155,21 @@ async fn main() -> Result<()> {
                     let Ok(exe_path) = std::fs::read_link(format!("/proc/{}/exe", event.pid)) else { continue };
                     let exe_path = exe_path.to_string_lossy().into_owned();
                     if is_suspicious_exec_location(&exe_path, &target) {
-                        handle_event(&event, &exe_path, cfg.mode, &quarantine, &notifier).await;
+                        handle_event(&event, &exe_path, cfg.mode, &quarantine, &notifier, &history).await;
                     }
                 }
                 guard.clear_ready();
+            }
+            _ = drop_check.tick() => {
+                let total: u64 = dropped_events.get(&0, 0).map(|v| v.iter().sum()).unwrap_or(0);
+                if total > last_dropped {
+                    warn!(
+                        dropped_since_start = total,
+                        dropped_since_last_check = total - last_dropped,
+                        "network ring buffer was full and dropped event(s) - some connection/listen events were not observed"
+                    );
+                    last_dropped = total;
+                }
             }
             _ = tokio::signal::ctrl_c() => { info!("received SIGINT, shutting down"); return Ok(()); }
             _ = sigterm.recv() => { info!("received SIGTERM, shutting down"); return Ok(()); }

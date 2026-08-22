@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::{map, tracepoint}, maps::RingBuf, programs::TracePointContext};
+use aya_ebpf::{helpers::bpf_get_current_pid_tgid, macros::{map, tracepoint}, maps::{PerCpuArray, RingBuf}, programs::TracePointContext};
 
 /// Matches the sock:inet_sock_set_state tracepoint format (checked against
 /// the running kernel via
@@ -60,6 +60,14 @@ pub struct ConnectEvent {
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// Counts `EVENTS.reserve()` failures (ring buffer full) - see the
+/// identical counter in `warden-exec-ebpf` for the full rationale
+/// (silent event loss under a deliberately-induced high connection rate
+/// is otherwise a completely invisible blind spot). One slot per CPU:
+/// a concurrent increment from another CPU can never race this one.
+#[map]
+static DROPPED_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 #[tracepoint]
 pub fn warden_connect(ctx: TracePointContext) -> u32 {
     match try_warden_connect(ctx) {
@@ -101,6 +109,12 @@ fn try_warden_connect(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) else {
+        if let Some(counter) = DROPPED_EVENTS.get_ptr_mut(0) {
+            // SAFETY: same reasoning as warden-exec-ebpf's identical
+            // counter - PerCpuArray guarantees this pointer names only
+            // the current CPU's own slot.
+            unsafe { *counter += 1 };
+        }
         return Ok(0);
     };
     entry.write(ConnectEvent { pid, port, family, kind, daddr });

@@ -1,0 +1,34 @@
+[Unit]
+Description=Warden EDR - outbound connection/listening socket detection (eBPF)
+After=network.target local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/warden-network
+Restart=on-failure
+RestartSec=2
+# Same capability set and reasoning as warden-exec.service, including
+# CAP_SYS_PTRACE: this module has ALWAYS resolved /proc/<pid>/exe of the
+# connecting process itself (main.rs, well before the exec-module symlink
+# fix that surfaced this capability gap) - so this was a real, likely
+# pre-existing bug, not a new one: without CAP_SYS_PTRACE the resolution
+# silently fails and `is_suspicious_exec_location` is never even reached,
+# meaning this module's suspicious-location check for outbound
+# connections/listening sockets may have never actually fired on a
+# hardened install. Found by checking rather than assumed to also need
+# it just because warden-exec did.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

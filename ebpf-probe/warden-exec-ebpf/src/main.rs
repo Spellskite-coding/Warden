@@ -4,7 +4,7 @@
 use aya_ebpf::{
     helpers::bpf_probe_read_kernel_str_bytes,
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
     EbpfContext as _,
 };
@@ -27,6 +27,19 @@ pub struct ExecEvent {
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// Counts `EVENTS.reserve()` failures (ring buffer full) - one slot per
+/// CPU, so a concurrent increment from another CPU can never race this
+/// one. Read and logged by userspace: a full ring buffer under a high
+/// exec() rate (an attacker can deliberately induce this - a flood of
+/// short-lived processes, a controlled fork bomb - to buy a window where
+/// this module is dropping events, including the one actually carrying
+/// their real payload) previously failed completely silently, with no
+/// counter, log, or metric anywhere. This turns that blind spot into an
+/// observable signal, even though it can't prevent the drop itself under
+/// sustained extreme load.
+#[map]
+static DROPPED_EVENTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 #[tracepoint]
 pub fn warden_exec(ctx: TracePointContext) -> u32 {
     match try_warden_exec(ctx) {
@@ -47,6 +60,13 @@ fn try_warden_exec(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     let Some(mut entry) = EVENTS.reserve::<ExecEvent>(0) else {
+        if let Some(counter) = DROPPED_EVENTS.get_ptr_mut(0) {
+            // SAFETY: PerCpuArray guarantees this pointer names the
+            // current CPU's own slot, never shared with any other CPU
+            // running this same program concurrently - a plain
+            // non-atomic increment is race-free here for that reason.
+            unsafe { *counter += 1 };
+        }
         return Ok(0);
     };
     entry.write(ExecEvent { pid, filename });

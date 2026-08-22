@@ -1,0 +1,47 @@
+[Unit]
+Description=Warden EDR - fileless/exec-from-suspicious-location detection (eBPF)
+After=network.target local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/warden-exec
+Restart=on-failure
+RestartSec=2
+# CAP_SYS_ADMIN/CAP_BPF/CAP_PERFMON (root) required to load and attach
+# eBPF programs and tracepoints; CAP_DAC_OVERRIDE for the same
+# quarantine-a-flagged-process response path warden itself uses
+# (response::handle_detection - Quarantine::take only ever renames/
+# copies/removes, so DAC_OVERRIDE alone covers it; FOWNER/CHOWN would
+# only matter for Quarantine::restore, which this binary never calls);
+# CAP_KILL to stop/kill the flagged process; CAP_SETUID/CAP_SETGID
+# because this binary also spawns warden-notify-helper directly (via
+# Notifier::notify, same as warden.service) to pop a desktop
+# notification for what it detects - dropped from an earlier pass of
+# this hardening, which silently broke exec-detection notifications
+# (EPERM on the uid/gid/setgroups drop, only ever `warn!`-logged) while
+# detection and quarantine kept working fine, discovered in review.
+# CAP_SYS_PTRACE - resolving /proc/<pid>/exe of the exec'd process (a
+# process this binary did not itself spawn), needed to see through a
+# symlink placed between the tracepoint's raw, kernel-never-resolved
+# execve() path and the real binary it points at - without it that
+# resolution fails silently (EACCES) and this module quietly falls back
+# to only ever checking the raw, symlink-unaware path, the exact
+# real-world gap live red-team testing found and this capability fixes.
+# Same root cause as warden.service's identical addition for
+# warden_common::package_manager - found again here in review after that
+# one, not assumed to also apply without checking.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
