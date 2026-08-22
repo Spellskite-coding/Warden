@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Every directory a real system package manager binary can legitimately
@@ -83,6 +83,35 @@ const PACKAGE_MANAGER_PROCESS_NAMES: &[&str] = &[
 /// directory check closes it - `/tmp` (or anywhere else a decoy could be
 /// dropped) can never canonicalize to a `SYSTEM_BIN_DIRS` entry, no
 /// matter what the binary is named or renamed to.
+/// Whether `exe_name` is an interpreter binary that a legitimate
+/// package-manager script is known to run under. `unattended-upgrade` is
+/// the motivating case: it's a Python script (shebang `#!/usr/bin/python3`),
+/// so its `/proc/<pid>/exe` resolves to the interpreter that executed it,
+/// never to the script file itself - the exact same interpreter-vs-script
+/// distinction already worked around in `warden-exec`'s exec-event
+/// handling. The version-suffixed check (`python3.11`, `python3.13`, ...)
+/// matters because `/usr/bin/python3` itself is frequently just a symlink,
+/// and the *resolved* `exe` target on the distros in the test matrix is
+/// the versioned binary, not the `python3` name.
+fn is_known_interpreter(exe_name: &str) -> bool {
+    exe_name == "python3" || exe_name.starts_with("python3.")
+}
+
+/// For a process whose `exe` is a known interpreter rather than the
+/// package manager itself, extracts the script path it was actually
+/// invoked with. Reads `argv[1]` from `/proc/<pid>/cmdline`: when the
+/// kernel runs a shebang script (`binfmt_script`), it re-executes as
+/// `<interpreter> <script-path> <original-args...>`, so the script's own
+/// path is always the interpreter's first argument for the simple,
+/// no-`env`-indirection shebang line `unattended-upgrade` actually uses.
+fn interpreted_script_path(proc_path: &Path) -> Option<PathBuf> {
+    let cmdline = fs::read(proc_path.join("cmdline")).ok()?;
+    let mut args = cmdline.split(|&b| b == 0).filter(|s| !s.is_empty());
+    args.next()?; // argv[0]: the interpreter itself
+    let script = args.next()?;
+    Some(PathBuf::from(std::str::from_utf8(script).ok()?))
+}
+
 pub fn is_active() -> bool {
     let system_bin_dirs = canonical_system_bin_dirs();
     let Ok(entries) = fs::read_dir("/proc") else { return false };
@@ -99,14 +128,34 @@ pub fn is_active() -> bool {
 
         let Ok(exe) = fs::read_link(path.join("exe")) else { continue };
         let Some(exe_name) = exe.file_name().and_then(|n| n.to_str()) else { continue };
-        if !PACKAGE_MANAGER_PROCESS_NAMES.contains(&exe_name) {
-            continue;
-        }
 
         let Some(exe_dir) = exe.parent() else { continue };
         let Ok(exe_dir) = exe_dir.canonicalize() else { continue };
-        if system_bin_dirs.contains(&exe_dir) {
+        if !system_bin_dirs.contains(&exe_dir) {
+            continue;
+        }
+
+        if PACKAGE_MANAGER_PROCESS_NAMES.contains(&exe_name) {
             return true;
+        }
+
+        // `exe` resolving to a real interpreter in a system bin dir only
+        // proves the interpreter is genuine - it says nothing about which
+        // script it's running, and an attacker who controls the exec call
+        // controls `argv` (`python3 /tmp/evil` can present its script arg
+        // as anything, the same way `comm` can be spoofed via
+        // `prctl(PR_SET_NAME)`). So the script path pulled from `cmdline`
+        // gets the exact same two checks as `exe` above: known name *and*
+        // its own directory canonicalizes into `SYSTEM_BIN_DIRS` - a
+        // decoy at `/tmp/unattended-upgrade` still can't pass that.
+        if is_known_interpreter(exe_name) {
+            if let Some(script) = interpreted_script_path(&path) {
+                let script_name_ok = script.file_name().and_then(|n| n.to_str()).is_some_and(|n| PACKAGE_MANAGER_PROCESS_NAMES.contains(&n));
+                let script_dir_ok = script.parent().and_then(|d| d.canonicalize().ok()).is_some_and(|d| system_bin_dirs.contains(&d));
+                if script_name_ok && script_dir_ok {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -119,6 +168,52 @@ mod tests {
     #[test]
     fn is_active_does_not_panic_and_returns_a_bool() {
         let _: bool = is_active();
+    }
+
+    #[test]
+    fn recognizes_versioned_python_interpreter_names() {
+        assert!(is_known_interpreter("python3"));
+        assert!(is_known_interpreter("python3.11"));
+        assert!(is_known_interpreter("python3.13"));
+        assert!(!is_known_interpreter("python2"));
+        assert!(!is_known_interpreter("python"));
+        assert!(!is_known_interpreter("perl"));
+    }
+
+    /// Regression test for a real red-team-confirmed gap: `unattended-upgrade`
+    /// is a Python script, so `/proc/<pid>/exe` resolves to the `python3`
+    /// interpreter that ran it, not to the script - `is_active()` never
+    /// recognized a live `unattended-upgrade` run at all before the
+    /// interpreter fallback was added. `interpreted_script_path` is what
+    /// recovers the actual script path from `cmdline` in that case; this
+    /// exercises it directly against a synthesized `cmdline` (real
+    /// `/proc/<pid>/cmdline` is NUL-separated argv, exactly reproduced here)
+    /// rather than needing to spawn and inspect a real process.
+    #[test]
+    fn interpreted_script_path_reads_argv1_from_cmdline() {
+        let dir = std::env::temp_dir().join(format!("warden-pkgmgr-cmdline-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creating scratch dir");
+        let mut cmdline = Vec::new();
+        cmdline.extend_from_slice(b"/usr/bin/python3\0");
+        cmdline.extend_from_slice(b"/usr/bin/unattended-upgrade\0");
+        cmdline.extend_from_slice(b"--dry-run\0");
+        std::fs::write(dir.join("cmdline"), &cmdline).expect("writing synthetic cmdline");
+
+        let script = interpreted_script_path(&dir).expect("should parse a script path out of argv");
+        assert_eq!(script, PathBuf::from("/usr/bin/unattended-upgrade"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interpreted_script_path_returns_none_when_there_is_no_second_argv() {
+        let dir = std::env::temp_dir().join(format!("warden-pkgmgr-cmdline-noarg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creating scratch dir");
+        std::fs::write(dir.join("cmdline"), b"/usr/bin/python3\0").expect("writing synthetic cmdline");
+
+        assert!(interpreted_script_path(&dir).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression test for the red-team-confirmed bypass: a decoy binary

@@ -25,16 +25,27 @@ rule Bash_Dev_Tcp_Reverse_Shell
         // redirection-operator regex only matches actual shell REDIRECTION
         // SYNTAX (">/dev/tcp/host/port", "3<>/dev/tcp/..."), which the bare
         // path string inside bash's own binary doesn't happen to be
-        // adjacent to; and filesize caps out real reverse-shell payloads
+        // adjacent to; and both trigger strings must appear within the
+        // first 64KB of the file, which any real reverse-shell payload
         // (always a small text script, from a one-liner up to a few KB)
-        // well below any real ELF binary's size, bash's own included
-        // (~1.3MB on a typical Debian install).
+        // does trivially.
+        //
+        // This used to be a plain `filesize < 65536` condition gating the
+        // *entire* file instead - found, in a later review, to be a real
+        // bypass: an attacker can keep the actual payload unchanged (still
+        // a working reverse shell) and just pad the file past 64KB with
+        // trailing junk (a comment block, here-doc, or anything bash never
+        // reaches), pushing `filesize` over the cutoff and making YARA
+        // skip scanning the file's content at all. Bounding *where* the
+        // matched strings must occur - rather than exempting the whole
+        // file once it crosses a size threshold - still lets a script grow
+        // arbitrarily large after the payload without evading detection.
     strings:
         $tcp_redir = /[<>]&?\s{0,2}\/dev\/tcp\// ascii
         $udp_redir = /[<>]&?\s{0,2}\/dev\/udp\// ascii
         $exec = "exec " ascii
     condition:
-        ($tcp_redir or $udp_redir) and $exec and filesize < 65536
+        (($tcp_redir in (0..65536)) or ($udp_redir in (0..65536))) and ($exec in (0..65536))
 }
 
 rule Netcat_Reverse_Shell
