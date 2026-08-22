@@ -1,8 +1,8 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use nix::sys::signal::Signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Opens a pidfd for `pid` via the `pidfd_open(2)` syscall - not exposed
 /// by the pinned `nix` 0.31 (no `pidfd` module in this version; later
@@ -72,26 +72,57 @@ fn pidfd_send_signal(pidfd: &OwnedFd, signal: Signal) -> std::io::Result<()> {
 /// isn't something a pidfd opened only once execution reaches here can
 /// retroactively fix - but it does eliminate the previously-real risk of
 /// the SIGSTOP and SIGKILL steps drifting onto two different processes.
+/// Sends `signal` to `pid` the old-fashioned way, by raw PID number
+/// (`kill(2)`) rather than through a pidfd. Only ever used as a fallback
+/// when `pidfd_open` itself fails - a review found that `stop_then_kill`
+/// used to treat *any* `pidfd_open` failure as fatal and send no signal
+/// at all, a real regression from the plain `kill(pid)` best-effort
+/// behavior this code had before pidfds were introduced. `pidfd_open` can
+/// fail for reasons that have nothing to do with the process already
+/// being gone - `EMFILE`/`ENFILE` (this process or the system out of file
+/// descriptors), a syscall that's filtered by a seccomp profile, an
+/// unsupported kernel - and in every one of those cases the target
+/// process is very much still alive and worth signaling anyway. Weaker
+/// than the pidfd path (vulnerable to the PID being reused between this
+/// call and a subsequent one, the exact race pidfds exist to close), but
+/// strictly better than the alternative of silently doing nothing.
+fn raw_kill(pid: i32, signal: Signal) -> std::io::Result<()> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal).map_err(std::io::Error::from)
+}
+
 pub fn stop_then_kill(pid: i32) -> Result<()> {
     let pidfd = match pidfd_open(pid) {
-        Ok(fd) => fd,
+        Ok(fd) => Some(fd),
         Err(e) => {
-            error!(pid, error = %e, "failed to open pidfd for suspect process (may have already exited)");
-            bail!("pidfd_open failed for pid {pid}: {e}");
+            warn!(pid, error = %e, "pidfd_open failed, falling back to raw kill(pid) by PID number (weaker: vulnerable to PID reuse, but still better than sending no signal at all)");
+            None
         }
     };
 
-    if let Err(e) = pidfd_send_signal(&pidfd, Signal::SIGSTOP) {
-        error!(pid, error = %e, "failed to SIGSTOP suspect process (may have already exited)");
+    match &pidfd {
+        Some(pidfd) => {
+            if let Err(e) = pidfd_send_signal(pidfd, Signal::SIGSTOP) {
+                error!(pid, error = %e, "failed to SIGSTOP suspect process via pidfd (may have already exited)");
+            }
+        }
+        None => {
+            if let Err(e) = raw_kill(pid, Signal::SIGSTOP) {
+                error!(pid, error = %e, "failed to SIGSTOP suspect process via fallback raw kill (may have already exited)");
+            }
+        }
     }
 
-    match pidfd_send_signal(&pidfd, Signal::SIGKILL) {
+    let kill_result = match &pidfd {
+        Some(pidfd) => pidfd_send_signal(pidfd, Signal::SIGKILL),
+        None => raw_kill(pid, Signal::SIGKILL),
+    };
+    match kill_result {
         Ok(()) => {
-            info!(pid, "killed suspect process");
+            info!(pid, via_pidfd = pidfd.is_some(), "killed suspect process");
             Ok(())
         }
         Err(e) => {
-            error!(pid, error = %e, "failed to SIGKILL suspect process");
+            error!(pid, via_pidfd = pidfd.is_some(), error = %e, "failed to SIGKILL suspect process");
             Err(e.into())
         }
     }
@@ -109,6 +140,25 @@ mod tests {
     #[test]
     fn pidfd_open_fails_for_a_pid_that_does_not_exist() {
         assert!(pidfd_open(i32::MAX).is_err());
+    }
+
+    /// Regression test for the confirmed regression: when `pidfd_open`
+    /// fails, `stop_then_kill` must still send SIGSTOP/SIGKILL via the
+    /// `raw_kill` fallback rather than silently doing nothing. Exercises
+    /// `raw_kill` directly (there's no portable way to force a real
+    /// `pidfd_open` failure against a genuinely live process from a unit
+    /// test), the same way the existing `pidfd_open_*` tests already
+    /// isolate the primary path.
+    #[test]
+    fn raw_kill_fallback_actually_terminates_a_real_child_process() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("failed to spawn test child");
+        let pid = child.id() as i32;
+
+        raw_kill(pid, Signal::SIGSTOP).expect("raw_kill(SIGSTOP) should succeed on our own live child");
+        raw_kill(pid, Signal::SIGKILL).expect("raw_kill(SIGKILL) should succeed on our own live child");
+
+        let status = child.wait().expect("waiting on killed child should succeed");
+        assert!(!status.success(), "a SIGKILLed child must not report success");
     }
 
     #[test]

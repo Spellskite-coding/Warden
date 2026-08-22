@@ -162,11 +162,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(path) = &args.quarantine_file {
-        if warden_common::exceptions::is_exempt(path) {
+        // Canonicalized before the exemption check, matching
+        // `--add-exception`/`--remove-exception` (see `exceptions::add`'s
+        // doc comment): every entry in the exceptions file is stored
+        // canonical, and `is_exempt` matches on a raw string comparison,
+        // so checking a non-canonical `path` here (a relative path, a
+        // `..` component, a symlink not yet resolved) would silently
+        // fail to recognize a file that genuinely has an active
+        // exception - defeating the "refuses to act on an exempted path"
+        // safety check below simply by spelling the same path
+        // differently than however it was originally exempted.
+        let path = path.canonicalize().with_context(|| format!("resolving {}", path.display()))?;
+        if warden_common::exceptions::is_exempt(&path) {
             anyhow::bail!("{} has an active exception - remove it first if you really want to quarantine this file", path.display());
         }
         let quarantine = Quarantine::new(std::path::Path::new("/var/lib/warden/quarantine"))?;
-        match quarantine.take(path, "manual", -1, "quarantined manually by an operator via pkexec") {
+        match quarantine.take(&path, "manual", -1, "quarantined manually by an operator via pkexec") {
             Ok(Some(dest)) => {
                 println!("Quarantined {} to {}", path.display(), dest.display());
                 let history = HistoryStore::new(std::path::Path::new("/var/lib/warden/history.jsonl"))?;

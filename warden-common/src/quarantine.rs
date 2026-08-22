@@ -1,10 +1,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -162,13 +163,69 @@ impl Quarantine {
         self.dir.join("manifest.jsonl")
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.dir.join("manifest.lock")
+    }
+
+    /// Acquires an exclusive advisory lock (`flock(2)`) shared by every
+    /// process that ever touches this quarantine directory's manifest -
+    /// `warden` itself, `warden-exec`, `warden-network`, and every
+    /// detection module each run in their own process, all sharing this
+    /// one directory. A review found a real lost-write race without this:
+    /// `restore()` reads the whole manifest, moves the file, then
+    /// rewrites the manifest with everything *except* the restored entry.
+    /// If another process's `take()` appended a brand new entry in
+    /// between that read and that rewrite, the rewrite's full-file
+    /// overwrite silently discarded it, even though the file it described
+    /// really was sitting in quarantine with no manifest record naming it
+    /// afterward. Held for the entire read-modify-write section in
+    /// `restore()`, and around every single `append_manifest` call, so
+    /// the two paths fully serialize against each other and against
+    /// themselves across processes, instead of racing.
+    fn lock_manifest(&self) -> Result<Flock<fs::File>> {
+        let path = self.lock_path();
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        Flock::lock(f, FlockArg::LockExclusive).map_err(|(_, e)| anyhow::anyhow!("flock on {}: {e}", path.display()))
+    }
+
     fn append_manifest(&self, entry: &ManifestEntry) -> Result<()> {
+        let _lock = self.lock_manifest()?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(self.manifest_path())
             .with_context(|| format!("opening {}", self.manifest_path().display()))?;
-        writeln!(f, "{}", serde_json::to_string(entry)?)?;
+        // `.mode(0o600)` above only governs the permissions a *newly
+        // created* file gets - confirmed live, the hard way: a manifest
+        // that already existed from before this hardening (e.g. an
+        // in-place upgrade of a running install) kept its old, looser
+        // mode indefinitely, since `open()` ignores the mode argument
+        // entirely once `O_CREAT` doesn't actually need to create
+        // anything. Re-applied explicitly on every call instead, on the
+        // already-open handle (no separate path-based TOCTOU), the same
+        // "never trust it survived, always re-assert it" pattern
+        // `Quarantine::new` already uses for the directory itself.
+        f.set_permissions(fs::Permissions::from_mode(0o600)).with_context(|| format!("hardening permissions on {}", self.manifest_path().display()))?;
+        // A single `write_all` on the fully-built line, not `writeln!`
+        // directly against `f`: a review found `writeln!` here issues two
+        // separate `write(2)` syscalls (the JSON string, then the
+        // newline), and while each individual `write(2)` to an
+        // `O_APPEND` fd is atomic with respect to other writers, a *pair*
+        // of them is not - a concurrent writer's entire line could land
+        // in between this one's two writes, corrupting both into one
+        // garbled, unparseable line. Building the complete line first and
+        // writing it in one call closes that even without the lock above,
+        // though the lock alone would already fully serialize this too.
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        f.write_all(line.as_bytes())?;
         Ok(())
     }
 
@@ -210,6 +267,11 @@ impl Quarantine {
     /// kernel checks existence and performs the move as one atomic
     /// operation instead.
     pub fn restore(&self, quarantine_name: &str) -> Result<PathBuf> {
+        // Held for the whole read-modify-write below (list -> move file
+        // -> rewrite manifest), not just the final rewrite - see
+        // `lock_manifest`'s doc comment for the lost-write race this
+        // closes.
+        let _lock = self.lock_manifest()?;
         let entries = self.list()?;
         let Some(entry) = entries.iter().find(|e| e.quarantine_name == quarantine_name) else {
             bail!("no quarantined file with id {quarantine_name:?}");
@@ -281,7 +343,20 @@ impl Quarantine {
     /// it here, and avoids ever leaving the manifest torn mid-edit.
     fn rewrite_manifest(&self, entries: &[&ManifestEntry]) -> Result<()> {
         let tmp_path = self.dir.join("manifest.jsonl.tmp");
-        let mut f = fs::File::create(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        // Same reasoning as `append_manifest`'s explicit re-chmod: a
+        // stale `.tmp` left behind by an interrupted rewrite (a crash
+        // between this `open` and the `rename` below, from some earlier
+        // run) would otherwise keep whatever permissions it already had,
+        // since `.mode(0o600)` only takes effect when `open` actually
+        // creates the file.
+        f.set_permissions(fs::Permissions::from_mode(0o600)).with_context(|| format!("hardening permissions on {}", tmp_path.display()))?;
         for entry in entries {
             writeln!(f, "{}", serde_json::to_string(entry)?)?;
         }
@@ -357,6 +432,91 @@ mod tests {
         assert_eq!(dest_mode, 0, "the quarantined copy must never carry the source's setuid/setgid/sticky bits");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for the confirmed lost-write race: many processes
+    /// (simulated here with threads - `flock` locks are per open file
+    /// description, so a fresh `open()` per `lock_manifest()` call
+    /// behaves identically whether it comes from a thread or a separate
+    /// process) appending concurrently must never lose or corrupt an
+    /// entry, which the old two-syscall `writeln!` plus lack of any
+    /// cross-process serialization could do.
+    #[test]
+    fn concurrent_appends_do_not_lose_or_corrupt_entries() {
+        let qdir = temp_dir("concurrent-append");
+        let quarantine = std::sync::Arc::new(Quarantine::new(&qdir).unwrap());
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let q = quarantine.clone();
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        q.append_manifest(&ManifestEntry {
+                            quarantined_at_unix: 0,
+                            module: "test".to_string(),
+                            pid: i,
+                            reason: "concurrency test".to_string(),
+                            original_path: format!("/tmp/f-{i}-{j}"),
+                            quarantine_name: format!("entry-{i}-{j}"),
+                            original_mode: 0,
+                            original_uid: 0,
+                            original_gid: 0,
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let entries = quarantine.list().unwrap();
+        assert_eq!(entries.len(), 8 * 20, "every concurrently appended entry must survive intact and parseable, none lost to interleaving");
+
+        fs::remove_dir_all(&qdir).ok();
+    }
+
+    /// Regression test for the specific lost-write scenario a review
+    /// found: `restore()`'s read-modify-write (list, move file, rewrite
+    /// manifest minus the restored entry) used to have no lock around it,
+    /// so a `take()` that appended a brand new entry while a `restore()`
+    /// was in flight elsewhere had that append silently discarded by the
+    /// restore's stale-snapshot rewrite.
+    #[test]
+    fn concurrent_take_during_restore_does_not_lose_the_new_entry() {
+        let qdir = temp_dir("concurrent-restore-take");
+        let quarantine = std::sync::Arc::new(Quarantine::new(&qdir).unwrap());
+
+        let src_dir = temp_dir("concurrent-restore-take-src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let first = src_dir.join("first.sh");
+        fs::write(&first, b"echo hi").unwrap();
+        quarantine.take(&first, "yara", -1, "first").unwrap().unwrap();
+        let first_id = quarantine.list().unwrap()[0].quarantine_name.clone();
+
+        let restore_handle = {
+            let q = quarantine.clone();
+            std::thread::spawn(move || q.restore(&first_id))
+        };
+        let take_handle = {
+            let q = quarantine.clone();
+            let second = src_dir.join("second.sh");
+            std::thread::spawn(move || {
+                fs::write(&second, b"echo bye").unwrap();
+                q.take(&second, "yara", -1, "second")
+            })
+        };
+
+        restore_handle.join().unwrap().unwrap();
+        take_handle.join().unwrap().unwrap();
+
+        let remaining = quarantine.list().unwrap();
+        assert_eq!(remaining.len(), 1, "the concurrently-quarantined second file must still be recorded in the manifest, not silently dropped");
+        assert!(remaining[0].original_path.ends_with("second.sh"));
+
+        fs::remove_dir_all(&qdir).ok();
+        fs::remove_dir_all(&src_dir).ok();
     }
 
     #[test]

@@ -247,7 +247,7 @@ pub fn run(
                 // threshold instead (see `Detector::observe_container_format_write`)
                 // so bulk legitimate saves still pass but blanket
                 // signature-forgery across many files doesn't.
-                if let Verdict::Burst { affected } = detector.observe_container_format_write(&path) {
+                if let Verdict::Burst { affected } = detector.observe_container_format_write(pid, &path) {
                     let evt = response::handle_detection(
                         mode,
                         MODULE,
@@ -263,6 +263,7 @@ pub fn run(
                         &quarantine,
                     );
                     let _ = event_tx.send(evt);
+                    detector.forget(pid);
                 } else {
                     debug!(pid, path = %path.display(), "high-entropy write recognized as a known container format, tracked but not yet over threshold");
                 }

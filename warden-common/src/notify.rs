@@ -82,6 +82,20 @@ fn spawn_helper(target_uid: u32, target_gid: u32) -> Result<ChildHandle> {
     // threaded at that point, so plain syscalls here are safe despite
     // the `unsafe` on the API.
     let mut command = Command::new(helper_path());
+    // systemd sets NOTIFY_SOCKET in this (root) process's own environment
+    // for `sd_notify(3)`-based readiness signaling (see main.rs's
+    // `READY=1` gating). `Command::spawn` inherits the parent's
+    // environment by default, so without this the child - about to have
+    // its privileges dropped to the target *user* - would otherwise
+    // inherit a live path to systemd's notification socket for this
+    // root-owned unit. An unprivileged process holding that would be
+    // able to send this service's systemd unit spoofed `WATCHDOG=1`/
+    // `READY=1`/`STOPPING=1` datagrams - e.g. defeating a watchdog timer
+    // meant to catch this same daemon hanging. `warden-notify-helper`
+    // itself never needs it (it never calls sd_notify), and stripping it
+    // here also means nothing it in turn execs (`warden-gui`) ever sees
+    // it either.
+    command.env_remove("NOTIFY_SOCKET");
     unsafe {
         command.as_std_mut().pre_exec(move || {
             nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(target_gid)]).map_err(std::io::Error::from)?;

@@ -1119,49 +1119,164 @@ Note utilisateur en cours de session : `/usr/bin` est refusé par
 `StartScan` (backlog HIGH, section précédente), pas de ce lot MEDIUM. À
 laisser tel quel sur confirmation explicite de l'utilisateur.
 
+## Backlog MEDIUM/LOW traité en totalité (22 août, suite 4)
+
+Sur directive explicite de l'utilisateur ("fait toute la ligne
+medium/low"), les 9 findings restants du backlog HIGH/MEDIUM/LOW sont
+tous corrigés, testés en Docker, et validés en direct sur les deux VMs :
+
+**`pidfd_open` qui échoue ne signalait plus rien du tout**
+(`warden-common::process`) - régression confirmée par rapport à l'ancien
+`kill(pid)` best-effort : n'importe quel échec de `pidfd_open` (pas
+seulement "process déjà mort") faisait abandonner `stop_then_kill` sans
+envoyer aucun signal. **Fix** : nouvelle fonction `raw_kill` (kill par
+PID brut, moins sûr face au PID reuse que la voie pidfd mais strictement
+meilleur que rien) utilisée en fallback quand `pidfd_open` échoue. Testé
+directement (`raw_kill_fallback_actually_terminates_a_real_child_process`)
+- pas de moyen portable de forcer un vrai échec `pidfd_open` sur un
+process réellement vivant depuis un test unitaire, donc le fallback est
+testé isolément, même logique que les tests `pidfd_open_*` existants.
+
+**`control::run`'s `accept()` tuait le listener IPC en permanence**
+(`warden-core::control`) - une seule erreur (`EMFILE`/`ENFILE` typiquement)
+propagée via `?` terminait toute la boucle de contrôle pour le reste de
+la vie du démon. **Fix** : boucle de retry avec backoff croissant
+(plafonné à 2s), même schéma que le retry déjà en place sur
+`fanotify::read_events`.
+
+**TOCTOU sur les permissions du socket de contrôle** entre `bind()` et
+`chmod`/`chown` (`warden-core::control`) - **fix** : `umask(0o077)` posé
+juste avant `bind()`, restauré juste après - le socket naît déjà
+non-accessible au groupe/others, sans fenêtre. **Validé en direct sur les
+deux VMs** : `stat` sur `/run/warden/control.sock` juste après démarrage
+→ `600 test:test` sur les deux.
+
+**Contournement par forgerie de format container plus large que
+documenté** (`warden-ransomware::detector`) - `observe_container_format_write`
+ne trackait QUE par répertoire et globalement, aucun compteur par-PID,
+contrairement à `observe_high_entropy_write`. Un process non-forké qui
+forge une signature ZIP/PDF sur chaque fichier chiffré bénéficiait donc
+d'un seuil 3x plus faible que prévu simplement parce que le signal le
+plus direct (par-PID) manquait totalement sur ce chemin. **Fix** :
+compteur `recent_container_format_writes_by_pid` ajouté au même seuil
+élevé que les deux autres, `files_for_pid`/`forget` mis à jour pour le
+fusionner - restaure aussi l'attribution correcte pour la réponse
+(quarantaine). Testé
+(`container_format_burst_from_a_single_pid_is_attributed_to_that_pid`).
+
+**Dossier de règles YARA custom illisible faisait échouer tout le
+module** (`warden-yara::rules`) - `read_dir` sur un dossier existant mais
+illisible (ACL cassée, montage réseau) propageait via `?`, faisant
+échouer `compile()` entièrement - même les règles builtin. Scénario
+plausible en prod : `custom_rules_dir` hors du périmètre
+`ReadWritePaths=` de `ProtectSystem=strict` renvoie `EACCES` même à root
+au niveau du mount namespace, pas des permissions DAC classiques (donc
+pas reproductible par un simple `chmod 000` en root dans un test unitaire
+- documenté honnêtement plutôt que simulé). **Fix** : dégrade vers
+builtin-only avec un `warn!`, comme le cas "dossier absent" déjà géré.
+Testés : dossier absent (`nonexistent_custom_rules_dir_falls_back_to_builtin_only`)
+et dossier valide avec une règle custom
+(`a_valid_custom_rule_file_loads_alongside_builtins`) - aucun test
+n'existait avant pour le chemin custom-rules-dir du tout.
+
+**`NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui` malgré
+la chute de privilèges** (`warden-common::notify`) - systemd pose
+`NOTIFY_SOCKET` dans l'environnement du process root ; sans
+`env_remove`, le helper (privilèges tombés vers l'utilisateur cible) en
+héritait, lui donnant un canal pour envoyer de faux `WATCHDOG=1`/
+`READY=1` à l'unité systemd de ce démon root. **Fix** :
+`command.env_remove("NOTIFY_SOCKET")` avant le `pre_exec` de drop de
+privilèges - `warden-gui` (lancé PAR le helper, jamais directement par
+`warden-core`) en hérite naturellement l'absence. **Validé en direct sur
+`debian13`** : déclenché une vraie détection YARA (reverse shell déposé),
+capturé `/proc/<pid du helper>/environ` → `NOTIFY_SOCKET` absent, contre
+présent dans l'environ de `warden` lui-même (`/run/systemd/notify`) pour
+comparaison.
+
+**`--quarantine-file` : check d'exemption sur un chemin non-canonicalisé**
+(`warden-core::main`) - contrairement à `--add-exception`/
+`--remove-exception` (qui canonicalisent avant de comparer), un chemin
+relatif ou avec `..` passé à `--quarantine-file` pouvait faire échouer
+silencieusement la reconnaissance d'une exception active existante,
+contournant le garde-fou "refuse d'agir sur un chemin exempté". **Fix** :
+canonicalisation ajoutée avant `is_exempt`/`quarantine.take`, cohérent
+avec le reste du CLI.
+
+**Fichiers manifest de quarantaine pas durcis à `0600`**
+(`warden-common::quarantine`) - `manifest.jsonl` et son fichier de
+réécriture temporaire (`rewrite_manifest`) n'avaient pas de mode explicite.
+**Fix initial** : `.mode(0o600)` sur les `OpenOptions`. **Piège trouvé en
+validant en direct** : `.mode()` ne s'applique QUE si `open()` crée
+réellement le fichier - un `manifest.jsonl` déjà existant sur `debian13`
+(accumulé pendant toute cette session) restait à `644` après le premier
+redéploiement, `.mode(0o600)` n'ayant simplement rien à faire sur un
+fichier déjà là. **Fix corrigé** : `f.set_permissions(0o600)` réappliqué
+explicitement sur le handle déjà ouvert, à chaque appel, même logique que
+`Quarantine::new()` pour le dossier lui-même ("ne jamais faire confiance
+à ce qui a survécu, toujours la réaffirmer"). **Re-validé en direct sur
+les deux VMs après correction** : nouvelle détection déclenchée →
+`manifest.jsonl` bien à `600 root:root` sur `debian13` ET `ubuntu25.10`.
+
+**Perte d'entrées manifest sous accès concurrent `take()`/`restore()`**
+(`warden-common::quarantine`) - 6 process différents (`warden`,
+`warden-exec`, `warden-network`, et chaque module de détection dans son
+propre process) partagent le même répertoire de quarantaine sans aucun
+verrou. `restore()` lit tout le manifest, déplace le fichier, puis
+réécrit le manifest SANS l'entrée restaurée - un `take()` concurrent qui
+ajoute une entrée entre cette lecture et cette réécriture se faisait
+silencieusement écraser par la réécriture basée sur l'instantané périmé.
+Second problème trouvé en marge : `append_manifest` utilisait `writeln!`
+directement sur le fichier, ce qui émet DEUX appels `write(2)` séparés
+(la ligne JSON, puis le `\n`) - chacun atomique individuellement sous
+`O_APPEND`, mais pas la paire, laissant une fenêtre où l'écriture d'un
+autre process pouvait s'intercaler entre les deux et corrompre les deux
+lignes. **Fix** : verrou `flock(2)` exclusif partagé
+(`manifest.lock`, nouveau fichier) posé sur toute la section
+lire-modifier-écrire de `restore()` et autour de chaque appel à
+`append_manifest` ; `append_manifest` construit la ligne complète
+(JSON + `\n`) et l'écrit en un seul `write_all`. Testés :
+`concurrent_appends_do_not_lose_or_corrupt_entries` (8 threads × 20
+écritures, aucune perdue) et `concurrent_take_during_restore_does_not_lose_the_new_entry`
+(reproduit précisément le scénario de perte confirmé) - un `flock` posé
+via un `open()` frais par appel se comporte identiquement entre threads
+et process séparés, donc ces tests reproduisent fidèlement la course
+inter-process réelle.
+
+**Drip-feed lent et kill symbolique pour un process déjà mort** :
+confirmés comme limitations structurelles (détection par fenêtre
+glissante, quarantaine des fichiers reste la vraie protection dans ce
+cas) plutôt que des bugs à corriger - acceptées, documentées, pas de
+changement de code.
+
+Testé : `cargo build --workspace` + `cargo clippy --workspace
+--all-targets -- -D warnings` propres + `cargo test --workspace` (63
+tests, tous verts). Déployé et revalidé en direct sur `debian13` ET
+`ubuntu25.10` : socket de contrôle `600`, `Ping`/`Pong` fonctionnel,
+détection reverse-shell toujours opérationnelle (quarantaine effective),
+`manifest.jsonl`/`manifest.lock` à `600 root:root` sur les deux,
+`NOTIFY_SOCKET` absent de l'environnement de `warden-notify-helper`.
+
 ## Prochaine session : par où reprendre
 
-Les 7 CRITIQUES + les 3 HIGH (2 TOCTOU + oracle StartScan) + les 3 MEDIUM
-ci-dessus (oracle/DoS résiduel StartScan, padding YARA, unattended-upgrades)
-sont tous corrigés, testés en Docker, et validés en direct sur les deux
-VMs. Ce lot MEDIUM reste **à committer** (pas encore fait au moment
-d'écrire cette section).
+Le backlog HIGH/MEDIUM/LOW documenté depuis le début de cette vague est
+maintenant **entièrement traité** (7 critiques + 3 HIGH + 12 MEDIUM/LOW,
+2 de ces derniers acceptés comme limitations structurelles plutôt que
+corrigés). Reste à committer ce dernier lot, puis :
 
-1. Committer ce lot MEDIUM (3 fichiers modifiés : `warden-yara/src/scan.rs`,
-   `warden-yara/rules/builtin.yar`, `warden-yara/src/rules.rs`,
-   `warden-common/src/package_manager.rs`) - probablement un seul commit
-   logique, les trois fixes sont indépendants mais petits.
-2. Backlog MEDIUM/LOW restant (voir la liste "Findings HIGH/MEDIUM
-   restants" plus haut pour le détail de chacun) :
-   - `pidfd_open` qui échoue (hors "process déjà mort") ne retente plus
-     rien du tout - régression par rapport à l'ancien `kill(pid)`
-     best-effort.
-   - `control::run`'s `accept()` qui échoue une fois tue le listener IPC
-     en permanence.
-   - Contournement par forgerie de format container plus large que
-     documenté (perd le tracking par-PID entièrement, pas juste un seuil
-     x3).
-   - Dossier de règles YARA custom illisible (pas juste absent) fait
-     échouer tout le module au lieu de dégrader vers les règles builtin
-     seules.
-   - `NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui`
-     malgré la chute de privilèges (pas de `env_remove` avant
-     `pre_exec`).
-   - `--quarantine-file` : le check d'exemption utilise un chemin non
-     canonicalisé (contrairement à `--add-exception`/`--remove-exception`).
-   - TOCTOU sur les permissions du socket de contrôle entre `bind()` et
-     `chmod`/`chown`.
-   - Fichiers manifest de quarantaine pas durcis à `0600`.
-   - Perte d'entrées manifest sous accès concurrent `take()`/`restore()`.
-   - Drip-feed lent et kill symbolique pour un process déjà mort :
-     limitations structurelles documentées, probablement à accepter
-     plutôt qu'à "fixer".
-3. Nouvel audit red team complet sur les deux VMs une fois ce backlog
-   traité (dans le conteneur `warden-redteam`/les VMs uniquement -
-   directive utilisateur : rien téléchargé depuis internet/GitHub pour le
-   red team, uniquement des paquets `apt` et des outils écrits maison).
-4. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
-5. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-6. `install.sh` finalisé + Dockerfiles de test systemd pour les 7 distros
-   (repoussé en tout dernier sur directive explicite de l'utilisateur).
+1. Committer ce lot MEDIUM/LOW (fichiers touchés : `warden-common/src/process.rs`,
+   `warden-common/src/quarantine.rs`, `warden-common/src/notify.rs`,
+   `warden-core/src/control.rs`, `warden-core/src/main.rs`,
+   `warden-ransomware/src/detector.rs`, `warden-ransomware/src/fanotify_monitor.rs`,
+   `warden-yara/src/rules.rs`).
+2. Nouvel audit red team complet sur les deux VMs (dans le conteneur
+   `warden-redteam`/les VMs uniquement - directive utilisateur : rien
+   téléchargé depuis internet/GitHub pour le red team, uniquement des
+   paquets `apt` et des outils écrits maison).
+3. `install.sh` finalisé + Dockerfiles de test systemd pour les distros
+   restantes (déjà validé en direct sur Debian 13 et Ubuntu 25.10 via les
+   VMs ; fedora/rocky/arch/opensuse/kali restent à tester en conteneur
+   systemd dédié).
+4. README à jour + préparation du dépôt pour une publication GitHub.
+5. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
+6. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
 7. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).

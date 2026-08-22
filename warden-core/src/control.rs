@@ -69,7 +69,22 @@ pub async fn run(
     // is actually listening on it anymore.
     let _ = std::fs::remove_file(socket_path);
 
-    let listener = UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))?;
+    // A restrictive umask for the duration of bind() closes a TOCTOU
+    // window a review pointed out: the kernel creates the socket inode at
+    // bind() time with permissions derived from the *process* umask (the
+    // same as any other new file), which previously stayed at whatever
+    // broad default applied - so for the brief window between bind()
+    // returning and the explicit chmod(0600)/chown below actually
+    // running, the socket could sit there group/world-accessible. Setting
+    // the umask first means the socket is born already non-group/other-
+    // accessible, with no gap - the chmod/chown calls below still run
+    // (defense in depth, and they set the exact mode/owner this needs),
+    // but nothing is relying on their timing anymore for the socket to
+    // never be briefly wide open.
+    let previous_umask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    let bind_result = UnixListener::bind(socket_path);
+    nix::sys::stat::umask(previous_umask);
+    let listener = bind_result.with_context(|| format!("binding {}", socket_path.display()))?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).context("setting control socket permissions")?;
     nix::unistd::chown(socket_path, Some(nix::unistd::Uid::from_raw(target_uid)), Some(nix::unistd::Gid::from_raw(target_gid)))
         .context("chowning control socket to target user")?;
@@ -78,8 +93,30 @@ pub async fn run(
     let status = Arc::new(status);
     let scan_state: Arc<ScanState> = Arc::new(ScanState::default());
 
+    // A review found that a single `accept()` error used to kill this
+    // whole loop (propagated via `?`, ending `run` and therefore the
+    // entire control socket forever, for the rest of the daemon's
+    // lifetime) - a same-uid process exhausting file descriptors
+    // (`EMFILE`) or the system running out of them (`ENFILE`) is exactly
+    // the kind of transient, recoverable condition `accept()` can return,
+    // not a reason to permanently take down the GUI's only channel to the
+    // daemon. Retried with a backoff that grows with consecutive
+    // failures (capped at 2s) instead, mirroring the same pattern already
+    // used for fanotify's `read_events` retry loop.
+    let mut consecutive_accept_failures = 0u32;
     loop {
-        let (stream, _) = listener.accept().await.context("accepting control connection")?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => {
+                consecutive_accept_failures = 0;
+                stream
+            }
+            Err(e) => {
+                consecutive_accept_failures += 1;
+                warn!(error = %e, consecutive_accept_failures, "accept() on control socket failed, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(200 * consecutive_accept_failures.min(10) as u64)).await;
+                continue;
+            }
+        };
         let history = history.clone();
         let quarantine = quarantine.clone();
         let status = status.clone();

@@ -63,6 +63,7 @@ pub struct Detector {
     recent_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_container_format_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
     directories_with_plaintext_history: HashSet<PathBuf>,
@@ -87,6 +88,7 @@ impl Detector {
             recent_writes_by_pid: HashMap::new(),
             recent_writes_by_dir: HashMap::new(),
             recent_writes_global: HashMap::new(),
+            recent_container_format_writes_by_pid: HashMap::new(),
             recent_container_format_writes_by_dir: HashMap::new(),
             recent_container_format_writes_global: HashMap::new(),
             directories_with_plaintext_history: HashSet::new(),
@@ -157,36 +159,45 @@ impl Detector {
     /// and the exact bytes are public - see `container_formats.rs`), but
     /// held to `container_format_burst_file_count` (a higher bar) rather
     /// than counted alongside outright-unrecognized high-entropy writes.
-    /// Directory-only, not per-PID: an attacker combining signature-
-    /// forgery with the fork-per-file trick above is the realistic
-    /// threat model this exists for.
-    pub fn observe_container_format_write(&mut self, path: &Path) -> Verdict {
+    ///
+    /// Tracks per-PID too, not just directory and global - a review found
+    /// this used to be directory/global only, on the reasoning that
+    /// "signature-forgery combined with fork-per-file is the realistic
+    /// threat model", but that made the actual bypass *wider* than
+    /// intended: a single, non-forking process forging a container-format
+    /// header over every file it encrypts got a full 3x weaker detection
+    /// bar than a plain high-entropy write from that same process would -
+    /// not because the design meant to give single-process forgery a
+    /// pass, but because the fastest, most direct signal for exactly that
+    /// case (per-PID) was simply missing from this path. Restored at the
+    /// same elevated threshold as the other two counters here, so a
+    /// genuine bulk-save still isn't over-eagerly flagged, but a single
+    /// process forging its way through many files no longer needs a
+    /// hollowed-out detector to do it. Also means `files_for_pid` can now
+    /// correctly attribute a container-format burst back to the process
+    /// that triggered it, for response/quarantine purposes.
+    pub fn observe_container_format_write(&mut self, pid: i32, path: &Path) -> Verdict {
         if !self.has_baseline(path) {
             return Verdict::Clean;
         }
-        let Some(dir) = path.parent() else { return Verdict::Clean };
 
         let now = Instant::now();
         let window = self.burst_window;
-        if let Some(affected) = Self::record_and_check(
-            &mut self.recent_container_format_writes_by_dir,
-            dir.to_path_buf(),
-            path,
-            now,
-            window,
-            self.container_format_burst_file_count,
-        ) {
+        let threshold = self.container_format_burst_file_count;
+
+        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
-        if let Some(affected) = Self::record_and_check(
-            &mut self.recent_container_format_writes_global,
-            (),
-            path,
-            now,
-            window,
-            self.container_format_burst_file_count,
-        ) {
+        if let Some(dir) = path.parent() {
+            if let Some(affected) =
+                Self::record_and_check(&mut self.recent_container_format_writes_by_dir, dir.to_path_buf(), path, now, window, threshold)
+            {
+                return Verdict::Burst { affected };
+            }
+        }
+
+        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
@@ -195,13 +206,20 @@ impl Detector {
 
     /// Distinct files recently touched by `pid`, for quarantine purposes
     /// (e.g. bundling them alongside a honeypot hit from the same
-    /// process).
+    /// process). Merges both the plain-high-entropy and container-format
+    /// per-PID maps, so a burst caught only via forged-signature writes
+    /// is still attributed correctly.
     pub fn files_for_pid(&self, pid: i32) -> Vec<PathBuf> {
-        self.recent_writes_by_pid.get(&pid).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        let mut files: Vec<PathBuf> = self.recent_writes_by_pid.get(&pid).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        if let Some(m) = self.recent_container_format_writes_by_pid.get(&pid) {
+            files.extend(m.keys().cloned());
+        }
+        files
     }
 
     pub fn forget(&mut self, pid: i32) {
         self.recent_writes_by_pid.remove(&pid);
+        self.recent_container_format_writes_by_pid.remove(&pid);
     }
 }
 
@@ -266,5 +284,24 @@ mod tests {
             }
         }
         assert_eq!(verdict, Verdict::Clean, "12 total files spread thinly across 6 dirs is ordinary activity, not a burst");
+    }
+
+    /// Regression test for the finding that `observe_container_format_write`
+    /// tracked no per-PID counter at all - a single, non-forking process
+    /// forging container-format signatures got a strictly weaker (dir/
+    /// global only) detection bar than the equivalent plain high-entropy
+    /// write would, and `files_for_pid` could never attribute the burst
+    /// back to it. A single PID hitting the threshold must both trigger a
+    /// burst verdict AND have those files show up in `files_for_pid`.
+    #[test]
+    fn container_format_burst_from_a_single_pid_is_attributed_to_that_pid() {
+        let mut d = detector_with_threshold(15); // container_format_burst_file_count = 45
+        let pid = 555;
+        let mut verdict = Verdict::Clean;
+        for i in 0..45 {
+            verdict = d.observe_container_format_write(pid, &PathBuf::from(format!("/home/test/Documents/f{i}.zip")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "45 container-format writes from one pid must trigger a burst");
+        assert_eq!(d.files_for_pid(pid).len(), 45, "the burst's files must be attributable back to the triggering pid");
     }
 }
