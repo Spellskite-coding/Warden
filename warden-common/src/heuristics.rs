@@ -22,5 +22,5 @@ pub fn is_suspicious_exec_location(exe_path: &str, target: &crate::target::Targe
     if mentions_suspicious_exec_path(exe_path) {
         return true;
     }
-    std::path::Path::new(exe_path).starts_with(target.home.join("Downloads"))
+    std::path::Path::new(exe_path).starts_with(&target.downloads_dir)
 }

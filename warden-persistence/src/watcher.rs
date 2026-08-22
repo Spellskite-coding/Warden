@@ -131,6 +131,46 @@ pub fn run(
             let Some(rule) = dw.matching_rule(name.as_ref()) else { continue };
 
             let full_path = dw.dir.join(name);
+
+            if rule.kind == TargetKind::DropinOverrideDir {
+                // Handled entirely separately from the file-diffing logic
+                // below, which assumes a readable text file - there's no
+                // meaningful "added lines" for a directory appearing.
+                // Report-only unconditionally: unlike a UnitDir file,
+                // there's no single new path here safe to quarantine
+                // outright (it's a directory, and whatever unit it
+                // overrides may be one nothing legitimate touched -
+                // deleting someone's real `systemctl edit` change because
+                // it happened to look suspicious is a worse outcome than
+                // leaving it for a human to review).
+                if full_path.is_dir() && seen_this_batch.insert(full_path.clone()) {
+                    let summary = format!("new {} appeared: {}", rule.label, full_path.display());
+                    let base_detail = "a new *.d override directory next to an existing unit can silently redefine its ExecStart - review its contents";
+
+                    // Same two annotate-don't-suppress exceptions as the
+                    // UnitDir new-file case just below: a real `apt
+                    // install`/`dnf upgrade` legitimately drops override
+                    // snippets for some packages, and an explicitly
+                    // exempted path is explicitly the operator's call -
+                    // neither should be silently swallowed (this is
+                    // already report-only either way, so there's no
+                    // enforcement action to skip), just labeled so a
+                    // human reviewing it isn't left guessing why it fired.
+                    let evt = if warden_common::exceptions::is_exempt(&full_path) {
+                        info!(module = MODULE, path = %full_path.display(), "path is in the exceptions list");
+                        DetectionEvent::new(MODULE, rule.base_severity, &summary, format!("{base_detail} (exempted path)"))
+                    } else if warden_common::package_manager::is_active() {
+                        info!(module = MODULE, path = %full_path.display(), "package manager active");
+                        DetectionEvent::new(MODULE, rule.base_severity, &summary, format!("{base_detail} (package manager active, likely legitimate)"))
+                    } else {
+                        warn!(module = MODULE, path = %full_path.display(), "systemd drop-in override directory appeared (report-only)");
+                        DetectionEvent::new(MODULE, rule.base_severity, &summary, base_detail)
+                    };
+                    let _ = event_tx.send(evt);
+                }
+                continue;
+            }
+
             if full_path.is_dir() {
                 continue;
             }
@@ -184,7 +224,21 @@ pub fn run(
             }
             let detail = reasons.join("; ");
 
-            let evt = if rule.kind == TargetKind::UnitDir && is_new_file {
+            let evt = if rule.kind == TargetKind::UnitDir && is_new_file && warden_common::exceptions::is_exempt(&full_path) {
+                info!(module = MODULE, path = %full_path.display(), "path is in the exceptions list, leaving file untouched");
+                DetectionEvent::new(MODULE, severity, &summary, format!("{detail} (exempted: file left untouched)"))
+            } else if rule.kind == TargetKind::UnitDir && is_new_file && warden_common::package_manager::is_active() {
+                // A trusted installer (apt/dpkg/dnf/pacman/flatpak/...)
+                // legitimately does exactly this: drop a new cron job,
+                // sudoers grant, systemd unit, or autostart entry. Only
+                // this UnitDir-new-file path is suppressed while one is
+                // active - a YARA content match or a genuinely new
+                // setuid binary elsewhere is unrelated to package
+                // installation and must never be waved through just
+                // because apt happens to be running at the same time.
+                info!(module = MODULE, path = %full_path.display(), "package manager active, leaving file untouched");
+                DetectionEvent::new(MODULE, severity, &summary, format!("{detail} (package manager active: file left untouched, review recommended)"))
+            } else if rule.kind == TargetKind::UnitDir && is_new_file {
                 let evt = response::handle_file_only_detection(mode, MODULE, severity, &summary, &detail, &full_path, &quarantine);
                 if evt.action_taken {
                     // The file was moved into quarantine: nothing left at

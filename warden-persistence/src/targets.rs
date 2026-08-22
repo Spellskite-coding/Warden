@@ -21,6 +21,23 @@ pub enum TargetKind {
     /// *pre-existing* file of this kind are still report-only, same
     /// reasoning as `Dotfile`.
     UnitDir,
+    /// A systemd drop-in override directory (`<unit>.service.d/`,
+    /// `<unit>.timer.d/`) appearing directly inside an already-watched
+    /// unit directory. A review pointed out this was a complete, silent
+    /// blind spot: `systemctl edit <unit>` on any pre-existing unit
+    /// (not just one Warden's own `UnitDir` logic already watches for
+    /// brand-new unit files) drops an `override.conf` with its own
+    /// `ExecStart=`/`ExecStartPost=` into a *subdirectory*, and inotify
+    /// on a directory isn't recursive - the parent dir watch sees the
+    /// new subdirectory's name, but nothing written *inside* it
+    /// afterward, and the existing content-diffing logic doesn't apply
+    /// to a directory at all. This only catches the drop-in directory's
+    /// first appearance (a real, working signal - genuinely nothing
+    /// legitimate creates one of these outside a deliberate admin
+    /// action), not edits to what's inside it afterward; report-only in
+    /// both modes, same reasoning as `Dotfile`, since there's no single
+    /// file here safe to act on automatically.
+    DropinOverrideDir,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +102,10 @@ fn unit_exact(name: String, label: &'static str, severity: Severity) -> Rule {
     Rule { filter: NameFilter::Exact(name), label, kind: TargetKind::UnitDir, base_severity: severity }
 }
 
+fn dropin_dir(label: &'static str, severity: Severity) -> Rule {
+    Rule { filter: NameFilter::Suffix(".d"), label, kind: TargetKind::DropinOverrideDir, base_severity: severity }
+}
+
 /// The default set of persistence-relevant locations to watch for
 /// `target_user`. Only directories that exist at startup are included -
 /// this module never creates one (unlike the ransomware module's watch
@@ -126,6 +147,7 @@ pub fn default_dir_watches(home: &Path, target_user: &str) -> Vec<DirWatch> {
         vec![
             unit_suffix(".service", "user systemd unit", Severity::Medium),
             unit_suffix(".timer", "user systemd timer", Severity::Medium),
+            dropin_dir("user systemd drop-in override directory", Severity::High),
         ],
     );
 
@@ -157,6 +179,7 @@ pub fn default_dir_watches(home: &Path, target_user: &str) -> Vec<DirWatch> {
         vec![
             unit_suffix(".service", "system systemd unit", Severity::Medium),
             unit_suffix(".timer", "system systemd timer", Severity::Medium),
+            dropin_dir("system systemd drop-in override directory", Severity::High),
         ],
     );
 

@@ -30,3 +30,4 @@ serde = { workspace = true }
 tracing = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
+libc = { workspace = true }

@@ -10,5 +10,5 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 nix = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true }
+libc = { workspace = true }

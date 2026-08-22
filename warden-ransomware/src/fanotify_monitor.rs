@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
-use nix::unistd::Whence;
 use tracing::{debug, info, warn};
 use warden_common::event::{Mode, Severity};
 use warden_common::quarantine::Quarantine;
@@ -13,6 +14,7 @@ use warden_common::response;
 
 use crate::baseline;
 use crate::config::RansomwareConfig;
+use crate::container_formats::is_known_container_format;
 use crate::detector::{Detector, Verdict};
 use crate::entropy::shannon_entropy;
 use crate::honeypot;
@@ -20,8 +22,16 @@ use crate::trust::TrustStore;
 
 const MODULE: &str = "ransomware";
 
-const WATCHED_EVENTS: MaskFlags =
-    MaskFlags::from_bits_truncate(MaskFlags::FAN_CLOSE_WRITE.bits() | MaskFlags::FAN_MODIFY.bits());
+// FAN_CLOSE_WRITE only - confirmed via live testing on a real kernel that
+// OR'ing in FAN_MODIFY (as this used to) breaks event delivery entirely:
+// the fanotify_mark() call succeeds with no error, but zero events ever
+// arrive on the group afterward. warden-yara's fanotify listener, in the
+// same process, uses FAN_CLOSE_WRITE alone and reliably receives events -
+// that comparison is what isolated this. CLOSE_WRITE is also the more
+// correct choice on its own merits: it fires once content is finalized,
+// so entropy sampling never sees a partial in-progress write the way
+// MODIFY (which can fire mid-write) could.
+const WATCHED_EVENTS: MaskFlags = MaskFlags::FAN_CLOSE_WRITE;
 
 /// One-time setup: initialize the fanotify group, mark the filesystem(s)
 /// backing the watched directories, and seed the plaintext-directory
@@ -75,6 +85,35 @@ fn is_under_watch_dirs(path: &Path, watch_dirs: &[PathBuf]) -> bool {
     watch_dirs.iter().any(|w| path.starts_with(w))
 }
 
+/// Reads up to `max_bytes` from `fd` - the exact fd the kernel handed
+/// back with the `FAN_CLOSE_WRITE` event - via a `dup(2)`'d copy, instead
+/// of reopening the file by path afterward. Same fix, same reasoning, as
+/// `warden_yara::fanotify_monitor::read_via_fd`: a review found the
+/// previous "reopen by path" approach here left a real TOCTOU window
+/// (the comment justifying it - "matches warden-yara's own listener,
+/// which works reliably" - was true only because warden-yara had the
+/// exact same bug at the time, not because reopening by path was safe).
+/// Between the event firing and this reopen, an attacker with write
+/// access to the watched directory can swap the path's content (or
+/// replace it with a symlink to something they want scored instead),
+/// making the entropy sample - and therefore the burst/plaintext-history
+/// decision - describe content that was never actually what got closed.
+fn read_sample_via_fd(fd: BorrowedFd, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    // SAFETY: see `warden_yara::fanotify_monitor::read_via_fd` - same
+    // dup(2)-on-a-valid-fd precondition, same guarantee.
+    let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+    let mut file = std::fs::File::from(owned);
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
 /// Blocking fanotify read/dispatch loop. Meant to run on a dedicated
 /// (blocking) thread: `Fanotify::read_events` blocks the calling thread
 /// until events are available.
@@ -86,6 +125,8 @@ pub fn run(
     cfg: RansomwareConfig,
     home: &Path,
     mode: Mode,
+    target_uid: u32,
+    target_gid: u32,
     event_tx: tokio::sync::mpsc::UnboundedSender<warden_common::event::DetectionEvent>,
     ready_tx: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
@@ -99,7 +140,7 @@ pub fn run(
     let sample_bytes = cfg.sample_bytes;
     let watch_dirs = cfg.watch_dirs.clone();
 
-    let honeypots = match honeypot::provision(&cfg.honeypots) {
+    let honeypots = match honeypot::provision(&cfg.honeypots, target_uid, target_gid) {
         Ok(h) => h,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
@@ -119,8 +160,8 @@ pub fn run(
     };
 
     let own_pid = std::process::id() as i32;
-    let mut trust = TrustStore::new(cfg.trusted_executables.clone());
-    info!(?mode, watch_dirs = ?watch_dirs, trusted_executables = cfg.trusted_executables.len(), "ransomware monitor loop started");
+    let mut trust = TrustStore::new();
+    info!(?mode, watch_dirs = ?watch_dirs, "ransomware monitor loop started");
 
     const MAX_CONSECUTIVE_READ_FAILURES: u32 = 20;
     let mut consecutive_failures = 0u32;
@@ -177,10 +218,13 @@ pub fn run(
                 continue;
             }
 
-            let mut buf = vec![0u8; sample_bytes];
-            let _ = nix::unistd::lseek(fd, 0, Whence::SeekSet);
-            let n = nix::unistd::read(fd, &mut buf).unwrap_or(0);
-            buf.truncate(n);
+            let buf = match read_sample_via_fd(fd, sample_bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(pid, path = %path.display(), error = %e, "reading fanotify event's fd failed, skipping this event");
+                    continue;
+                }
+            };
 
             if buf.is_empty() {
                 continue;
@@ -193,14 +237,42 @@ pub fn run(
                 detector.note_plaintext_activity(&path);
             } else if trust.is_trusted(pid) {
                 debug!(pid, path = %path.display(), "high-entropy write from a trusted executable, not counting toward burst");
-            } else if let Verdict::Burst { count } = detector.observe_high_entropy_write(pid, &path) {
-                let affected = detector.files_for_pid(pid);
+            } else if is_known_container_format(&buf) {
+                // Starts with a recognized ZIP/PDF/JPEG/... header - could
+                // be a legitimate Office document/archive/image rewrite,
+                // but the signature alone proves nothing: it's a 4-8 byte
+                // prefix, trivial to forge over real ciphertext, and now
+                // that this project is open source the exact bytes are
+                // public. Not fully exempted - held to a separate, higher
+                // threshold instead (see `Detector::observe_container_format_write`)
+                // so bulk legitimate saves still pass but blanket
+                // signature-forgery across many files doesn't.
+                if let Verdict::Burst { affected } = detector.observe_container_format_write(&path) {
+                    let evt = response::handle_detection(
+                        mode,
+                        MODULE,
+                        Severity::Critical,
+                        pid,
+                        &format!(
+                            "{} high-entropy file rewrites (matching known container-format signatures) within {}s (last: {})",
+                            affected.len(),
+                            cfg.burst_window_secs,
+                            path.display()
+                        ),
+                        affected,
+                        &quarantine,
+                    );
+                    let _ = event_tx.send(evt);
+                } else {
+                    debug!(pid, path = %path.display(), "high-entropy write recognized as a known container format, tracked but not yet over threshold");
+                }
+            } else if let Verdict::Burst { affected } = detector.observe_high_entropy_write(pid, &path) {
                 let evt = response::handle_detection(
                     mode,
                     MODULE,
                     Severity::Critical,
                     pid,
-                    &format!("{count} high-entropy file rewrites within {}s (last: {})", cfg.burst_window_secs, path.display()),
+                    &format!("{} high-entropy file rewrites within {}s (last: {})", affected.len(), cfg.burst_window_secs, path.display()),
                     affected,
                     &quarantine,
                 );

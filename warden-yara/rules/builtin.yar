@@ -14,12 +14,27 @@ rule Bash_Dev_Tcp_Reverse_Shell
     meta:
         description = "Bash /dev/tcp or /dev/udp reverse shell pattern combined with exec"
         severity = "high"
+        // A plain, unmodified `/bin/bash` binary itself contains the bare
+        // literal string "/dev/tcp/" (used internally to implement its own
+        // /dev/tcp redirection feature) alongside "exec " somewhere in its
+        // compiled strings table - confirmed live: copying stock
+        // /usr/bin/bash into a watched directory matched this rule and got
+        // quarantined as a "reverse shell", a real false positive against
+        // one of the most common legitimate binaries on any Linux system.
+        // Two changes close that without weakening real detection: the
+        // redirection-operator regex only matches actual shell REDIRECTION
+        // SYNTAX (">/dev/tcp/host/port", "3<>/dev/tcp/..."), which the bare
+        // path string inside bash's own binary doesn't happen to be
+        // adjacent to; and filesize caps out real reverse-shell payloads
+        // (always a small text script, from a one-liner up to a few KB)
+        // well below any real ELF binary's size, bash's own included
+        // (~1.3MB on a typical Debian install).
     strings:
-        $tcp = "/dev/tcp/" ascii
-        $udp = "/dev/udp/" ascii
+        $tcp_redir = /[<>]&?\s{0,2}\/dev\/tcp\// ascii
+        $udp_redir = /[<>]&?\s{0,2}\/dev\/udp\// ascii
         $exec = "exec " ascii
     condition:
-        ($tcp or $udp) and $exec
+        ($tcp_redir or $udp_redir) and $exec and filesize < 65536
 }
 
 rule Netcat_Reverse_Shell

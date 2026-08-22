@@ -4,20 +4,48 @@ use std::time::{Duration, Instant};
 
 use crate::config::RansomwareConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Clean,
-    /// Too many *distinct files* high-entropy-rewritten by the same PID in
-    /// the time window.
-    Burst { count: usize },
+    /// Too many *distinct files* high-entropy-rewritten within the time
+    /// window - either by the same PID, or across PIDs in the same
+    /// directory (see `Detector`'s doc comment for why both are tracked).
+    Burst { affected: Vec<PathBuf> },
 }
 
-/// Tracks, per originating PID, the set of distinct files recently seen
-/// with a high-entropy write, so we can catch the "many files rewritten as
-/// ciphertext in a few seconds" pattern that a single event can't reveal on
-/// its own. Deliberately keyed on distinct paths (not raw write events) so
-/// that one large file written in many chunks doesn't get mistaken for many
-/// files.
+/// Tracks recent high-entropy writes two ways, both keyed on distinct
+/// paths (not raw write events, so one large file written in many chunks
+/// doesn't get mistaken for many files) within a rolling time window:
+///
+/// - **Per originating PID** (`recent_writes_by_pid`): catches "one
+///   process rewrites many files as ciphertext in a few seconds", the
+///   common case, and lets the response path attribute the burst to a
+///   specific still-running process to stop.
+/// - **Per directory, PID-agnostic** (`recent_writes_by_dir`): catches
+///   the same pattern spread across many short-lived processes - e.g.
+///   ransomware that `fork()`s (or shells out to a one-shot encryption
+///   command) once per file specifically to keep any single PID's count
+///   under the per-PID threshold. A review of this code found that
+///   without this second counter, that's a trivial, complete bypass of
+///   burst detection regardless of how fast or how many total files get
+///   encrypted. There's no single process to attribute a directory-level
+///   burst to (the responsible short-lived processes may have already
+///   exited by the time this fires), so the response path can only best-
+///   effort target whichever PID triggered the *triggering* write.
+/// - **Globally, PID- and directory-agnostic** (`recent_writes_global`):
+///   a second, red-team-confirmed bypass of the two counters above -
+///   fork-per-file *combined with* spreading those files across several
+///   watched directories at once (e.g. `burst_file_count - 1` files each
+///   in every one of the default six watch dirs) keeps every single
+///   per-PID AND per-directory count individually under threshold while
+///   still touching dozens of distinct files within the window.
+///   Reproduced live end-to-end: 48 files across 6 directories, 8 per
+///   directory, one short-lived process per file - zero detections, zero
+///   quarantines. The per-directory counter alone only bounds a *single*
+///   directory's count, never the sum across all of them; this third
+///   counter closes that gap the same way `recent_writes_by_dir` closes
+///   the per-PID one, at the same threshold - a real burst is a real
+///   burst no matter how it's laundered across PIDs and directories.
 ///
 /// Also tracks, per directory, whether ordinary (low-entropy) content has
 /// ever been seen there. A burst of high-entropy writes only counts as
@@ -26,9 +54,17 @@ pub enum Verdict {
 /// the same heuristic as actual encryption.
 pub struct Detector {
     burst_file_count: usize,
+    /// Higher threshold for writes that match a known container-format
+    /// magic byte prefix (ZIP/PDF/JPEG/...) - see
+    /// `observe_container_format_write`.
+    container_format_burst_file_count: usize,
     burst_window: Duration,
     require_directory_baseline: bool,
-    recent_writes: HashMap<i32, HashMap<PathBuf, Instant>>,
+    recent_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
+    recent_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
+    recent_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_container_format_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
+    recent_container_format_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
     directories_with_plaintext_history: HashSet<PathBuf>,
 }
 
@@ -36,9 +72,23 @@ impl Detector {
     pub fn new(cfg: &RansomwareConfig) -> Self {
         Self {
             burst_file_count: cfg.burst_file_count,
+            // A container-format-matching write isn't fully trusted (see
+            // `observe_container_format_write`), just held to a visibly
+            // higher bar than an outright unrecognized high-entropy
+            // write - 3x is a deliberately generous margin so a genuine
+            // bulk save of office documents/archives/images (a user
+            // zipping a folder, an app re-saving several open documents
+            // at once) stays well clear of it, while a ransomware strain
+            // trying to blanket-forge every file it touches with a fake
+            // signature still crosses it quickly.
+            container_format_burst_file_count: cfg.burst_file_count.saturating_mul(3),
             burst_window: Duration::from_secs(cfg.burst_window_secs),
             require_directory_baseline: cfg.require_directory_baseline,
-            recent_writes: HashMap::new(),
+            recent_writes_by_pid: HashMap::new(),
+            recent_writes_by_dir: HashMap::new(),
+            recent_writes_global: HashMap::new(),
+            recent_container_format_writes_by_dir: HashMap::new(),
+            recent_container_format_writes_global: HashMap::new(),
             directories_with_plaintext_history: HashSet::new(),
         }
     }
@@ -49,34 +99,172 @@ impl Detector {
         }
     }
 
+    fn has_baseline(&self, path: &Path) -> bool {
+        !self.require_directory_baseline || path.parent().is_some_and(|dir| self.directories_with_plaintext_history.contains(dir))
+    }
+
+    /// Records a distinct-path hit in `map[key]`, prunes anything outside
+    /// the burst window, and returns the surviving paths once the count
+    /// reaches `threshold` (empty otherwise).
+    fn record_and_check<K: std::hash::Hash + Eq>(
+        map: &mut HashMap<K, HashMap<PathBuf, Instant>>,
+        key: K,
+        path: &Path,
+        now: Instant,
+        window: Duration,
+        threshold: usize,
+    ) -> Option<Vec<PathBuf>> {
+        let files = map.entry(key).or_default();
+        files.insert(path.to_path_buf(), now);
+        files.retain(|_, &mut seen| now.duration_since(seen) <= window);
+        if files.len() >= threshold {
+            Some(files.keys().cloned().collect())
+        } else {
+            None
+        }
+    }
+
     pub fn observe_high_entropy_write(&mut self, pid: i32, path: &Path) -> Verdict {
-        if self.require_directory_baseline {
-            let has_baseline = path.parent().is_some_and(|dir| self.directories_with_plaintext_history.contains(dir));
-            if !has_baseline {
-                return Verdict::Clean;
-            }
+        if !self.has_baseline(path) {
+            return Verdict::Clean;
         }
 
         let now = Instant::now();
         let window = self.burst_window;
-        let files = self.recent_writes.entry(pid).or_default();
 
-        files.insert(path.to_path_buf(), now);
-        files.retain(|_, &mut seen| now.duration_since(seen) <= window);
-
-        if files.len() >= self.burst_file_count {
-            Verdict::Burst { count: files.len() }
-        } else {
-            Verdict::Clean
+        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, self.burst_file_count) {
+            return Verdict::Burst { affected };
         }
+
+        if let Some(dir) = path.parent() {
+            if let Some(affected) =
+                Self::record_and_check(&mut self.recent_writes_by_dir, dir.to_path_buf(), path, now, window, self.burst_file_count)
+            {
+                return Verdict::Burst { affected };
+            }
+        }
+
+        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
+            return Verdict::Burst { affected };
+        }
+
+        Verdict::Clean
     }
 
-    /// Distinct files recently touched by `pid`, for quarantine purposes.
+    /// Same idea as `observe_high_entropy_write`, for a write that
+    /// matched a known container-format magic byte prefix: not trusted
+    /// outright (the prefix is trivial to forge over real ciphertext,
+    /// and the exact bytes are public - see `container_formats.rs`), but
+    /// held to `container_format_burst_file_count` (a higher bar) rather
+    /// than counted alongside outright-unrecognized high-entropy writes.
+    /// Directory-only, not per-PID: an attacker combining signature-
+    /// forgery with the fork-per-file trick above is the realistic
+    /// threat model this exists for.
+    pub fn observe_container_format_write(&mut self, path: &Path) -> Verdict {
+        if !self.has_baseline(path) {
+            return Verdict::Clean;
+        }
+        let Some(dir) = path.parent() else { return Verdict::Clean };
+
+        let now = Instant::now();
+        let window = self.burst_window;
+        if let Some(affected) = Self::record_and_check(
+            &mut self.recent_container_format_writes_by_dir,
+            dir.to_path_buf(),
+            path,
+            now,
+            window,
+            self.container_format_burst_file_count,
+        ) {
+            return Verdict::Burst { affected };
+        }
+
+        if let Some(affected) = Self::record_and_check(
+            &mut self.recent_container_format_writes_global,
+            (),
+            path,
+            now,
+            window,
+            self.container_format_burst_file_count,
+        ) {
+            return Verdict::Burst { affected };
+        }
+
+        Verdict::Clean
+    }
+
+    /// Distinct files recently touched by `pid`, for quarantine purposes
+    /// (e.g. bundling them alongside a honeypot hit from the same
+    /// process).
     pub fn files_for_pid(&self, pid: i32) -> Vec<PathBuf> {
-        self.recent_writes.get(&pid).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        self.recent_writes_by_pid.get(&pid).map(|m| m.keys().cloned().collect()).unwrap_or_default()
     }
 
     pub fn forget(&mut self, pid: i32) {
-        self.recent_writes.remove(&pid);
+        self.recent_writes_by_pid.remove(&pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detector_with_threshold(burst_file_count: usize) -> Detector {
+        let cfg = RansomwareConfig { burst_file_count, require_directory_baseline: false, ..RansomwareConfig::default() };
+        Detector::new(&cfg)
+    }
+
+    #[test]
+    fn single_pid_single_dir_burst_is_still_caught() {
+        let mut d = detector_with_threshold(15);
+        let mut verdict = Verdict::Clean;
+        for i in 0..15 {
+            verdict = d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/Documents/f{i}.bin")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "15 files from one pid in one dir must still trigger");
+    }
+
+    /// Regression test for the red-team-confirmed bypass: fork-per-file
+    /// (one PID per write) *combined with* spreading those writes across
+    /// several watched directories, each individually staying under
+    /// `burst_file_count`. Reproduces the exact live finding - 48 files,
+    /// 6 directories, 8 per directory, one PID per file - which the
+    /// per-PID and per-directory counters alone let through completely.
+    #[test]
+    fn fork_per_file_spread_across_directories_is_caught_by_the_global_counter() {
+        let mut d = detector_with_threshold(15);
+        let dirs = ["Documents", "Bureau", "Téléchargements", "Images", "Vidéos", "Musique"];
+        let mut verdict = Verdict::Clean;
+        let mut pid = 10_000;
+        'outer: for dir in dirs {
+            for i in 0..8 {
+                pid += 1; // a distinct short-lived process per file
+                let path = PathBuf::from(format!("/home/test/{dir}/redteam_victim_{i}.bin"));
+                verdict = d.observe_high_entropy_write(pid, &path);
+                if matches!(verdict, Verdict::Burst { .. }) {
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            matches!(verdict, Verdict::Burst { .. }),
+            "48 files across 6 dirs (8 each, distinct pids) must trigger the global counter even though no per-pid or per-dir count reaches the threshold alone"
+        );
+    }
+
+    #[test]
+    fn low_volume_activity_spread_across_directories_stays_clean() {
+        let mut d = detector_with_threshold(15);
+        let dirs = ["Documents", "Bureau", "Téléchargements", "Images", "Vidéos", "Musique"];
+        let mut verdict = Verdict::Clean;
+        let mut pid = 20_000;
+        for dir in dirs {
+            for i in 0..2 {
+                pid += 1;
+                let path = PathBuf::from(format!("/home/test/{dir}/normal_save_{i}.bin"));
+                verdict = d.observe_high_entropy_write(pid, &path);
+            }
+        }
+        assert_eq!(verdict, Verdict::Clean, "12 total files spread thinly across 6 dirs is ordinary activity, not a burst");
     }
 }

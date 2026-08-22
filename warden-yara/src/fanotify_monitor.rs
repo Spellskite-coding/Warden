@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,45 @@ const WATCHED_EVENTS: MaskFlags = MaskFlags::FAN_CLOSE_WRITE;
 
 fn is_under_watch_dirs(path: &Path, watch_dirs: &[PathBuf]) -> bool {
     watch_dirs.iter().any(|w| path.starts_with(w))
+}
+
+/// Reads the full content behind `fd` - the exact fd the kernel handed
+/// back with the `FAN_CLOSE_WRITE` event - via a `dup(2)`'d copy, rather
+/// than reopening the file by path afterward.
+///
+/// A review found the previous code used `fd` only to resolve a path
+/// string (via `/proc/self/fd/N`), then discarded it and called
+/// `scanner.scan_file(&path)` - a brand-new open-by-path. That's a real
+/// TOCTOU window: between the event firing and this reopen, whatever
+/// currently sits at that path (attacker-controlled, if they still have
+/// write access to the watched directory) is what actually gets scanned,
+/// not what was closed. A same-path swap (rename a symlink over it, or
+/// replace the content) can make root scan/quarantine something the
+/// attacker chose the identity of, or make the actually-malicious
+/// content never get scanned at all. Reading through the event's own fd
+/// (duplicated so closing our copy doesn't affect the fanotify group's
+/// handling of the original) reads the bytes that were ACTUALLY closed,
+/// regardless of anything that happens to the path afterward.
+fn read_via_fd(fd: BorrowedFd) -> std::io::Result<Vec<u8>> {
+    // SAFETY: `dup` on a valid, currently-open fd returns either a fresh
+    // fd this call uniquely owns, or -1/errno on failure - no other
+    // precondition to uphold. The original `fd` is untouched either way.
+    let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative return from dup(2) is a freshly duplicated
+    // fd this call uniquely owns - exactly what OwnedFd::from_raw_fd
+    // requires.
+    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+    let mut file = std::fs::File::from(owned);
+    // fanotify hands back the fd already positioned wherever the writer
+    // left it (typically EOF right after a close-for-write) - seek back
+    // to the start explicitly rather than assuming offset 0.
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// One-time setup: initialize the fanotify group, mark the filesystem(s)
@@ -122,23 +163,35 @@ pub fn run(
                 continue;
             };
 
-            let path = std::fs::read_link(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd)))
-                .unwrap_or_else(|_| PathBuf::from("<unknown>"));
+            let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap_or_else(|_| PathBuf::from("<unknown>"));
 
             if !is_under_watch_dirs(&path, &watch_dirs) {
                 continue;
             }
 
-            let results = match scanner.scan_file(&path) {
+            let content = match read_via_fd(fd) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(path = %path.display(), error = %e, "reading fanotify event's fd failed");
+                    continue;
+                }
+            };
+
+            let results = match scanner.scan(&content) {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(path = %path.display(), error = %e, "yara scan failed (file vanished before we got to it?)");
+                    debug!(path = %path.display(), error = %e, "yara scan failed");
                     continue;
                 }
             };
 
             let matched: Vec<&str> = results.matching_rules().map(|r| r.identifier()).collect();
             if matched.is_empty() {
+                continue;
+            }
+
+            if warden_common::exceptions::is_exempt(&path) {
+                debug!(path = %path.display(), "path is in the exceptions list, not quarantining");
                 continue;
             }
 

