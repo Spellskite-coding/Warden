@@ -7,6 +7,8 @@ members = [
     "warden-privesc",
     "warden-yara",
     "warden-core",
+    "warden-notify-helper",
+    "warden-gui",
 ]
 
 [workspace.package]

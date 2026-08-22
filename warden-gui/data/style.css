@@ -1,0 +1,73 @@
+/* Warden brand palette: dark ground, red shield, amber keyhole accent. */
+@define-color warden_ground #101114;
+@define-color warden_tile #8c1f1b;
+@define-color warden_shield #c33a2e;
+@define-color warden_amber #d9a441;
+
+/* No `color:` override here (or on `headerbar` below): with the app
+ * declared dark via `AdwStyleManager::set_color_scheme(ForceDark)` in
+ * main.rs, libadwaita's own default foreground for a dark scheme is
+ * already the right, contrast-correct choice for plain text - and,
+ * critically, is what every libadwaita-native style (.dim-label,
+ * ActionRow subtitles, ...) computes ITS OWN reduced-opacity color
+ * relative to. A raw `color: #f2ede4` override here does not update
+ * that reference, so widgets that dim relative to it stayed dark-on-
+ * dark and unreadable even though plain text looked fine - the actual
+ * bug behind "Mode"/"ENFORCE"/module names being barely legible. */
+window {
+    background-color: @warden_ground;
+    font-family: "JetBrains Mono", "Google Sans Mono", monospace;
+}
+
+headerbar {
+    background-color: shade(@warden_ground, 1.15);
+    border-bottom: 1px solid shade(@warden_ground, 1.4);
+}
+
+headerbar windowtitle,
+headerbar .title {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+
+.warden-brand-title {
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    color: @warden_amber;
+}
+
+list.boxed-list {
+    background-color: transparent;
+}
+
+row.warden-incident {
+    background-color: shade(@warden_ground, 1.12);
+    border-radius: 8px;
+    margin: 3px 0;
+}
+
+row.warden-incident:hover {
+    background-color: shade(@warden_ground, 1.25);
+}
+
+.severity-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 999px;
+}
+
+.severity-critical { background-color: @warden_shield; }
+.severity-high { background-color: @warden_amber; }
+.severity-medium { background-color: shade(@warden_amber, 0.75); }
+.severity-low { background-color: shade(#f2ede4, 0.55); }
+.severity-info { background-color: shade(#f2ede4, 0.4); }
+
+.warden-detail-heading {
+    color: @warden_amber;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+
+.warden-empty-state {
+    color: shade(#f2ede4, 0.55);
+}

@@ -7,12 +7,18 @@
 # musl build.
 FROM rockylinux:9
 
-RUN dnf install -y --allowerasing gcc pkgconf-pkg-config make curl git && dnf clean all
+RUN dnf install -y epel-release dnf-plugins-core \
+    && dnf config-manager --set-enabled crb \
+    && dnf install -y --allowerasing gcc pkgconf-pkg-config make curl git \
+    gtk4-devel libadwaita-devel glib2-devel gobject-introspection-devel pango-devel cairo-devel cairo-gobject-devel gdk-pixbuf2-devel graphene-devel \
+    && dnf clean all
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+    && rustup component add clippy \
+    && cargo install cargo-audit --locked
 
 WORKDIR /build

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Warden
+GenericName=Endpoint Detection & Response
+Comment=Warden EDR - live status, incident history and detection details
+Exec=warden-gui
+Icon=warden
+Categories=System;Security;Monitor;
+Terminal=false
+StartupNotify=true

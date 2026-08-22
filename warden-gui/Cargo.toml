@@ -1,0 +1,17 @@
+[package]
+name = "warden-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "warden-gui"
+path = "src/main.rs"
+
+[dependencies]
+warden-common = { path = "../warden-common" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
