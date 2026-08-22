@@ -1,41 +1,92 @@
 [Unit]
-Description=Warden autonomous EDR agent for Linux workstations
-After=local-fs.target
+Description=Warden EDR - core detection (ransomware, persistence, privesc, yara)
+After=network.target local-fs.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/warden --config /etc/warden/config.toml
+ExecStart=/usr/local/bin/warden
 Restart=on-failure
 RestartSec=2
-NotifyAccess=main
-
-# Warden needs CAP_SYS_ADMIN for fanotify (filesystem-wide marks), CAP_KILL
-# to neutralize offending processes in Enforce mode, and CAP_DAC_OVERRIDE
-# to actually read/traverse the target user's $HOME - which on every
-# mainstream distro's default (`useradd -m` -> 0700) is not world-readable,
-# so plain root without this capability gets EACCES on the very directories
-# it's supposed to protect (caught by testing against a real 0700 $HOME in
-# a container, not assumed). Everything else root would normally have is
-# dropped from the process's capability set entirely, not just left unused
-# - so even a full compromise of the agent can't leverage capabilities like
-# CAP_SYS_PTRACE or CAP_NET_ADMIN that root implicitly has but this daemon
-# never needs.
-AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL CAP_DAC_OVERRIDE
+# Root is required: fanotify filesystem-wide marks, killing/quarantining
+# arbitrary user processes, and stripping setuid bits all need it - see
+# PROGRESS.md for why this is accepted rather than fought with
+# capabilities for a workstation-scale EDR. Root is orthogonal to the
+# sandboxing below, though: a security review pointed out that a bare
+# root process with no bounding set gets every capability the kernel has
+# (CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_SYS_RAWIO, ...), so a code-exec bug
+# in Warden itself would hand an attacker unrestricted root immediately.
+# Narrowing the bounding set to what's actually used shrinks that a lot
+# without dropping root itself:
+#   CAP_SYS_ADMIN     - fanotify filesystem-wide marks
+#   CAP_DAC_OVERRIDE   - reading/quarantining files regardless of their
+#                        permissions (any user's ransomware-affected
+#                        files, a scan target it wouldn't otherwise be
+#                        able to open, ...)
+#   CAP_FOWNER, CAP_CHOWN - restoring a quarantined file's original mode
+#                        and ownership, stripping a setuid/setgid bit
+#   CAP_KILL           - SIGSTOP/SIGKILL on a suspect process
+#   CAP_SETUID, CAP_SETGID - dropping to the target desktop user's uid/
+#                        gid/groups when spawning warden-notify-helper
+#   CAP_SYS_PTRACE     - resolving /proc/<pid>/exe of a process Warden
+#                        did not itself spawn (warden_common::package_manager,
+#                        used to recognize a real package manager mid-
+#                        install and suppress persistence/privesc's
+#                        auto-quarantine while one is legitimately at
+#                        work). The kernel requires this capability for
+#                        that lookup even as root once the bounding set
+#                        no longer grants every capability by default -
+#                        found live: without it, that check silently
+#                        fails closed for every process (never "active"),
+#                        which doesn't create a security gap but does
+#                        mean a real `apt`/`dnf`/`pacman` install
+#                        legitimately dropping a new cron job, sudoers
+#                        grant, or systemd unit gets needlessly
+#                        auto-quarantined in Enforce mode instead of
+#                        recognized as trusted.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_KILL CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
 NoNewPrivileges=true
+# A review found this directive had been dropped entirely somewhere along
+# the way, leaving a root process with capabilities to match/rename/chmod
+# arbitrary files completely unconfined at the filesystem level - any bug
+# reachable from attacker-supplied input (a YARA scan target, a quarantine
+# restore path, a config parsing edge case) could otherwise write ANYWHERE
+# on the root filesystem, not just inside the paths Warden actually needs.
+# ProtectSystem=strict mounts the entire hierarchy read-only except /dev,
+# /proc, /sys, and whatever ReadWritePaths= adds back. The exact paths
+# that need write access depend on the target user's home and locale
+# (Bureau vs Desktop, Téléchargements vs Downloads, ...) and can't be
+# hardcoded here - install.sh computes them from the actual config and
+# target user at install time and writes them into a
+# /etc/systemd/system/warden.service.d/ drop-in rather than editing this
+# file directly. If you install by hand instead of via install.sh, add
+# your own ReadWritePaths= drop-in covering at minimum: /var/lib/warden,
+# /run/warden, the target user's $HOME, /tmp, /var/tmp, /dev/shm, and the
+# system directories persistence/privesc can quarantine/strip
+# (/usr/bin, /usr/sbin, /bin, /sbin, /usr/local/bin, /usr/local/sbin,
+# /etc/cron.d, /etc/sudoers.d, /etc/systemd/system, /etc/xdg/autostart,
+# /etc/profile.d, /var/spool/cron) - or Warden will fail to quarantine
+# files, provision honeypots, or strip setuid bits.
 ProtectSystem=strict
-# Nothing is writable from the base unit: the agent only ever reads
-# /etc/warden/config.toml (ProtectSystem=strict still permits reads
-# everywhere, it just blocks writes), so that directory needs no
-# ReadWritePaths entry. The install script computes what DOES need write
-# access - the quarantine dir and the target user's watched directories,
-# where honeypot files are created - from the actual config and adds it via
-# a /etc/systemd/system/warden.service.d/ drop-in rather than editing this
-# file. If you install by hand instead, add your own ReadWritePaths= drop-in
-# or the agent will fail to quarantine files and provision honeypots.
-# Connecting to the target user's D-Bus session socket under
-# /run/user/<uid>/bus needs no extra write access either: that's a connect(),
-# not a write to the filesystem.
+# /run/warden (the control socket's directory) specifically uses
+# RuntimeDirectory rather than a ReadWritePaths= entry in the install.sh
+# drop-in: systemd creates it (and grants write access to it) BEFORE the
+# process starts and removes it on stop, which is exactly the "must exist
+# pre-start, is tmpfs, doesn't survive a reboot" shape /run/warden has -
+# a plain ReadWritePaths=/run/warden entry would need the path to already
+# exist at mount-namespace-setup time, which a fresh boot can't guarantee.
+RuntimeDirectory=warden
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+# Warden only ever strips setuid/setgid bits (permissions::strip_setuid_setgid),
+# never sets them - safe to block the kernel-level ability to do so at all.
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
