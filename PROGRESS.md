@@ -1408,3 +1408,204 @@ manquante. Committé (`4f68624`).
    fait rien... c'est une défense en plus, pas un remplacement de la
    vigilance humaine"). Ne pas reproposer sans que l'utilisateur relance
    le sujet lui-même.
+
+## Audit externe (issue #1, PR #2, audit "Fable") - analysé, corrigé, validé en direct (23 août)
+
+Le dépôt a été poussé sur GitHub entre-temps (`Spellskite-coding/Warden`).
+Un ami a ouvert une issue de sécurité réelle sur le burst detector, une PR
+avec un correctif, et fait passer une revue de code plus large ("Fable")
+sur l'architecture générale. Les trois ont été lus et vérifiés contre le
+code réel avant toute action - pas pris pour argent comptant.
+
+**Issue #1 / PR #2 - burst detector aveugle aux nouveaux répertoires.**
+Confirmé exact par lecture directe : `observe_high_entropy_write` et
+`observe_container_format_write` retournaient `Verdict::Clean`
+immédiatement si `has_baseline()` était faux, court-circuitant même le
+compteur global - un répertoire fraîchement créé (jamais vu avec un
+contenu en clair) était invisible au burst detector, quel que soit le
+nombre de fichiers chiffrés dedans.
+
+La PR proposait un correctif plus fin que l'issue elle-même : compteur
+per-pid rendu inconditionnel, deux maps globales séparées (baseline vs
+sans baseline) pour éviter un verdict qui dépend de l'ordre d'écriture.
+Bonne architecture, mais un défaut réel dans les seuils choisis : la PR
+mettait le seuil "sans baseline" à 2x le seuil normal (30 fichiers au
+lieu de 15) - ce qui rouvre le bug qu'elle corrige, juste avec un budget
+plus grand : un attaquant qui cible systématiquement des répertoires
+neufs obtient une allocation double. Repris la structure de la PR (maps
+séparées, per-pid inconditionnel) mais avec le MÊME seuil des deux côtés
+- pas d'incitation mécanique à préférer les répertoires neufs.
+
+Reproduit en direct sur `debian13` (mode enforce, `test` protégé) :
+`mkdir` + 20x `dd if=/dev/urandom` dans un répertoire neuf sous
+`Documents/` - AVANT le correctif ça serait passé silencieusement (bug
+confirmé par lecture de code, pas re-testé sur l'ancien binaire pour ne
+pas perdre de temps). APRÈS : détection déclenchée pile au 15e fichier
+(`recent_writes_global_unbaselined`, seuil identique au cas avec
+baseline), les 20 fichiers mis en quarantaine. 6 nouveaux tests unitaires
+ajoutés dans `detector.rs` (bypass global sans baseline, container-format
+sans baseline, per-pid seul, seuils identiques baseline/sans-baseline,
+répertoire type Pictures jamais baseliné).
+
+**Fuite mémoire dans le détecteur (trouvé par l'audit "Fable", confirmé
+réel).** `record_and_check` purge la map interne d'une clé à chaque écriture
+sur cette même clé, mais ne retire jamais la clé externe elle-même une
+fois son contenu vidé - un PID qui écrit une fois puis ne revient jamais
+(l'écrasante majorité des PIDs sur un poste actif) laisse une entrée
+permanente dans `recent_writes_by_pid`. Ajouté `Detector::prune_expired`,
+appelé une fois par fenêtre de burst dans la boucle fanotify (throttled,
+pas à chaque évènement). Testé : 500 PIDs distincts, un seul appel après
+expiration de la fenêtre, la map est vide ensuite.
+
+**Contournement complet de l'auto-quarantine par un utilisateur non
+privilégié (audit "Fable", confirmé réel et plus grave que documenté).**
+`package_manager::is_active()` ne vérifiait jamais l'UID du processus -
+`while :; do /usr/bin/rpm --version >/dev/null; done &` lancé par
+n'importe quel compte local suffisait à maintenir `is_active()` à `true`
+en continu, sans aucun privilège, suspendant l'auto-quarantine
+persistence/privesc en mode Enforce indéfiniment. Ajouté une vérification
+d'UID (0 = root, via le propriétaire du répertoire `/proc/<pid>`, pas
+`/proc/<pid>/status` - moins cher et pas falsifiable par le processus
+lui-même) - chaque cas légitime (apt/dnf/pacman réel, unattended-upgrade,
+update-initramfs) tourne déjà en root au moment où ça compte. Testé en
+plaçant un faux binaire nommé correctement dans un vrai `SYSTEM_BIN_DIRS`
+et en le lançant sous l'uid 65534 ("nobody") - passe tous les autres
+checks, rejeté uniquement par le nouveau contrôle d'UID.
+
+**Nom de fichier des honeypots fixe malgré le dossier randomisé (audit
+"Fable", confirmé réel).** Le dossier parent était bien randomisé par
+seed (`Confidential_Backup_<hex>`, 225 combinaisons), mais le fichier
+*à l'intérieur* était toujours littéralement `passwords_export.csv` ou
+`releve_compte.csv` - un `find / -name passwords_export.csv` trouve tous
+les honeypots sur la machine sans jamais avoir besoin du seed ni de
+connaître le schéma de nommage du dossier. Ajouté deux pools de noms de
+fichiers plausibles (`HONEYPOT_FILENAMES`, `HOME_HONEYPOT_FILENAMES`),
+dérivés du seed avec une rotation indépendante de celle du nom de
+dossier. Testé en direct sur `debian13` : honeypot re-provisionné sous
+`Documents/Classified_Contracts/vault_export.csv`, écriture dedans
+détectée et mis en quarantaine normalement (`honeypot touched:
+.../vault_export.csv`). Note : après mise à jour, l'ancien fichier au nom
+fixe reste orphelin dans le même dossier (pas de logique de migration
+ajoutée exprès - même raisonnement que pour les autres artefacts de
+honeypot déjà documenté : pas grave, pas de nettoyage automatique risqué).
+
+**Échantillonnage d'entropie contournable en préfixant le fichier (audit
+"Fable", confirmé réel).** `read_sample_via_fd` ne lisait que les 8 Kio
+au tout début du fichier (offset 0). Un ransomware préfixant chaque
+fichier chiffré d'un en-tête en clair de 8 Kio (ou laissant le début du
+fichier original intact) passait systématiquement sous
+`entropy_threshold`, et pire, chaque écriture de ce type empoisonnait la
+baseline du répertoire via `note_plaintext_activity`. Remplacé par
+`sample_entropy_via_fd` : échantillonne 3 zones réparties (début, milieu,
+fin), retourne l'entropie MAXIMALE des trois (pas la moyenne, qui serait
+elle aussi contournable en diluant une zone à haute entropie avec du
+remplissage). Le sniffing de format container (ZIP/PDF/JPEG) reste basé
+sur le premier chunk (offset 0), où vivent les magic bytes de toute façon.
+
+**Sortie propre d'un module = perte de protection silencieuse (audit
+"Fable", confirmé - non atteignable aujourd'hui mais le type le
+permettait).** Chaque boucle de module est un `loop {}` sans `break`, donc
+un retour `Ok(())` propre n'était pas atteignable en pratique - mais le
+code le traitait comme un arrêt normal (`exit(0)`) si jamais ça arrivait,
+et `Restart=on-failure` de systemd ne redémarre PAS sur un exit 0. Corrigé
+: un retour `Ok(())` d'une boucle de module est maintenant traité comme
+fatal (exit non-zéro), pour que `Restart=on-failure` fonctionne quelle que
+soit la raison de l'arrêt. Ajouté un `WatchdogSec=30` avec ping
+périodique côté `main.rs` (`sd_notify::watchdog_enabled()`), et
+`StartLimitIntervalSec=120`/`StartLimitBurst=10` pour laisser une vraie
+chance de redémarrage après un échec transitoire sans non plus
+crash-looper indéfiniment.
+
+**Durcissement systemd supplémentaire (audit "Fable") - une régression
+réelle trouvée en la testant en direct, corrigée avant de la garder.**
+Ajouté `RestrictAddressFamilies=AF_UNIX` et `ProtectProc=invisible` - les
+deux validés en direct (socket de contrôle, détection des 4 modules,
+lecture `/proc/<pid>` d'autres utilisateurs via `CAP_SYS_PTRACE` pour
+`package_manager`). `MemoryDenyWriteExecute=true` a été essayé aussi,
+mais **casse complètement le module yara** : `yara-x` compile les règles
+via un JIT `wasmtime`, qui a besoin de rendre une page mémoire
+inscriptible PUIS exécutable - exactement ce que cette directive bloque.
+Résultat en direct : le module yara panique au démarrage ("WASM module is
+not valid: unable to make memory executable"), ce qui - combiné au fait
+qu'un panic de module est fatal pour tout le démon - a fait entrer
+`warden.service` en crash-loop toutes les ~2s. Directive retirée avant de
+committer. Leçon confirmée une fois de plus : chaque directive de
+durcissement doit être testée en démarrant vraiment le service et en
+vérifiant que les 4 modules rapportent "ready", pas seulement que le
+process a démarré.
+
+**Ce qui a été délibérément documenté plutôt que codé (limitations
+d'architecture, pas des bugs).**
+- Le mode Enforce ne peut que constater après coup (fanotify
+  `FAN_CLASS_NOTIF`, pas `FAN_CLASS_CONTENT`/permission events) - un vrai
+  blocage synchrone existe côté kernel mais avec un risque de deadlock et
+  un coût de perf différents ; pas de changement d'architecture pour
+  aujourd'hui, seulement à documenter honnêtement dans le README (le
+  README actuel dit déjà "kills/quarantines it immediately", ce qui est
+  globalement correct - la détection est quasi-instantanée à l'échelle
+  humaine même si techniquement post-hoc).
+- Le seuil de burst est un débit (N fichiers / fenêtre), pas un volume
+  cumulatif long terme - un ransomware très lent (1 fichier/s) resterait
+  sous le radar indéfiniment. Un vrai compteur cumulatif long terme
+  demanderait de la persistance entre redémarrages pour ne pas être
+  trivialement contournable (redémarrer le service reset le compteur) -
+  hors scope pour cette passe, les honeypots restent le filet de sécurité
+  pour ce cas.
+- Coût CPU/fd du double mark fanotify filesystem-wide (ransomware + yara)
+  sur une machine très active en écriture - déjà `FAN_UNLIMITED_QUEUE`,
+  pas d'autre optimisation évidente sans changer d'approche (marks
+  par-répertoire, qui casserait la détection des sous-répertoires créés
+  après coup).
+- `ReadWritePaths` du service systemd : vérifié, déjà strictement le
+  minimum nécessaire (correspond exactement à ce que `package_manager`/
+  `quarantine`/`honeypot` touchent réellement) - pas une vraie régression
+  malgré ce que l'audit "Fable" laissait entendre.
+- Symlink loop dans `warden-ransomware/src/baseline.rs::seed()` - **vérifié
+  et non reproductible** : `DirEntry::metadata()` sur Unix utilise `lstat`
+  (ne suit pas les symlinks), confirmé par un test Rust minimal compilé
+  dans le conteneur de build (`entry.metadata().is_dir()` retourne `false`
+  pour un symlink, même pointant vers un répertoire réel). L'audit avait
+  tort sur ce point précis - noté pour ne pas perdre de temps dessus si ça
+  revient.
+- Ratio commentaires/code élevé (~26%, relevé par l'audit) - décision
+  délibérée de ne pas réduire : les commentaires de ce projet portent
+  presque tous une justification de sécurité durement acquise (un bypass
+  trouvé en red-team, une raison précise pour un choix de seuil...), pas
+  du bruit. Retirer ce contexte pour améliorer un ratio ferait perdre
+  exactement l'information qui a le plus de valeur pour un futur lecteur
+  ou contributeur.
+
+**Hygiène du dépôt - ajouté ce qui était mécanique et peu risqué.**
+`.github/workflows/test.yml` (build+test+clippy+cargo-audit sur tout le
+workspace, y compris `warden-gui` avec les dépendances GTK4/libadwaita -
+plus large que le `.yml` de la PR, qui ne couvrait que
+`warden-ransomware`). `--locked` ajouté aux trois invocations de `cargo
+build` dans `install.sh`. `cargo fmt --all -- --check` délibérément PAS
+ajouté à la CI : le style existant du projet (lignes larges, signatures
+sur une ligne) ne correspond pas aux réglages par défaut de rustfmt, et
+personne n'a demandé de reformater tout le dépôt - une CI rouge dès le
+premier push serait pire que pas de check du tout.
+
+**Validation.** `cargo build/clippy -D warnings/test --workspace --locked`
+propres dans le conteneur Rocky Linux (72 tests, tous verts). `shellcheck`
+propre sur `install.sh`/`uninstall.sh`. Testé en direct de bout en bout
+sur `debian13` (KDE Plasma, utilisateur protégé `test`) : upgrade en place
+via `install.sh` (piège trouvé : `TARGET_USER` reprend `$SUDO_USER`, donc
+relancer `sudo ./install.sh` en étant connecté en SSH sous un autre compte
+que l'utilisateur protégé écrase la config pour le mauvais utilisateur -
+rattrapé avant que le drop-in systemd soit réécrit, relancé avec
+`WARDEN_TARGET_USER=test` explicite), reproduction du PoC exact de
+l'issue #1 (corrigé), honeypot au nouveau nom de fichier (détecté),
+restore-from-quarantine (toujours fonctionnel). Matrice dnf/pacman/zypper (Fedora/Arch/openSUSE, conteneurs
+systemd-as-PID1) relancée avec le code à jour : les trois passent propre
+(`install.sh` exit 0, service `active`, `uninstall.sh --purge` exit 0,
+aucun résidu - binaires/units/`/etc/warden`/`/var/lib/warden` tous
+absents après). Les 4 familles de gestionnaires de paquets sont donc
+validées avec le code d'aujourd'hui : apt en direct sur la VM (le seul
+test poussé jusqu'au bout fonctionnel, pas juste installation/suppression
+- PoC, honeypot, restore), dnf/pacman/zypper via la matrice Docker
+(installation/démarrage/suppression propres, pas de test fonctionnel
+poussé aussi loin que sur la VM - couverture jugée suffisante puisque le
+code Rust est strictement le même binaire partout, seule la partie
+gestionnaire de paquets d'`install.sh` change réellement d'un OS à
+l'autre).
