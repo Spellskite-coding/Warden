@@ -32,26 +32,59 @@ pub enum Verdict {
 ///   burst to (the responsible short-lived processes may have already
 ///   exited by the time this fires), so the response path can only best-
 ///   effort target whichever PID triggered the *triggering* write.
-/// - **Globally, PID- and directory-agnostic** (`recent_writes_global`):
-///   a second, red-team-confirmed bypass of the two counters above -
-///   fork-per-file *combined with* spreading those files across several
-///   watched directories at once (e.g. `burst_file_count - 1` files each
-///   in every one of the default six watch dirs) keeps every single
-///   per-PID AND per-directory count individually under threshold while
-///   still touching dozens of distinct files within the window.
-///   Reproduced live end-to-end: 48 files across 6 directories, 8 per
-///   directory, one short-lived process per file - zero detections, zero
-///   quarantines. The per-directory counter alone only bounds a *single*
-///   directory's count, never the sum across all of them; this third
-///   counter closes that gap the same way `recent_writes_by_dir` closes
-///   the per-PID one, at the same threshold - a real burst is a real
-///   burst no matter how it's laundered across PIDs and directories.
+/// - **Globally, PID- and directory-agnostic** - two variants:
+///   `recent_writes_global` for directories that already have a plaintext
+///   baseline, and `recent_writes_global_unbaselined` for ones that don't.
+///   A red-team-confirmed bypass of the first two counters - fork-per-file
+///   *combined with* spreading those files across several watched
+///   directories at once (e.g. `burst_file_count - 1` files each in every
+///   one of the default six watch dirs) keeps every single per-PID AND
+///   per-directory count individually under threshold while still
+///   touching dozens of distinct files within the window. Reproduced live
+///   end-to-end: 48 files across 6 directories, 8 per directory, one
+///   short-lived process per file - zero detections, zero quarantines.
+///   The per-directory counter alone only bounds a *single* directory's
+///   count, never the sum across all of them; this global counter closes
+///   that gap the same way `recent_writes_by_dir` closes the per-PID one.
+///
+///   A second, independently red-team-confirmed bypass (external report,
+///   full writeup and PoC in PROGRESS.md) targeted the *unbaselined* case
+///   specifically: `has_baseline()` used to gate ALL THREE counters,
+///   including this global one, so a directory that had simply never
+///   received a plaintext write before (any freshly-created subdirectory,
+///   any Pictures/Videos folder that only ever holds container-format
+///   files and so never triggers `note_plaintext_activity`) was
+///   completely invisible to burst detection no matter how many files
+///   got encrypted in it. `recent_writes_global_unbaselined` exists so
+///   that gap closes at the SAME threshold as the baselined path, not a
+///   looser one - a separate map (rather than reusing
+///   `recent_writes_global` under a different threshold depending on
+///   which write happens to land last) avoids the verdict becoming
+///   order-dependent and keeps `files_for_pid` attribution consistent.
+///   Deliberately not given a higher/looser threshold than the baselined
+///   global counter: doing so would hand ransomware a mechanical
+///   incentive to prefer fresh directories specifically because they
+///   carry a bigger allowance, which defeats the entire point of closing
+///   this bypass in the first place.
+///
+/// - **Per originating PID, unconditionally** (still `recent_writes_by_pid`,
+///   at the same threshold as everywhere else): also no longer gated on
+///   `has_baseline()`, for the same reason as the global counters just
+///   above - a single non-forking process encrypting many files in a
+///   fresh directory needs to be caught by *something* even before the
+///   global counter's aggregate threshold is reached, exactly as it
+///   already is in a baselined directory. Per-directory tracking alone
+///   stays gated on baseline (see below) since it's the counter most
+///   prone to false-positiving on a directory that legitimately only
+///   ever receives bulk container-format content; per-PID and global
+///   don't share that risk the same way and so don't need the same gate.
 ///
 /// Also tracks, per directory, whether ordinary (low-entropy) content has
-/// ever been seen there. A burst of high-entropy writes only counts as
-/// suspicious in a directory that used to hold plain content - otherwise a
-/// directory that only ever receives already-compressed output would trip
-/// the same heuristic as actual encryption.
+/// ever been seen there. A burst of high-entropy writes in a directory
+/// with a baseline gets an extra, more sensitive check (the per-directory
+/// counter, gated on this) on top of the two unconditional ones above -
+/// otherwise a directory that only ever receives already-compressed
+/// output would trip that particular counter on ordinary bulk activity.
 pub struct Detector {
     burst_file_count: usize,
     /// Higher threshold for writes that match a known container-format
@@ -63,9 +96,11 @@ pub struct Detector {
     recent_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_writes_global_unbaselined: HashMap<(), HashMap<PathBuf, Instant>>,
     recent_container_format_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_container_format_writes_global_unbaselined: HashMap<(), HashMap<PathBuf, Instant>>,
     directories_with_plaintext_history: HashSet<PathBuf>,
 }
 
@@ -88,9 +123,11 @@ impl Detector {
             recent_writes_by_pid: HashMap::new(),
             recent_writes_by_dir: HashMap::new(),
             recent_writes_global: HashMap::new(),
+            recent_writes_global_unbaselined: HashMap::new(),
             recent_container_format_writes_by_pid: HashMap::new(),
             recent_container_format_writes_by_dir: HashMap::new(),
             recent_container_format_writes_global: HashMap::new(),
+            recent_container_format_writes_global_unbaselined: HashMap::new(),
             directories_with_plaintext_history: HashSet::new(),
         }
     }
@@ -127,26 +164,28 @@ impl Detector {
     }
 
     pub fn observe_high_entropy_write(&mut self, pid: i32, path: &Path) -> Verdict {
-        if !self.has_baseline(path) {
-            return Verdict::Clean;
-        }
-
         let now = Instant::now();
         let window = self.burst_window;
+        let threshold = self.burst_file_count;
+        let has_baseline = self.has_baseline(path);
 
-        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, self.burst_file_count) {
+        // Per-PID and (one of) the global counters run unconditionally -
+        // see the struct doc comment for why gating them on `has_baseline`
+        // was the actual bug being fixed here.
+        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
-        if let Some(dir) = path.parent() {
-            if let Some(affected) =
-                Self::record_and_check(&mut self.recent_writes_by_dir, dir.to_path_buf(), path, now, window, self.burst_file_count)
-            {
+        if has_baseline {
+            if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, threshold) {
                 return Verdict::Burst { affected };
             }
-        }
-
-        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
+            if let Some(dir) = path.parent() {
+                if let Some(affected) = Self::record_and_check(&mut self.recent_writes_by_dir, dir.to_path_buf(), path, now, window, threshold) {
+                    return Verdict::Burst { affected };
+                }
+            }
+        } else if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global_unbaselined, (), path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
@@ -177,27 +216,27 @@ impl Detector {
     /// correctly attribute a container-format burst back to the process
     /// that triggered it, for response/quarantine purposes.
     pub fn observe_container_format_write(&mut self, pid: i32, path: &Path) -> Verdict {
-        if !self.has_baseline(path) {
-            return Verdict::Clean;
-        }
-
         let now = Instant::now();
         let window = self.burst_window;
         let threshold = self.container_format_burst_file_count;
+        let has_baseline = self.has_baseline(path);
 
         if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
-        if let Some(dir) = path.parent() {
-            if let Some(affected) =
-                Self::record_and_check(&mut self.recent_container_format_writes_by_dir, dir.to_path_buf(), path, now, window, threshold)
-            {
+        if has_baseline {
+            if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
                 return Verdict::Burst { affected };
             }
-        }
-
-        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
+            if let Some(dir) = path.parent() {
+                if let Some(affected) =
+                    Self::record_and_check(&mut self.recent_container_format_writes_by_dir, dir.to_path_buf(), path, now, window, threshold)
+                {
+                    return Verdict::Burst { affected };
+                }
+            }
+        } else if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global_unbaselined, (), path, now, window, threshold) {
             return Verdict::Burst { affected };
         }
 
@@ -220,6 +259,44 @@ impl Detector {
     pub fn forget(&mut self, pid: i32) {
         self.recent_writes_by_pid.remove(&pid);
         self.recent_container_format_writes_by_pid.remove(&pid);
+    }
+
+    /// Drops every per-PID/per-directory outer entry whose tracked writes
+    /// have all aged out of the burst window.
+    ///
+    /// `record_and_check` prunes a key's *inner* map (the timestamped
+    /// paths) on every write to that same key, but it never removes the
+    /// *outer* key itself even once that inner map is left empty - and
+    /// for a PID that writes exactly once and then exits (the overwhelming
+    /// common case: PIDs churn constantly, most never come back), nothing
+    /// ever touches that key again to trigger a prune. `recent_writes_by_pid`
+    /// and `recent_writes_by_dir` (and their container-format counterparts)
+    /// therefore grow by roughly one entry per distinct PID/directory ever
+    /// observed, for as long as the daemon runs - a real unbounded-memory
+    /// finding on a long-lived workstation daemon, found by review rather
+    /// than live reproduction (the growth is slow enough that it wouldn't
+    /// show up in a normal test run). The two global maps aren't included
+    /// here: keyed on a single unit `()`, they're re-pruned on every
+    /// single write regardless of which PID/directory it came from, so
+    /// they don't share this growth pattern.
+    ///
+    /// Meant to be called periodically (not on every event - see the
+    /// caller in `fanotify_monitor::run`) rather than after every write,
+    /// since a full sweep costs O(total tracked PIDs + directories).
+    pub fn prune_expired(&mut self, now: Instant) {
+        let window = self.burst_window;
+        for map in [&mut self.recent_writes_by_pid, &mut self.recent_container_format_writes_by_pid] {
+            map.retain(|_, files| {
+                files.retain(|_, &mut seen| now.duration_since(seen) <= window);
+                !files.is_empty()
+            });
+        }
+        for map in [&mut self.recent_writes_by_dir, &mut self.recent_container_format_writes_by_dir] {
+            map.retain(|_, files| {
+                files.retain(|_, &mut seen| now.duration_since(seen) <= window);
+                !files.is_empty()
+            });
+        }
     }
 }
 
@@ -303,5 +380,115 @@ mod tests {
         }
         assert!(matches!(verdict, Verdict::Burst { .. }), "45 container-format writes from one pid must trigger a burst");
         assert_eq!(d.files_for_pid(pid).len(), 45, "the burst's files must be attributable back to the triggering pid");
+    }
+
+    fn detector_with_baseline_required(burst_file_count: usize) -> Detector {
+        let cfg = RansomwareConfig { burst_file_count, require_directory_baseline: true, ..RansomwareConfig::default() };
+        Detector::new(&cfg)
+    }
+
+    /// Regression test for the externally-reported "no-baseline bypass":
+    /// a directory that never received a plaintext write (any freshly
+    /// created subdirectory) used to be completely invisible to ALL
+    /// THREE counters, including the global one. 20 files from 20
+    /// distinct short-lived PIDs (the exact shape of the reported PoC)
+    /// in a directory with no baseline must still trigger, at the same
+    /// threshold a baselined directory would.
+    #[test]
+    fn burst_in_a_directory_with_no_baseline_is_still_caught_by_the_global_counter() {
+        let mut d = detector_with_baseline_required(15);
+        let mut verdict = Verdict::Clean;
+        for i in 0..20 {
+            verdict = d.observe_high_entropy_write(50_000 + i, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "20 files across 20 distinct pids in a never-baselined directory must trigger");
+    }
+
+    /// Same PoC shape, container-format path.
+    #[test]
+    fn container_format_burst_in_a_directory_with_no_baseline_is_still_caught() {
+        let mut d = detector_with_baseline_required(15); // container_format_burst_file_count = 45
+        let mut verdict = Verdict::Clean;
+        for i in 0..45 {
+            verdict = d.observe_container_format_write(60_000 + i, Path::new(&format!("/home/test/new_dir/file_{i}.zip")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "45 container-format writes across distinct pids in a never-baselined directory must trigger");
+    }
+
+    /// A single non-forking process writing into a fresh, never-baselined
+    /// directory must be caught by the now-unconditional per-PID counter,
+    /// without needing to wait for the (also unconditional, but
+    /// process-agnostic) global-unbaselined counter to separately reach
+    /// threshold.
+    #[test]
+    fn single_pid_burst_in_a_directory_with_no_baseline_is_caught_by_per_pid() {
+        let mut d = detector_with_baseline_required(15);
+        let mut verdict = Verdict::Clean;
+        for i in 0..15 {
+            verdict = d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "15 files from one pid in a never-baselined directory must trigger");
+    }
+
+    /// The unbaselined global counter must use the SAME threshold as the
+    /// baselined one - not a looser one. A looser threshold would hand
+    /// ransomware a mechanical incentive to prefer fresh directories,
+    /// re-opening (at a higher file count) the exact bypass this is
+    /// meant to close.
+    #[test]
+    fn unbaselined_global_threshold_matches_the_baselined_one() {
+        let mut d = detector_with_baseline_required(15);
+        d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
+        // 14 baselined writes from distinct pids, one dir - under both
+        // per-pid and per-dir thresholds, exercises the global-baselined
+        // path specifically.
+        for i in 0..14 {
+            d.observe_high_entropy_write(1000 + i, Path::new(&format!("/home/test/docs/file_{i}.enc")));
+        }
+        // 14 unbaselined writes from distinct pids, a different dir.
+        let mut verdict = Verdict::Clean;
+        for i in 0..14 {
+            verdict = d.observe_high_entropy_write(2000 + i, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        }
+        assert_eq!(verdict, Verdict::Clean, "14 is still one below the 15 threshold on either path");
+
+        verdict = d.observe_high_entropy_write(2100, Path::new("/home/test/new_dir/file_last.enc"));
+        assert!(matches!(verdict, Verdict::Burst { .. }), "the 15th unbaselined write must trigger at the same threshold as the baselined path");
+    }
+
+    /// Directories that legitimately only ever hold container-format
+    /// content (a Pictures/Videos folder) never call `note_plaintext_activity`,
+    /// so `has_baseline` never becomes true for them - the per-directory
+    /// counter (gated on baseline, to avoid false-positiving on bulk
+    /// legitimate imports) stays silent, but the unconditional per-PID and
+    /// global-unbaselined counters must still catch a real burst there.
+    #[test]
+    fn a_pictures_style_directory_that_never_gets_a_baseline_is_still_protected() {
+        let mut d = detector_with_baseline_required(15);
+        let mut verdict = Verdict::Clean;
+        for i in 0..20 {
+            verdict = d.observe_high_entropy_write(70_000 + i, Path::new(&format!("/home/test/Pictures/photo_{i}.raw")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }), "a directory that only ever holds container-format content must still be covered by the global counter");
+    }
+
+    /// Regression test for the memory-leak finding: a PID that writes
+    /// once, well under threshold, and never writes again must not leave
+    /// a permanent entry in the per-PID map once its write has aged out
+    /// of the burst window.
+    #[test]
+    fn prune_expired_removes_stale_per_pid_and_per_dir_entries() {
+        let mut d = detector_with_threshold(15);
+        let start = Instant::now();
+        for pid in 0..500 {
+            d.observe_high_entropy_write(pid, Path::new(&format!("/home/test/Documents/once_{pid}.bin")));
+        }
+        assert_eq!(d.recent_writes_by_pid.len(), 500, "sanity check: every one-off pid left an entry");
+
+        let long_after_window = start + d.burst_window + Duration::from_secs(1);
+        d.prune_expired(long_after_window);
+
+        assert!(d.recent_writes_by_pid.is_empty(), "every entry should have aged out of the burst window and been pruned");
+        assert!(d.recent_writes_by_dir.values().all(|m| !m.is_empty()) || d.recent_writes_by_dir.is_empty(), "no stale empty inner maps left behind");
     }
 }
