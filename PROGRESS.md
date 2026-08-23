@@ -1341,18 +1341,70 @@ redirigée vers un fichier, jamais en gardant le process attaché à la
 session SSH/paramiko elle-même - une commande longue ne doit jamais
 dépendre de la survie de la connexion qui l'a lancée.
 
+Lot install/uninstall committé (`f20282f`). README réécrit et committé
+(`78cb91c`). `PUSH_TO_GITHUB.txt` et `/home/user/warden.zip` préparés
+(zip validé de bout en bout : contenu extrait à froid dans un conteneur
+neuf, `install.sh` exécuté depuis cette copie, détection réelle
+confirmée - le zip est un livrable autoportant complet).
+
+## `pkexec`/PolicyKit manquant - trouvé en testant la GUI en direct (23 août)
+
+L'utilisateur a testé la GUI en conditions réelles sur `debian13` -
+Restore et Switch mode échouaient tous les deux avec "Could not run
+pkexec: Aucun fichier ou dossier de ce nom". Cause : `pkexec` (utilisé
+par TOUTES les actions authentifiées de la GUI - restore, exceptions,
+quarantine manuel, changement de mode, voir `run_pkexec_warden` dans
+`warden-gui/src/ui.rs`) n'était installé par aucune branche
+d'`install_packages()` - jamais un vrai paquet requis pour BUILD Warden,
+seulement pour l'UTILISER une fois installé, donc invisible tant qu'une
+machine a déjà un environnement de bureau complet qui l'apporte comme
+dépendance (le cas de toutes les vraies machines desktop, mais pas de
+cette VM minimale ni des conteneurs de test de cette nuit).
+
+**Piège en corrigeant** : `policykit-1` n'existe plus tel quel sur
+Debian 13 (trixie) - scindé en `pkexec` + `polkitd` séparés. Un simple
+ajout de `policykit-1` à la liste de paquets aurait fait échouer
+`apt-get install` EN ENTIER (un seul nom de paquet introuvable annule
+toute la commande), cassant tout l'install sur trixie pour ce détail.
+**Fix** : nouvelle fonction `install_polkit_apt()` isolée, essaie
+`policykit-1` puis retombe sur `pkexec`+`polkitd`, best-effort (avertit
+sans faire échouer le reste de l'install). `polkit` ajouté directement
+pour dnf/pacman/zypper - vérifié en direct (requête au dépôt de chaque
+distro, pas juste supposé) que c'est le bon nom sur les 3.
+
+**Incident opérationnel en marge** : pour tester le fix proprement,
+`pkexec` a été désinstallé de `debian13` pour simuler une machine
+neuve - sans prévenir l'utilisateur que c'était fait sur la VM qu'il
+testait activement, ce qui a cassé la GUI sous ses yeux pendant le
+test. Réinstallé immédiatement. Leçon : une action destructive/perturbatrice
+sur une machine que l'utilisateur utilise activement en direct doit être
+annoncée AVANT de la faire, même pour un test, même réversible en
+quelques secondes.
+
+**Validé en direct sur `debian13`** : `pkexec` désinstallé, vrai
+`install.sh` relancé de bout en bout (build complet + `install_polkit_apt`
++ démarrage des 3 services), `pkexec` de retour, détection reverse-shell
+toujours fonctionnelle. Un agent d'authentification PolicyKit
+(`polkit-kde-authentication-agent-1`) était déjà actif dans la session
+KDE Plasma de la VM, confirmant que `pkexec` seul était bien la pièce
+manquante. Committé (`4f68624`).
+
 ## Prochaine session : par où reprendre
 
-1. Committer ce lot install/uninstall (`docker/Dockerfile.test.fedora`,
-   `docker/Dockerfile.test.arch`, `docker/Dockerfile.test.opensuse`,
-   `.dockerignore`, `uninstall.sh`).
-2. Nouvel audit red team complet sur les deux VMs (dans le conteneur
+1. Nouvel audit red team complet sur les deux VMs (dans le conteneur
    `warden-redteam`/les VMs uniquement - directive utilisateur : rien
    téléchargé depuis internet/GitHub pour le red team, uniquement des
    paquets `apt` et des outils écrits maison).
-3. README à jour + préparation du dépôt pour une publication GitHub
-   (organisation du dossier, fichiers git nécessaires, fichier de
-   commandes pour pousser sur GitHub, archive zip transportable).
-4. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
-5. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+2. Régénérer `/home/user/warden.zip` et `install.sh` sur le Bureau si
+   d'autres changements de code sont faits (actuellement à jour avec
+   `4f68624`, mais à revérifier avant publication finale sur GitHub).
+3. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
+4. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
+5. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+6. Module infostealer (lecture des stores de credentials navigateur/SSH/
+   cloud CLI) - discuté et scopé avec l'utilisateur (mode notify d'abord,
+   pas de blocage synchrone, liste de confiance pour les accesseurs
+   légitimes), mais explicitement refusé pour l'instant ("la flemme, on
+   fait rien... c'est une défense en plus, pas un remplacement de la
+   vigilance humaine"). Ne pas reproposer sans que l'utilisateur relance
+   le sujet lui-même.
