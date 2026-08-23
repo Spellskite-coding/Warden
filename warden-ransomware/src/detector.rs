@@ -41,7 +41,11 @@ pub enum Verdict {
 ///   threshold `burst_file_count * 2`) so each is always evaluated at a
 ///   fixed threshold. A single shared map evaluated at different thresholds
 ///   depending on which process writes last produces non-deterministic
-///   verdicts and incorrect PID attribution.
+///   verdicts and incorrect PID attribution. Trade-off: writes in dirs
+///   with and without baseline never cumulate across maps. With default
+///   burst_file_count=15, the residual cap is 14+29=43 files on the plain
+///   path and 44+89=133 on the container-format path before any global
+///   counter fires.
 ///
 /// Also tracks, per directory, whether ordinary (low-entropy) content has
 /// ever been seen there. A burst of high-entropy writes only counts as
@@ -326,10 +330,17 @@ mod tests {
         let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
         let mut d = Detector::new(&cfg);
         d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
-        let mut verdict = Verdict::Clean;
-        for i in 0..15 {
-            verdict = d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/docs/file_{i}.enc")));
+        d.note_plaintext_activity(Path::new("/home/test/desktop/note.txt"));
+        // 8 files from distinct PIDs in docs/ — under per-pid and per-dir thresholds
+        for i in 0..8 {
+            d.observe_high_entropy_write(1000 + i, Path::new(&format!("/home/test/docs/file_{i}.enc")));
         }
+        // 7 more from distinct PIDs in desktop/ — each local counter still under 15
+        let mut verdict = Verdict::Clean;
+        for i in 0..7 {
+            verdict = d.observe_high_entropy_write(2000 + i, Path::new(&format!("/home/test/desktop/file_{i}.enc")));
+        }
+        // global baselined map at 15 → fires
         assert!(matches!(verdict, Verdict::Burst { .. }));
     }
 
@@ -338,10 +349,16 @@ mod tests {
         let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
         let mut d = Detector::new(&cfg);
         d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
-        for i in 0u32..14 {
-            d.observe_high_entropy_write(9999 + i as i32, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        // 29 unbaselined writes — just below the 2x=30 threshold
+        for i in 0..29i32 {
+            d.observe_high_entropy_write(9000 + i, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
         }
-        let verdict = d.observe_high_entropy_write(1000, Path::new("/home/test/docs/report.enc"));
+        // 14 baselined writes — just below the 1x=15 threshold
+        let mut verdict = Verdict::Clean;
+        for i in 0..14i32 {
+            verdict = d.observe_high_entropy_write(8000 + i, Path::new(&format!("/home/test/docs/file_{i}.enc")));
+        }
+        // maps are separate: neither threshold reached
         assert_eq!(verdict, Verdict::Clean);
     }
 
