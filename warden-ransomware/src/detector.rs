@@ -42,10 +42,11 @@ pub enum Verdict {
 ///   fixed threshold. A single shared map evaluated at different thresholds
 ///   depending on which process writes last produces non-deterministic
 ///   verdicts and incorrect PID attribution. Trade-off: writes in dirs
-///   with and without baseline never cumulate across maps. With default
-///   burst_file_count=15, the residual cap is 14+29=43 files on the plain
-///   path and 44+89=133 on the container-format path before any global
-///   counter fires.
+///   with and without baseline accumulate in separate global maps. With
+///   default burst_file_count=15, a single process is caught at 2x=30
+///   files regardless of which dirs it targets. Multi-process spread
+///   (fork-per-file) has a residual cap of 14+29=43 files on the plain
+///   path and 44+89=133 on the container-format path.
 ///
 /// Also tracks, per directory, whether ordinary (low-entropy) content has
 /// ever been seen there. A burst of high-entropy writes only counts as
@@ -135,12 +136,14 @@ impl Detector {
         let window = self.burst_window;
         let has_baseline = self.has_baseline(path);
 
-        let pid_burst = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, self.burst_file_count);
+        let pid_threshold = if has_baseline { self.burst_file_count } else { self.burst_file_count.saturating_mul(2) };
+        let pid_burst = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, pid_threshold);
+
+        if let Some(affected) = pid_burst {
+            return Verdict::Burst { affected };
+        }
 
         if has_baseline {
-            if let Some(affected) = pid_burst {
-                return Verdict::Burst { affected };
-            }
             if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
                 return Verdict::Burst { affected };
             }
@@ -187,12 +190,14 @@ impl Detector {
         let threshold = self.container_format_burst_file_count;
         let has_baseline = self.has_baseline(path);
 
-        let pid_burst = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, threshold);
+        let pid_threshold = if has_baseline { threshold } else { threshold.saturating_mul(2) };
+        let pid_burst = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, pid_threshold);
+
+        if let Some(affected) = pid_burst {
+            return Verdict::Burst { affected };
+        }
 
         if has_baseline {
-            if let Some(affected) = pid_burst {
-                return Verdict::Burst { affected };
-            }
             if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
                 return Verdict::Burst { affected };
             }
@@ -360,6 +365,23 @@ mod tests {
         }
         // maps are separate: neither threshold reached
         assert_eq!(verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn single_pid_mixed_baseline_and_no_baseline_caught_by_per_pid() {
+        let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
+        let mut d = Detector::new(&cfg);
+        d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
+        // 8 files in baselined dir — per-PID at 8, threshold 15
+        for i in 0..8 {
+            d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/docs/file_{i}.enc")));
+        }
+        // 22 more in unbaselined dir — per-PID reaches 30, threshold 2x=30
+        let mut verdict = Verdict::Clean;
+        for i in 0..22 {
+            verdict = d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }));
     }
 
     /// Regression test for the finding that `observe_container_format_write`
