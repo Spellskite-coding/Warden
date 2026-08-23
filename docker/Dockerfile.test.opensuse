@@ -1,0 +1,25 @@
+# Full systemd-as-PID1 test image for the zypper/openSUSE-family branch
+# of install.sh's install_packages() (opensuse*/sles) - previously
+# untested end-to-end. See Dockerfile.test.fedora's header comment for
+# why this runs real systemd rather than just launching the binary
+# directly.
+FROM opensuse/tumbleweed:latest
+
+ENV container=docker
+
+RUN zypper --non-interactive install systemd sudo procps shadow git \
+    && systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
+        systemd-udevd-control.socket getty.target getty-static.service \
+        systemd-remount-fs.service sys-kernel-config.mount || true
+
+RUN useradd -m -u 1500 tester && echo "tester:tester" | chpasswd \
+    && mkdir -p /home/tester/Documents /home/tester/Desktop \
+    && echo "just a normal text document" > /home/tester/Documents/notes.txt \
+    && chown -R tester:tester /home/tester
+
+COPY . /opt/warden-src
+RUN chown -R tester:tester /opt/warden-src
+
+STOPSIGNAL SIGRTMIN+3
+VOLUME ["/sys/fs/cgroup"]
+CMD ["/sbin/init"]

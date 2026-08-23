@@ -1261,22 +1261,98 @@ détection reverse-shell toujours opérationnelle (quarantaine effective),
 Le backlog HIGH/MEDIUM/LOW documenté depuis le début de cette vague est
 maintenant **entièrement traité** (7 critiques + 3 HIGH + 12 MEDIUM/LOW,
 2 de ces derniers acceptés comme limitations structurelles plutôt que
-corrigés). Reste à committer ce dernier lot, puis :
+corrigés). Ce lot a été committé (`89059a0`).
 
-1. Committer ce lot MEDIUM/LOW (fichiers touchés : `warden-common/src/process.rs`,
-   `warden-common/src/quarantine.rs`, `warden-common/src/notify.rs`,
-   `warden-core/src/control.rs`, `warden-core/src/main.rs`,
-   `warden-ransomware/src/detector.rs`, `warden-ransomware/src/fanotify_monitor.rs`,
-   `warden-yara/src/rules.rs`).
+## `install.sh`/`uninstall.sh` validés de bout en bout sur les 4 familles de gestionnaires de paquets + création d'un désinstalleur (23 août)
+
+Plutôt que de tester bêtement les 7 noms de distro un par un, `install.sh`
+n'a en réalité que 4 branches de gestionnaire de paquets distinctes
+(apt/dnf/pacman/zypper) - chacune validée une fois pour de vrai plutôt
+que dupliquée inutilement :
+
+- **apt** (Debian/Ubuntu/Kali/Mint/Pop) - `install.sh` exécuté pour de
+  vrai (pas le script de déploiement manuel habituel) sur les deux VMs
+  réelles `debian13` et `ubuntu25.10`, y compris le build eBPF complet
+  (`warden-exec`/`warden-network`, rustup nightly + bpf-linker déjà en
+  place sur ces VMs depuis les sessions précédentes) et la GUI GTK4.
+  Détection reverse-shell confirmée fonctionnelle après install sur les
+  deux.
+- **dnf** (Fedora/RHEL/Rocky/Alma/CentOS) - nouveau
+  `docker/Dockerfile.test.fedora` (systemd réel comme PID1, pattern
+  repris de `~/ransomshield/docker/Dockerfile.debian`: masquer les
+  units matériel-dépendantes inutiles en conteneur, `STOPSIGNAL
+  SIGRTMIN+3`, `VOLUME ["/sys/fs/cgroup"]`, `CMD ["/sbin/init"]`).
+  `install.sh` exécuté pour de vrai (`cargo`/`rustc` distro via `dnf`,
+  eBPF sauté proprement - pas de rustup nightly configuré, comportement
+  attendu et documenté dans le script) : build complet workspace + GUI
+  GTK4/libadwaita, unit systemd installée et démarrée, détection
+  reverse-shell confirmée (fichier quarantiné).
+- **pacman** (Arch/Manjaro) - `docker/Dockerfile.test.arch`, même
+  validation complète.
+- **zypper** (openSUSE Tumbleweed/SLES) - `docker/Dockerfile.test.opensuse`,
+  même validation complète.
+
+**Nouveau : `uninstall.sh`** (sur demande explicite) - désinstalleur
+propre : arrête/désactive les services AVANT de toucher un fichier (même
+raisonnement qu'`install.sh` : persistence surveille activement
+`/etc/systemd/system`), retire binaires/units/icônes GUI, et laisse
+`/etc/warden` (config) et `/var/lib/warden` (quarantaine, historique,
+seed honeypot) intacts par défaut - un fichier quarantiné peut être la
+seule copie survivante d'un incident réel. Un `--purge` optionnel
+supprime aussi ces deux-là, mais seulement après confirmation explicite
+(`yes` tapé, ou `-y`/`--yes` pour l'usage non-interactif). Tous les
+chemins agis dessus sont des constantes fixes en tête de script - jamais
+construits depuis une variable qui pourrait être vide, pour qu'aucun
+`rm -rf` ne puisse jamais s'élargir accidentellement. Ne tente pas de
+reconstruire/supprimer les dossiers honeypot dans le `$HOME` de
+l'utilisateur (leur nommage est un algorithme dérivé d'un seed
+aléatoire dans `honeypot.rs` - le dupliquer en bash serait une
+seconde implémentation risquant de diverger silencieusement de la
+vraie ; un pattern-match sur des dossiers arbitraires dans un home
+réel pour les supprimer automatiquement est aussi le genre de pari
+qu'un script de nettoyage ne devrait pas faire) - documenté
+explicitement dans le message final plutôt que laissé sous silence.
+
+**SAST** : `shellcheck` propre (exit 0) sur `uninstall.sh`.
+
+**Validé en conditions réelles** (installation réelle → détection réelle
+→ désinstallation → vérification qu'il ne reste plus rien → re-exécution
+pour prouver l'idempotence → réinstallation pour laisser la machine
+protégée) sur :
+- Fedora, Arch, openSUSE (conteneurs Docker, `--purge` testé - jetables,
+  aucune donnée réelle à perdre).
+- `debian13`, `ubuntu25.10` (VMs réelles, **sans** `--purge` - ces VMs
+  ont des mois de preuves de tests red-team accumulées dans leur
+  quarantaine ; 69 et 73 fichiers respectivement, comptés avant/après
+  pour confirmer qu'aucun n'a été perdu par la désinstallation par
+  défaut). Les deux VMs ont été réinstallées ensuite via `install.sh`
+  pour repartir protégées.
+
+Incident opérationnel en cours de route, pour référence future : la
+toute première tentative d'exécuter `install.sh` sur `ubuntu25.10` via
+`paramiko.exec_command` (sans `setsid`/`nohup`/`disown`) a subi un
+`PipeTimeout` côté client sans que le process distant meure - il a
+continué à tourner en arrière-plan, orphelin, pendant plusieurs heures
+en parallèle d'une seconde tentative relancée par erreur, gonflant
+artificiellement la durée totale sans qu'aucun des deux builds ne soit
+réellement bloqué. Leçon retenue : toujours lancer une commande longue
+sur une VM distante via `setsid nohup ... & disown` avec sortie
+redirigée vers un fichier, jamais en gardant le process attaché à la
+session SSH/paramiko elle-même - une commande longue ne doit jamais
+dépendre de la survie de la connexion qui l'a lancée.
+
+## Prochaine session : par où reprendre
+
+1. Committer ce lot install/uninstall (`docker/Dockerfile.test.fedora`,
+   `docker/Dockerfile.test.arch`, `docker/Dockerfile.test.opensuse`,
+   `.dockerignore`, `uninstall.sh`).
 2. Nouvel audit red team complet sur les deux VMs (dans le conteneur
    `warden-redteam`/les VMs uniquement - directive utilisateur : rien
    téléchargé depuis internet/GitHub pour le red team, uniquement des
    paquets `apt` et des outils écrits maison).
-3. `install.sh` finalisé + Dockerfiles de test systemd pour les distros
-   restantes (déjà validé en direct sur Debian 13 et Ubuntu 25.10 via les
-   VMs ; fedora/rocky/arch/opensuse/kali restent à tester en conteneur
-   systemd dédié).
-4. README à jour + préparation du dépôt pour une publication GitHub.
-5. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
-6. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-7. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
+3. README à jour + préparation du dépôt pour une publication GitHub
+   (organisation du dossier, fichiers git nécessaires, fichier de
+   commandes pour pousser sur GitHub, archive zip transportable).
+4. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
+5. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
+6. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
