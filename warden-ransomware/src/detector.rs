@@ -32,20 +32,16 @@ pub enum Verdict {
 ///   burst to (the responsible short-lived processes may have already
 ///   exited by the time this fires), so the response path can only best-
 ///   effort target whichever PID triggered the *triggering* write.
-/// - **Globally, PID- and directory-agnostic** (`recent_writes_global`):
-///   a second, red-team-confirmed bypass of the two counters above -
-///   fork-per-file *combined with* spreading those files across several
-///   watched directories at once (e.g. `burst_file_count - 1` files each
-///   in every one of the default six watch dirs) keeps every single
-///   per-PID AND per-directory count individually under threshold while
-///   still touching dozens of distinct files within the window.
-///   Reproduced live end-to-end: 48 files across 6 directories, 8 per
-///   directory, one short-lived process per file - zero detections, zero
-///   quarantines. The per-directory counter alone only bounds a *single*
-///   directory's count, never the sum across all of them; this third
-///   counter closes that gap the same way `recent_writes_by_dir` closes
-///   the per-PID one, at the same threshold - a real burst is a real
-///   burst no matter how it's laundered across PIDs and directories.
+/// - **Globally, PID- and directory-agnostic**: closes the bypass where
+///   fork-per-file combined with spreading writes across several watched
+///   directories keeps every per-PID and per-directory count individually
+///   under threshold. Two separate maps are used (`recent_writes_global`
+///   for directories with a baseline, threshold `burst_file_count`; and
+///   `recent_writes_global_unbaselined` for directories without one,
+///   threshold `burst_file_count * 2`) so each is always evaluated at a
+///   fixed threshold. A single shared map evaluated at different thresholds
+///   depending on which process writes last produces non-deterministic
+///   verdicts and incorrect PID attribution.
 ///
 /// Also tracks, per directory, whether ordinary (low-entropy) content has
 /// ever been seen there. A burst of high-entropy writes only counts as
@@ -63,9 +59,11 @@ pub struct Detector {
     recent_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_writes_global_unbaselined: HashMap<(), HashMap<PathBuf, Instant>>,
     recent_container_format_writes_by_pid: HashMap<i32, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_by_dir: HashMap<PathBuf, HashMap<PathBuf, Instant>>,
     recent_container_format_writes_global: HashMap<(), HashMap<PathBuf, Instant>>,
+    recent_container_format_writes_global_unbaselined: HashMap<(), HashMap<PathBuf, Instant>>,
     directories_with_plaintext_history: HashSet<PathBuf>,
 }
 
@@ -88,9 +86,11 @@ impl Detector {
             recent_writes_by_pid: HashMap::new(),
             recent_writes_by_dir: HashMap::new(),
             recent_writes_global: HashMap::new(),
+            recent_writes_global_unbaselined: HashMap::new(),
             recent_container_format_writes_by_pid: HashMap::new(),
             recent_container_format_writes_by_dir: HashMap::new(),
             recent_container_format_writes_global: HashMap::new(),
+            recent_container_format_writes_global_unbaselined: HashMap::new(),
             directories_with_plaintext_history: HashSet::new(),
         }
     }
@@ -137,23 +137,18 @@ impl Detector {
             if let Some(affected) = pid_burst {
                 return Verdict::Burst { affected };
             }
-        }
-
-        let global_threshold = if has_baseline { self.burst_file_count } else { self.burst_file_count.saturating_mul(2) };
-        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, global_threshold) {
-            return Verdict::Burst { affected };
-        }
-
-        if !has_baseline {
-            return Verdict::Clean;
-        }
-
-        if let Some(dir) = path.parent() {
-            if let Some(affected) =
-                Self::record_and_check(&mut self.recent_writes_by_dir, dir.to_path_buf(), path, now, window, self.burst_file_count)
-            {
+            if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
                 return Verdict::Burst { affected };
             }
+            if let Some(dir) = path.parent() {
+                if let Some(affected) =
+                    Self::record_and_check(&mut self.recent_writes_by_dir, dir.to_path_buf(), path, now, window, self.burst_file_count)
+                {
+                    return Verdict::Burst { affected };
+                }
+            }
+        } else if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global_unbaselined, (), path, now, window, self.burst_file_count.saturating_mul(2)) {
+            return Verdict::Burst { affected };
         }
 
         Verdict::Clean
@@ -194,23 +189,18 @@ impl Detector {
             if let Some(affected) = pid_burst {
                 return Verdict::Burst { affected };
             }
-        }
-
-        let global_threshold = if has_baseline { threshold } else { threshold.saturating_mul(2) };
-        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, global_threshold) {
-            return Verdict::Burst { affected };
-        }
-
-        if !has_baseline {
-            return Verdict::Clean;
-        }
-
-        if let Some(dir) = path.parent() {
-            if let Some(affected) =
-                Self::record_and_check(&mut self.recent_container_format_writes_by_dir, dir.to_path_buf(), path, now, window, threshold)
-            {
+            if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
                 return Verdict::Burst { affected };
             }
+            if let Some(dir) = path.parent() {
+                if let Some(affected) =
+                    Self::record_and_check(&mut self.recent_container_format_writes_by_dir, dir.to_path_buf(), path, now, window, threshold)
+                {
+                    return Verdict::Burst { affected };
+                }
+            }
+        } else if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global_unbaselined, (), path, now, window, threshold.saturating_mul(2)) {
+            return Verdict::Burst { affected };
         }
 
         Verdict::Clean
@@ -329,6 +319,30 @@ mod tests {
             verdict = d.observe_container_format_write(1234, Path::new(&format!("/home/test/new_dir/file_{i}.zip")));
         }
         assert!(matches!(verdict, Verdict::Burst { .. }));
+    }
+
+    #[test]
+    fn baselined_dir_uses_regular_global_threshold() {
+        let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
+        let mut d = Detector::new(&cfg);
+        d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
+        let mut verdict = Verdict::Clean;
+        for i in 0..15 {
+            verdict = d.observe_high_entropy_write(1234, Path::new(&format!("/home/test/docs/file_{i}.enc")));
+        }
+        assert!(matches!(verdict, Verdict::Burst { .. }));
+    }
+
+    #[test]
+    fn mixed_baseline_and_no_baseline_writes_use_separate_maps() {
+        let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
+        let mut d = Detector::new(&cfg);
+        d.note_plaintext_activity(Path::new("/home/test/docs/readme.txt"));
+        for i in 0u32..14 {
+            d.observe_high_entropy_write(9999 + i as i32, Path::new(&format!("/home/test/new_dir/file_{i}.enc")));
+        }
+        let verdict = d.observe_high_entropy_write(1000, Path::new("/home/test/docs/report.enc"));
+        assert_eq!(verdict, Verdict::Clean);
     }
 
     /// Regression test for the finding that `observe_container_format_write`
