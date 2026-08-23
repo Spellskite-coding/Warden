@@ -85,20 +85,39 @@ fn is_under_watch_dirs(path: &Path, watch_dirs: &[PathBuf]) -> bool {
     watch_dirs.iter().any(|w| path.starts_with(w))
 }
 
-/// Reads up to `max_bytes` from `fd` - the exact fd the kernel handed
-/// back with the `FAN_CLOSE_WRITE` event - via a `dup(2)`'d copy, instead
-/// of reopening the file by path afterward. Same fix, same reasoning, as
-/// `warden_yara::fanotify_monitor::read_via_fd`: a review found the
-/// previous "reopen by path" approach here left a real TOCTOU window
-/// (the comment justifying it - "matches warden-yara's own listener,
-/// which works reliably" - was true only because warden-yara had the
-/// exact same bug at the time, not because reopening by path was safe).
-/// Between the event firing and this reopen, an attacker with write
-/// access to the watched directory can swap the path's content (or
-/// replace it with a symlink to something they want scored instead),
-/// making the entropy sample - and therefore the burst/plaintext-history
-/// decision - describe content that was never actually what got closed.
-fn read_sample_via_fd(fd: BorrowedFd, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+/// Number of spread-out sample points taken across the file - see
+/// `sample_entropy_via_fd`'s doc comment for why sampling only the start
+/// (the previous behavior) is bypassable.
+const SAMPLE_POINTS: usize = 3;
+
+/// Samples up to `max_bytes` total, split across `SAMPLE_POINTS` chunks
+/// spread across the file (start, middle, end rather than just offset 0),
+/// via a `dup(2)`'d copy of `fd` - the exact fd the kernel handed back
+/// with the `FAN_CLOSE_WRITE` event - instead of reopening the file by
+/// path afterward. Same TOCTOU reasoning as
+/// `warden_yara::fanotify_monitor::read_via_fd`: reopening by path
+/// between the event firing and the read would let an attacker with
+/// write access to the watched directory swap the content (or replace it
+/// with a symlink) before it gets scored.
+///
+/// Returns the HIGHEST entropy seen across the sampled chunks, not an
+/// average and not just the first chunk, alongside the first (offset 0)
+/// chunk's raw bytes for the caller's separate container-format magic-
+/// byte sniff (always checked at the start of the file, regardless of
+/// which sampled chunk had the highest entropy). A single sample from
+/// offset 0 is trivially bypassed: ransomware that prefixes every
+/// encrypted file with a small low-entropy header (or leaves the first
+/// few KiB of the original plaintext in place before encrypting the
+/// rest) reads as low-entropy on every single write, staying under
+/// `entropy_threshold` on every sample - and worse, each such write then
+/// calls `note_plaintext_activity`, actively poisoning the directory's
+/// baseline in the ransomware's favor. Taking the max (not the average,
+/// which the same attack would also defeat by diluting a genuinely
+/// high-entropy region with enough low-entropy padding elsewhere) means
+/// every sampled region has to be individually low-entropy for a write
+/// to pass as plaintext - padding only one region no longer helps.
+/// Returns `Ok(None)` for a file with nothing readable (e.g. empty).
+fn sample_entropy_via_fd(fd: BorrowedFd, max_bytes: usize) -> std::io::Result<Option<(f64, Vec<u8>)>> {
     // SAFETY: see `warden_yara::fanotify_monitor::read_via_fd` - same
     // dup(2)-on-a-valid-fd precondition, same guarantee.
     let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
@@ -107,11 +126,37 @@ fn read_sample_via_fd(fd: BorrowedFd, max_bytes: usize) -> std::io::Result<Vec<u
     }
     let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
     let mut file = std::fs::File::from(owned);
-    file.seek(SeekFrom::Start(0))?;
-    let mut buf = vec![0u8; max_bytes];
-    let n = file.read(&mut buf)?;
-    buf.truncate(n);
-    Ok(buf)
+    let file_size = file.metadata()?.len();
+
+    let chunk_bytes = (max_bytes / SAMPLE_POINTS).max(1) as u64;
+    let last_start = file_size.saturating_sub(chunk_bytes);
+    let mid_start = (file_size / 2).saturating_sub(chunk_bytes / 2).min(last_start);
+    let offsets = [0u64, mid_start, last_start];
+
+    let mut max_entropy: Option<f64> = None;
+    let mut first_chunk: Option<Vec<u8>> = None;
+    let mut seen_offsets = HashSet::new();
+    for &offset in &offsets {
+        // A file smaller than one chunk produces the same offset (0) more
+        // than once - skip the duplicate rather than re-scoring it.
+        if !seen_offsets.insert(offset) {
+            continue;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; chunk_bytes as usize];
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            continue;
+        }
+        buf.truncate(n);
+        let entropy = shannon_entropy(&buf);
+        max_entropy = Some(max_entropy.map_or(entropy, |m: f64| m.max(entropy)));
+        if offset == 0 {
+            first_chunk = Some(buf);
+        }
+    }
+
+    Ok(max_entropy.map(|e| (e, first_chunk.unwrap_or_default())))
 }
 
 /// Blocking fanotify read/dispatch loop. Meant to run on a dedicated
@@ -166,7 +211,22 @@ pub fn run(
     const MAX_CONSECUTIVE_READ_FAILURES: u32 = 20;
     let mut consecutive_failures = 0u32;
 
+    // `Detector::prune_expired` reclaims the per-PID/per-directory outer
+    // map entries that `record_and_check` alone never removes (see its
+    // doc comment - a real unbounded-memory finding on a long-lived
+    // daemon). Throttled to at most once per burst window rather than run
+    // on every event batch: a full sweep is O(tracked pids + dirs), and
+    // this only needs to run often enough to bound worst-case growth, not
+    // on every wakeup.
+    let mut last_prune = std::time::Instant::now();
+    let prune_interval = std::time::Duration::from_secs(cfg.burst_window_secs);
+
     loop {
+        if last_prune.elapsed() >= prune_interval {
+            detector.prune_expired(std::time::Instant::now());
+            last_prune = std::time::Instant::now();
+        }
+
         let events = match group.read_events() {
             Ok(ev) => {
                 consecutive_failures = 0;
@@ -218,26 +278,22 @@ pub fn run(
                 continue;
             }
 
-            let buf = match read_sample_via_fd(fd, sample_bytes) {
-                Ok(b) => b,
+            let (entropy, first_chunk) = match sample_entropy_via_fd(fd, sample_bytes) {
+                Ok(Some(v)) => v,
+                Ok(None) => continue, // nothing readable (e.g. empty file)
                 Err(e) => {
                     debug!(pid, path = %path.display(), error = %e, "reading fanotify event's fd failed, skipping this event");
                     continue;
                 }
             };
 
-            if buf.is_empty() {
-                continue;
-            }
-
-            let entropy = shannon_entropy(&buf);
             debug!(pid, path = %path.display(), entropy, "file write observed");
 
             if entropy < cfg.entropy_threshold {
                 detector.note_plaintext_activity(&path);
             } else if trust.is_trusted(pid) {
                 debug!(pid, path = %path.display(), "high-entropy write from a trusted executable, not counting toward burst");
-            } else if is_known_container_format(&buf) {
+            } else if is_known_container_format(&first_chunk) {
                 // Starts with a recognized ZIP/PDF/JPEG/... header - could
                 // be a legitimate Office document/archive/image rewrite,
                 // but the signature alone proves nothing: it's a 4-8 byte
