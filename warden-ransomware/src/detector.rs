@@ -127,14 +127,42 @@ impl Detector {
     }
 
     pub fn observe_high_entropy_write(&mut self, pid: i32, path: &Path) -> Verdict {
+        let now = Instant::now();
+        let window = self.burst_window;
+
+        // Per-PID is recorded first - before the global check returns - so
+        // that files_for_pid() always includes the triggering file. If the
+        // global counter fires and returns immediately below, the per-PID map
+        // must already hold this write or quarantine attribution misses the
+        // last file. The threshold result is captured but not acted on yet:
+        // it is only returned after has_baseline() confirms enforcement applies.
+        let pid_burst = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, self.burst_file_count);
+
+        // Global counter runs unconditionally, before the has_baseline() guard.
+        // A directory created after Warden starts has no plaintext history, so
+        // has_baseline() returns false for it. The previous ordering placed the
+        // global after the guard, making it unreachable for new directories:
+        // all three counters were skipped via the early return.
+        //
+        // Confirmed bypass on a real install (Ubuntu 24.04, mode=enforce):
+        // 20 /dev/urandom files in a freshly-created subdirectory produced
+        // zero alerts and zero quarantine entries. Moving the global here
+        // closes that gap: a burst is a burst regardless of whether the
+        // target directory ever held plaintext.
+        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
+            return Verdict::Burst { affected };
+        }
+
+        // Per-directory and per-PID threshold checks remain behind the
+        // has_baseline() guard: a directory that legitimately only ever
+        // receives compressed or encrypted output (a backup tool's output
+        // dir, a build artifact dir) should not trigger false positives.
+        // The global counter above already handles the aggregate case.
         if !self.has_baseline(path) {
             return Verdict::Clean;
         }
 
-        let now = Instant::now();
-        let window = self.burst_window;
-
-        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_by_pid, pid, path, now, window, self.burst_file_count) {
+        if let Some(affected) = pid_burst {
             return Verdict::Burst { affected };
         }
 
@@ -144,10 +172,6 @@ impl Detector {
             {
                 return Verdict::Burst { affected };
             }
-        }
-
-        if let Some(affected) = Self::record_and_check(&mut self.recent_writes_global, (), path, now, window, self.burst_file_count) {
-            return Verdict::Burst { affected };
         }
 
         Verdict::Clean
@@ -177,15 +201,23 @@ impl Detector {
     /// correctly attribute a container-format burst back to the process
     /// that triggered it, for response/quarantine purposes.
     pub fn observe_container_format_write(&mut self, pid: i32, path: &Path) -> Verdict {
-        if !self.has_baseline(path) {
-            return Verdict::Clean;
-        }
-
         let now = Instant::now();
         let window = self.burst_window;
         let threshold = self.container_format_burst_file_count;
 
-        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, threshold) {
+        // Same ordering as observe_high_entropy_write: per-PID recorded first
+        // for attribution, global checked unconditionally before has_baseline().
+        let pid_burst = Self::record_and_check(&mut self.recent_container_format_writes_by_pid, pid, path, now, window, threshold);
+
+        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
+            return Verdict::Burst { affected };
+        }
+
+        if !self.has_baseline(path) {
+            return Verdict::Clean;
+        }
+
+        if let Some(affected) = pid_burst {
             return Verdict::Burst { affected };
         }
 
@@ -195,10 +227,6 @@ impl Detector {
             {
                 return Verdict::Burst { affected };
             }
-        }
-
-        if let Some(affected) = Self::record_and_check(&mut self.recent_container_format_writes_global, (), path, now, window, threshold) {
-            return Verdict::Burst { affected };
         }
 
         Verdict::Clean
@@ -284,6 +312,53 @@ mod tests {
             }
         }
         assert_eq!(verdict, Verdict::Clean, "12 total files spread thinly across 6 dirs is ordinary activity, not a burst");
+    }
+
+    /// Regression test for the live-confirmed bypass: high-entropy writes in
+    /// a directory with no plaintext baseline (newly created after Warden
+    /// started) were silently ignored because has_baseline() returned false
+    /// and the early return skipped all three counters including the global.
+    ///
+    /// Reproduced on a real install: 20 /dev/urandom files in a freshly
+    /// created subdirectory → zero alerts, zero quarantine entries.
+    /// After the fix, the global counter fires correctly at burst_file_count.
+    #[test]
+    fn global_counter_catches_burst_in_directory_with_no_baseline() {
+        let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
+        let mut d = Detector::new(&cfg);
+        // No note_plaintext_activity calls — directory has no baseline.
+        let mut verdict = Verdict::Clean;
+        for i in 0..15 {
+            verdict = d.observe_high_entropy_write(
+                1234,
+                Path::new(&format!("/home/test/new_dir_no_baseline/file_{i}.enc")),
+            );
+        }
+        assert!(
+            matches!(verdict, Verdict::Burst { .. }),
+            "global counter must fire at burst_file_count even in a directory \
+             with no plaintext baseline"
+        );
+    }
+
+    /// Same regression for the container-format path: forging ZIP/PDF/JPEG
+    /// headers over ciphertext in a new directory was equally invisible.
+    #[test]
+    fn global_counter_catches_container_format_burst_in_directory_with_no_baseline() {
+        let cfg = RansomwareConfig { burst_file_count: 15, require_directory_baseline: true, ..RansomwareConfig::default() };
+        let mut d = Detector::new(&cfg);
+        // container_format_burst_file_count = 15 * 3 = 45
+        let mut verdict = Verdict::Clean;
+        for i in 0..45 {
+            verdict = d.observe_container_format_write(
+                1234,
+                Path::new(&format!("/home/test/new_dir_no_baseline/file_{i}.zip")),
+            );
+        }
+        assert!(
+            matches!(verdict, Verdict::Burst { .. }),
+            "global container-format counter must fire even in a directory with no baseline"
+        );
     }
 
     /// Regression test for the finding that `observe_container_format_write`
