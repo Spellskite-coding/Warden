@@ -131,18 +131,20 @@ fi
 
 echo
 log "Warden uninstalled."
-# Honeypot decoy folders (a per-machine randomized name inside
-# Documents/Desktop/Downloads/etc. and one at the top of $HOME,
-# containing a single passwords_export.csv or releve_compte.csv) live in
-# the protected user's own home directory, not under $STATE_DIR - this
-# script does not remove them. Reconstructing their exact names would
-# mean duplicating warden-ransomware::honeypot's word-selection logic
-# here in bash, a second implementation that could silently drift out of
-# sync with the real one; pattern-matching against arbitrary directories
-# inside a live user's home to delete them automatically is exactly the
-# kind of guess a cleanup script should not make. They are harmless if
-# left behind - and easy to spot in the meantime, so we just say so.
+# Honeypot decoy folders (a per-machine randomized adjective_noun name
+# inside Documents/Desktop/Downloads/etc. and one at the top of $HOME,
+# each holding a single plausibly-named CSV - the exact leaf filename is
+# also randomized per machine, not always passwords_export.csv/
+# releve_compte.csv) live in the protected user's own home directory, not
+# under $STATE_DIR - this script does not remove them. Reconstructing
+# their exact names would mean duplicating warden-ransomware::honeypot's
+# word-selection logic here in bash, a second implementation that could
+# silently drift out of sync with the real one; pattern-matching against
+# arbitrary directories inside a live user's home to delete them
+# automatically is exactly the kind of guess a cleanup script should not
+# make. They are harmless if left behind - and easy to spot in the
+# meantime, so we just say so.
 echo "  Note: any honeypot decoy folders Warden created under your home directory"
-echo "        (an unfamiliar folder in Documents/Desktop/etc. holding a single"
-echo "        passwords_export.csv, or one at the top of \$HOME holding releve_compte.csv)"
-echo "        are not removed by this script and can be deleted by hand if you want."
+echo "        (an unfamiliar folder in Documents/Desktop/etc., or one at the top of"
+echo "        \$HOME, each holding a single plausibly-named CSV file) are not removed"
+echo "        by this script and can be deleted by hand if you want."
