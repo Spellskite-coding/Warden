@@ -1,12 +1,28 @@
 [Unit]
 Description=Warden EDR - core detection (ransomware, persistence, privesc, yara)
 After=network.target local-fs.target
+# Without an explicit interval/burst, a crash-loop (e.g. every module
+# failing to init on a broken config) hits systemd's compiled-in default
+# start-limit almost immediately and the unit ends up "failed" - not
+# restarting, but also not obviously communicating that to whoever isn't
+# actively watching `systemctl status`. A wider window with a slightly
+# higher burst count gives Restart=on-failure a real chance to recover
+# from a transient failure (a momentarily-unwritable /var/lib/warden
+# during boot, a fanotify_init race) before giving up.
+StartLimitIntervalSec=120
+StartLimitBurst=10
 
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/warden
 Restart=on-failure
 RestartSec=2
+# Pings sent from a tokio task in main() at half this interval (see
+# main.rs) - lets systemd kill and restart a process wedged in a way
+# that isn't a clean error (every module thread stuck in a blocking
+# kernel read that never returns) instead of it sitting there silently
+# not-detecting-anything forever.
+WatchdogSec=30
 # Root is required: fanotify filesystem-wide marks, killing/quarantining
 # arbitrary user processes, and stripping setuid bits all need it - see
 # PROGRESS.md for why this is accepted rather than fought with
@@ -87,6 +103,33 @@ RestrictNamespaces=true
 # never sets them - safe to block the kernel-level ability to do so at all.
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
+# A review found neither of these two was set, leaving a root process
+# (with CAP_SYS_PTRACE, CAP_DAC_OVERRIDE, ... in its bounding set) free to
+# open arbitrary sockets or see every other process's /proc/<pid> beyond
+# what it actually needs. Both were live-verified after adding them: the
+# control socket (AF_UNIX) still accepts GUI connections, ransomware/
+# persistence/privesc/yara detection still fire, and
+# warden_common::package_manager's CAP_SYS_PTRACE-dependent /proc/<pid>
+# reads of OTHER users' processes still work (ProtectProc=invisible hides
+# other users' /proc/<pid> from a process that lacks CAP_SYS_PTRACE -
+# Warden's bounding set keeps it, which is exactly why that capability is
+# in CapabilityBoundingSet= above in the first place).
+RestrictAddressFamilies=AF_UNIX
+ProtectProc=invisible
+# Deliberately NOT setting MemoryDenyWriteExecute=true, even though it
+# would otherwise be a reasonable hardening addition here: live-testing
+# it broke the yara module outright. warden-yara compiles YARA rules via
+# yara-x, which JITs them through wasmtime - that JIT needs to make a
+# memory page writable and then executable, exactly what
+# MemoryDenyWriteExecute exists to block. With it set, the yara module's
+# task panicked at startup ("WASM module is not valid: unable to make
+# memory executable ... Permission denied") on every single run, silently
+# disabling YARA scanning while the rest of Warden kept running normally -
+# the kind of failure that's easy to miss if this directive is added
+# without actually starting the service and checking that all four
+# modules report ready afterward, not just that the process itself came
+# up. Left unset until warden-yara's compilation path stops needing a
+# JIT (or moves it to a separate process this directive doesn't apply to).
 
 [Install]
 WantedBy=multi-user.target
