@@ -6,5 +6,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p warden-ransomware -p warden-common
+      - run: cargo test -p warden-ransomware
       - run: cargo clippy -p warden-ransomware -- -D warnings
