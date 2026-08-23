@@ -366,7 +366,16 @@ fi
 # ---------------------------------------------------------------------------
 
 log "building the core workspace (warden, warden-common, detection modules, warden-notify-helper)"
-( cd "$REPO_DIR" && cargo build --release --workspace )
+# --locked: build exactly the dependency versions recorded in
+# Cargo.lock (already committed to the repo) rather than letting cargo
+# silently re-resolve to newer semver-compatible releases at install
+# time - a one-line change that matters for a security tool people are
+# asked to build from source and run as root: a "works on my machine"
+# install using different transitive dependency versions than whatever
+# was actually reviewed/tested is exactly the kind of drift that
+# should fail loudly (a missing/stale Cargo.lock entry) rather than
+# silently resolve to something never audited.
+( cd "$REPO_DIR" && cargo build --release --workspace --locked )
 
 GUI_BUILT=0
 # A review pointed out that redirecting to a fixed, predictable /tmp path
@@ -377,7 +386,7 @@ GUI_BUILT=0
 # symlink points at. `mktemp` creates a fresh file itself (O_EXCL under
 # the hood), so there's nothing for a pre-planted symlink to redirect.
 WARDEN_GUI_BUILD_LOG="$(mktemp /tmp/warden-gui-build.XXXXXX.log)"
-if cargo build --release -p warden-gui --manifest-path "$REPO_DIR/warden-gui/Cargo.toml" 2>"$WARDEN_GUI_BUILD_LOG"; then
+if cargo build --release -p warden-gui --manifest-path "$REPO_DIR/warden-gui/Cargo.toml" --locked 2>"$WARDEN_GUI_BUILD_LOG"; then
     GUI_BUILT=1
 else
     warn "warden-gui failed to build (see $WARDEN_GUI_BUILD_LOG) - continuing without the GUI"
@@ -386,7 +395,7 @@ fi
 EBPF_BUILT=0
 if [ "$EBPF_AVAILABLE" -eq 1 ]; then
     log "building the eBPF workspace (warden-exec, warden-network)"
-    if ( cd "$REPO_DIR/ebpf-probe" && cargo build --release ); then
+    if ( cd "$REPO_DIR/ebpf-probe" && cargo build --release --locked ); then
         EBPF_BUILT=1
     else
         warn "eBPF workspace failed to build - continuing without warden-exec/warden-network"
