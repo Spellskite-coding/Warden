@@ -76,6 +76,18 @@ const HONEYPOT_NOUNS: &[&str] = &[
     "Statements",
 ];
 
+/// Plausible leaf filenames for the per-watch-dir honeypot, paired with
+/// `HONEYPOT_ADJECTIVES`/`HONEYPOT_NOUNS` via `honeypot_filename` - see
+/// its doc comment for why the leaf name needs its own seeded variation
+/// rather than the single fixed `passwords_export.csv` this used to be.
+const HONEYPOT_FILENAMES: &[&str] =
+    &["passwords_export.csv", "credentials.csv", "logins_backup.csv", "account_passwords.csv", "saved_passwords.csv", "password_vault.csv", "my_passwords.csv", "vault_export.csv"];
+
+/// Plausible leaf filenames for the standalone `$HOME`-root honeypot,
+/// paired with `HOME_HONEYPOT_NOUNS` via `home_honeypot_filename`.
+const HOME_HONEYPOT_FILENAMES: &[&str] =
+    &["releve_compte.csv", "bank_statement.csv", "compte_bancaire.csv", "releve_bancaire.csv", "account_statement.csv", "solde_compte.csv"];
+
 /// A per-machine random seed, generated once and persisted so honeypot
 /// names stay stable across restarts.
 ///
@@ -89,23 +101,28 @@ const HONEYPOT_NOUNS: &[&str] = &[
 /// part defeats it completely, so the "would need to read this machine's
 /// own seed file" claim was simply wrong for that construction.
 ///
-/// The seed here now selects BOTH words of the plausible name (see
-/// `honeypot_theme_words`) from `HONEYPOT_ADJECTIVES`/`HONEYPOT_NOUNS`
-/// (15x15 = 225 combinations) in addition to the numeric suffix, so there
-/// is no single fixed substring shared across every Warden install for a
-/// wildcard glob to key on. Being honest about what this does and
-/// doesn't achieve: it is NOT information-theoretically unenumerable -
-/// the word lists are public (this file is open source), so a
-/// sufficiently motivated, Warden-aware attacker can still glob all 225
-/// adjective/noun combinations. What it does close is the trivial case -
-/// a single grep/glob for one known literal string - and it defeats any
+/// The seed here now selects BOTH words of the plausible parent folder
+/// name (see `honeypot_theme_words`) from `HONEYPOT_ADJECTIVES`/
+/// `HONEYPOT_NOUNS` (15x15 = 225 combinations), AND the honeypot's own
+/// leaf filename (see `honeypot_filename`, `HONEYPOT_FILENAMES` - 8
+/// options), in addition to the numeric suffix - a review found that
+/// randomizing only the folder name left the leaf file itself fixed
+/// (always `passwords_export.csv`), which is exactly the "single fixed
+/// substring to glob for" weakness this mechanism exists to close, just
+/// one path component lower than the folder-name fix looked. Being
+/// honest about what this does and doesn't achieve: it is NOT
+/// information-theoretically unenumerable - the word lists are public
+/// (this file is open source), so a sufficiently motivated, Warden-aware
+/// attacker can still glob all 225x8 folder/filename combinations. What
+/// it does close is the trivial case - a single grep/glob for one known
+/// literal string, at either path component - and it defeats any
 /// generic/commodity ransomware that doesn't specifically know it's
 /// running against Warden, which is the overwhelming realistic case for
 /// a single workstation. A targeted adversary who reads this exact file
-/// and is willing to enumerate 225 candidate directory names is a threat
-/// this naming scheme alone cannot fully close; burst/entropy detection
-/// (the other two counters in `detector.rs`) remains the backstop for
-/// that scenario, same as it already is for a strain that avoids every
+/// and is willing to enumerate every candidate path is a threat this
+/// naming scheme alone cannot fully close; burst/entropy detection (the
+/// other counters in `detector.rs`) remains the backstop for that
+/// scenario, same as it already is for a strain that avoids every
 /// honeypot outright by never touching a decoy file at all.
 fn honeypot_seed() -> Result<String> {
     if let Ok(existing) = std::fs::read_to_string(SEED_PATH) {
@@ -150,6 +167,38 @@ fn home_honeypot_theme_words(seed: &str) -> (&'static str, &'static str) {
     (adjective, noun)
 }
 
+/// Picks this machine's leaf filename for the per-watch-dir honeypot from
+/// the same seed, rotated independently of `honeypot_theme_words` so the
+/// two picks aren't correlated.
+///
+/// Randomizing the parent FOLDER name (`honeypot_theme_words`) alone left
+/// a gap the folder-name fix didn't close: the leaf file itself was still
+/// always literally `passwords_export.csv` on every Warden install. An
+/// attacker doesn't need to know the seed, the adjective/noun scheme, or
+/// even that Warden is involved at all to find it - `find / -xdev -name
+/// passwords_export.csv` (or the equivalent recursive grep/glob) locates
+/// every honeypot on the box in one pass, the exact "single fixed
+/// substring" weakness `honeypot_theme_words`'s own doc comment already
+/// identifies as the thing worth closing, just one path component lower
+/// than where the original fix looked. Same honesty caveat as there: this
+/// is not information-theoretically unenumerable (the name pool is
+/// public), it defeats the trivial single-glob case and any generic
+/// ransomware that doesn't specifically know it's running against
+/// Warden - a targeted adversary who reads this file and enumerates every
+/// adjective/noun/filename combination is still a threat only burst/
+/// entropy detection can fully cover.
+fn honeypot_filename(seed: &str) -> &'static str {
+    let n = u32::from_str_radix(seed, 16).unwrap_or(0).rotate_left(19);
+    HONEYPOT_FILENAMES[(n as usize) % HONEYPOT_FILENAMES.len()]
+}
+
+/// Same idea as `honeypot_filename`, for the standalone `$HOME`-root
+/// honeypot - picks from `HOME_HONEYPOT_FILENAMES` instead.
+fn home_honeypot_filename(seed: &str) -> &'static str {
+    let n = u32::from_str_radix(seed, 16).unwrap_or(0).rotate_left(7);
+    HOME_HONEYPOT_FILENAMES[(n as usize) % HOME_HONEYPOT_FILENAMES.len()]
+}
+
 /// Builds this machine's honeypot path for one watch directory: a
 /// dedicated, plausibly-named SUBFOLDER (not a file dropped loose at the
 /// top level of a real data directory) holding one enticingly-named
@@ -185,7 +234,8 @@ pub fn honeypot_path(dir: &Path) -> PathBuf {
     match honeypot_seed() {
         Ok(seed) => {
             let (adjective, noun) = honeypot_theme_words(&seed);
-            dir.join(format!("{adjective}_{noun}")).join("passwords_export.csv")
+            let filename = honeypot_filename(&seed);
+            dir.join(format!("{adjective}_{noun}")).join(filename)
         }
         Err(e) => {
             warn!(error = %e, "could not derive a randomized honeypot path, falling back to the fixed name");
@@ -225,7 +275,8 @@ pub fn home_honeypot_path(home: &Path) -> PathBuf {
     match honeypot_seed() {
         Ok(seed) => {
             let (adjective, noun) = home_honeypot_theme_words(&seed);
-            home.join(format!("{adjective}_{noun}")).join("releve_compte.csv")
+            let filename = home_honeypot_filename(&seed);
+            home.join(format!("{adjective}_{noun}")).join(filename)
         }
         Err(e) => {
             warn!(error = %e, "could not derive a randomized home honeypot path, falling back to the fixed name");
@@ -315,25 +366,25 @@ pub fn provision(paths: &[PathBuf], target_uid: u32, target_gid: u32) -> Result<
             }
             Err(_) => {
                 // Picks bank-statement content for the standalone
-                // `$HOME`-root honeypot (`home_honeypot_path`, whose leaf
-                // filename is always `releve_compte.csv`) and the
+                // `$HOME`-root honeypot (`home_honeypot_path`, leaf
+                // filename drawn from `HOME_HONEYPOT_FILENAMES`) and the
                 // password-export content for every per-watch-dir one
-                // (`honeypot_path`, leaf filename `passwords_export.csv`)
-                // - matches each honeypot's content to its filename/
-                // framing so the two stay thematically consistent rather
-                // than a "Banque"-themed folder containing a file named
-                // like a password export. Keyed on the LEAF filename
-                // rather than the parent folder name on purpose: the
-                // parent folder name is now drawn from a shared, seeded
-                // word pool (see `honeypot_theme_words`/
-                // `home_honeypot_theme_words`) specifically so there's no
-                // fixed public prefix to key content-selection off of
-                // either - the two leaf filenames stay fixed and public,
-                // which is fine since (per `honeypot_path`'s doc comment)
-                // the file's own name was never the part doing the actual
-                // enumeration-resistance work, only its parent folder's
-                // name is.
-                let content = p.file_name().and_then(|n| n.to_str()).filter(|n| *n == "releve_compte.csv").map_or(CANARY_CONTENT, |_| BANK_CANARY_CONTENT);
+                // (`honeypot_path`, leaf filename drawn from
+                // `HONEYPOT_FILENAMES`) - matches each honeypot's content
+                // to its filename/framing so the two stay thematically
+                // consistent rather than a "Banque"-themed folder
+                // containing a file named like a password export. Keyed
+                // on membership in `HOME_HONEYPOT_FILENAMES` (a small
+                // fixed pool now, not one fixed literal) rather than the
+                // parent folder name, for the same reason as before: the
+                // parent folder name is drawn from its own seeded word
+                // pool with no fixed public prefix to key off of. A path
+                // supplied via `RansomwareConfig::honeypots` (bypassing
+                // both generator functions entirely) whose filename
+                // matches neither pool falls back to the generic
+                // password-export content, same default as before this
+                // change.
+                let content = p.file_name().and_then(|n| n.to_str()).filter(|n| HOME_HONEYPOT_FILENAMES.contains(n)).map_or(CANARY_CONTENT, |_| BANK_CANARY_CONTENT);
                 std::fs::write(p, content).with_context(|| format!("writing honeypot file {}", p.display()))?;
                 std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).with_context(|| format!("setting permissions on {}", p.display()))?;
                 nix::unistd::chown(p, Some(nix::unistd::Uid::from_raw(target_uid)), Some(nix::unistd::Gid::from_raw(target_gid)))
@@ -363,6 +414,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Regression test for the finding that the honeypot's leaf filename
+    /// was a single fixed literal (`passwords_export.csv` /
+    /// `releve_compte.csv`) even after the parent folder name was
+    /// seeded - `find / -name passwords_export.csv` located every
+    /// honeypot on the box without ever needing the per-machine seed.
+    /// Different seeds must be able to produce different filenames, and
+    /// every produced filename must actually come from the declared pool
+    /// (never an out-of-range index, e.g. from a seed that doesn't parse).
+    #[test]
+    fn honeypot_filenames_vary_by_seed_and_stay_within_their_pool() {
+        let seeds = ["00000000", "11111111", "22222222", "33333333", "44444444", "55555555", "66666666", "77777777", "deadbeef", "not-hex"];
+        let mut names = HashSet::new();
+        let mut home_names = HashSet::new();
+        for seed in seeds {
+            let name = honeypot_filename(seed);
+            assert!(HONEYPOT_FILENAMES.contains(&name), "{name} must come from HONEYPOT_FILENAMES");
+            names.insert(name);
+
+            let home_name = home_honeypot_filename(seed);
+            assert!(HOME_HONEYPOT_FILENAMES.contains(&home_name), "{home_name} must come from HOME_HONEYPOT_FILENAMES");
+            home_names.insert(home_name);
+        }
+        assert!(names.len() > 1, "distinct seeds must be able to produce distinct per-watch-dir honeypot filenames, not always the same literal");
+        assert!(home_names.len() > 1, "distinct seeds must be able to produce distinct home-honeypot filenames, not always the same literal");
     }
 
     /// Regression test for the red-team-confirmed local-privesc finding:
