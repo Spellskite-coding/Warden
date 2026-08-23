@@ -336,21 +336,53 @@ async fn main() -> Result<()> {
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
     info!("warden ready");
 
+    // If the unit sets WatchdogSec=, ping at half the requested interval
+    // (systemd's own recommended margin) so a genuinely wedged process -
+    // every module thread parked in a blocking read that never returns,
+    // for instance a fanotify group that stops delivering events without
+    // an explicit error - gets killed and restarted by systemd instead of
+    // sitting there silently not-detecting-anything forever. A no-op
+    // (`watchdog_enabled` returns `None`) when the unit doesn't set
+    // WatchdogSec=, so this is safe regardless of how the service file is
+    // configured.
+    if let Some(interval) = sd_notify::watchdog_enabled() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval / 2);
+            tick.tick().await; // first tick fires immediately, skip it
+            loop {
+                tick.tick().await;
+                let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+            }
+        });
+    }
+
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    // If any module's loop ends (its own internal fatal error, not just an
-    // init failure already handled above), treat it as fatal for the whole
-    // process rather than trying to keep running half-blind: exit non-zero
-    // so systemd's Restart=on-failure gives every module a clean full
-    // re-init, instead of building a more complex per-module supervisor
-    // that can restart just the failed one (a reasonable future
-    // improvement, not done yet - see PROGRESS.md).
+    // If any module's loop ends for ANY reason - its own internal fatal
+    // error, or even an unexpected clean return - treat it as fatal for
+    // the whole process and exit non-zero, rather than trying to keep
+    // running half-blind. A review found the clean-exit case here used
+    // to return `Ok(())` (exit code 0) instead: every module's loop is a
+    // `loop {}` with no legitimate way to return `Ok(())` today, so this
+    // was unreachable in practice, but the type signature allows it and
+    // systemd's `Restart=on-failure` does NOT restart a service that
+    // exits 0 - a future change introducing any legitimate early return
+    // from a module loop would have silently and permanently stopped all
+    // protection with no restart and no alert. Exiting non-zero
+    // unconditionally here, instead of building a more complex
+    // per-module supervisor that can restart just the failed one (a
+    // reasonable future improvement, not done yet - see PROGRESS.md), is
+    // what actually delivers the "exit non-zero so systemd restarts
+    // everything" intent this comment already described.
     tokio::select! {
         joined = modules.join_next() => {
             dispatcher.abort();
             modules.abort_all();
             return match joined {
-                Some(Ok((name, Ok(())))) => { info!(module = name, "module loop exited"); Ok(()) }
+                Some(Ok((name, Ok(())))) => {
+                    error!(module = name, "module loop exited cleanly - unexpected for an infinite detection loop, treating as fatal so protection actually restarts instead of silently staying down");
+                    Err(anyhow::anyhow!("module {name} exited unexpectedly"))
+                }
                 Some(Ok((name, Err(e)))) => { error!(module = name, error = %e, "module failed"); Err(e) }
                 Some(Err(e)) => { error!(error = %e, "module task panicked"); Err(anyhow::anyhow!(e)) }
                 None => { error!("all modules already ended"); anyhow::bail!("no modules left running") }
