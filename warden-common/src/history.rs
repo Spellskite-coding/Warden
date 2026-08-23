@@ -1,11 +1,12 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::event::DetectionEvent;
 
@@ -57,6 +58,27 @@ impl From<&DetectionEvent> for HistoryRecord {
 /// database: a workstation's realistic detection volume never needs
 /// indexed queries, and appending a line is simpler to reason about and
 /// to recover from a torn write than a database file would be.
+/// Once `history.jsonl` exceeds this size, `record` rotates it down to
+/// the newest records that fit in half of this (see `rotate`'s doc
+/// comment for why half, and why size rather than a fixed line count is
+/// what's actually bounded). A workstation's realistic detection volume
+/// (this file's own module doc comment) should almost never reach this
+/// in practice, but nothing previously bounded it: a noisy machine
+/// (frequent YARA false positives, a misconfigured monitor-mode
+/// deployment logging routine activity) could grow this file
+/// indefinitely, and `recent()` re-reads and re-parses the entire file
+/// on every call - a GUI dashboard open in the background polling status
+/// would make that cost scale with all-time history, not with what it
+/// actually displays.
+const HISTORY_ROTATE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// A secondary cap on how many of the newest records survive a rotation,
+/// alongside the byte-size target - see `rotate`. Comfortably above any
+/// `recent(limit)` call this codebase makes (the GUI never asks for more
+/// than a few hundred), so this cap alone never discards anything a
+/// normal read would have returned anyway; it only bites when records
+/// are unusually small and numerous.
+const HISTORY_ROTATE_KEEP_LINES: usize = 5_000;
+
 #[derive(Clone)]
 pub struct HistoryStore {
     path: PathBuf,
@@ -79,12 +101,92 @@ impl HistoryStore {
         Ok(Self { path: path.to_path_buf() })
     }
 
+    fn lock_path(&self) -> PathBuf {
+        let mut p = self.path.clone();
+        p.set_extension("jsonl.lock");
+        p
+    }
+
+    /// Takes an exclusive cross-process lock, matching `Quarantine`'s
+    /// `flock`-based manifest locking (same reasoning: multiple
+    /// independent binaries - `warden`, `warden-exec`, `warden-network` -
+    /// each open this same path themselves and append to it). Plain
+    /// `O_APPEND` alone is enough to make individual appends atomic with
+    /// respect to each other, but `record`'s rotation step (below) reads
+    /// the whole file and replaces it via `rename` - without a lock
+    /// serializing that against a concurrent append from a *different*
+    /// process, that other process could still be holding an fd open to
+    /// the pre-rotation inode and its next write would land on a file no
+    /// longer reachable by any path, silently losing that record forever.
+    fn lock(&self) -> Result<Flock<fs::File>> {
+        let f = OpenOptions::new().create(true).write(true).truncate(false).mode(0o600).open(self.lock_path())?;
+        Flock::lock(f, FlockArg::LockExclusive).map_err(|(_, e)| anyhow::anyhow!("locking {}: {e}", self.lock_path().display()))
+    }
+
     pub fn record(&self, evt: &DetectionEvent) -> Result<()> {
+        let _guard = self.lock().with_context(|| format!("locking {}", self.path.display()))?;
+
         let record = HistoryRecord::from(evt);
         let line = format!("{}\n", serde_json::to_string(&record)?);
         let mut f = OpenOptions::new().create(true).append(true).mode(0o600).open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
         f.write_all(line.as_bytes())?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        drop(f);
+
+        if let Ok(meta) = fs::metadata(&self.path) {
+            if meta.len() > HISTORY_ROTATE_MAX_BYTES {
+                self.rotate()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the newest records, bounded by BOTH `HISTORY_ROTATE_KEEP_LINES`
+    /// and half of `HISTORY_ROTATE_MAX_BYTES` (whichever limit is hit
+    /// first) - not just a fixed line count. A fixed line count alone
+    /// doesn't actually bound the resulting file's size: an unusually
+    /// large record (a Burst detection's `affected_paths` can hold
+    /// thousands of entries for a widely-spread attack) could make even
+    /// `HISTORY_ROTATE_KEEP_LINES` records add up to far more than
+    /// `HISTORY_ROTATE_MAX_BYTES`, defeating the whole point of rotating -
+    /// found by this function's own test, which pads records specifically
+    /// to trigger rotation quickly and would otherwise silently produce a
+    /// "rotated" file bigger than the threshold that triggered rotation
+    /// in the first place. Targets half the max (not the full max) so a
+    /// freshly-rotated file has real headroom to grow before the next
+    /// rotation, rather than triggering one on almost every subsequent
+    /// write. Always keeps at least the single newest record regardless
+    /// of its size, so one outsized record can't make rotation produce an
+    /// empty file. Called with the lock already held by `record`.
+    /// Malformed lines are dropped the same way `recent` already
+    /// tolerates them - a rotation is not the place to newly start
+    /// failing over a line torn by an earlier crash.
+    fn rotate(&self) -> Result<()> {
+        let data = fs::read_to_string(&self.path).with_context(|| format!("reading {} for rotation", self.path.display()))?;
+        let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        let target_bytes = HISTORY_ROTATE_MAX_BYTES / 2;
+        let mut kept_from = lines.len();
+        let mut bytes = 0u64;
+        while kept_from > 0 && lines.len() - kept_from < HISTORY_ROTATE_KEEP_LINES {
+            let candidate_bytes = lines[kept_from - 1].len() as u64 + 1;
+            if bytes + candidate_bytes > target_bytes && kept_from < lines.len() {
+                break; // always keep at least the single newest line
+            }
+            bytes += candidate_bytes;
+            kept_from -= 1;
+        }
+        let kept = &lines[kept_from..];
+
+        let tmp_path = self.path.with_extension("jsonl.tmp");
+        let mut tmp = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
+        tmp.set_permissions(fs::Permissions::from_mode(0o600))?;
+        for line in kept {
+            writeln!(tmp, "{line}")?;
+        }
+        tmp.sync_all().ok();
+        fs::rename(&tmp_path, &self.path).with_context(|| format!("replacing {}", self.path.display()))?;
+        info!(kept = kept.len(), dropped = lines.len() - kept.len(), "rotated history.jsonl");
         Ok(())
     }
 
@@ -159,6 +261,43 @@ mod tests {
         assert_eq!(events[1].summary, "event 4");
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Regression test for the finding that `history.jsonl` had nothing
+    /// bounding its growth: writes padded to ~20KB each (well under the
+    /// default `sample_bytes`/entropy-scan sizes, just large enough to
+    /// cross `HISTORY_ROTATE_MAX_BYTES` in a bounded number of iterations
+    /// so this test stays fast) until the file exceeds the rotation
+    /// threshold, then confirms it actually rotated down to at most
+    /// `HISTORY_ROTATE_KEEP_LINES` records, is smaller than the
+    /// pre-rotation size, and is still readable afterward (the newest
+    /// event survives).
+    #[test]
+    fn record_rotates_the_file_once_it_exceeds_the_size_threshold() {
+        let path = temp_path("rotate");
+        let _ = std::fs::remove_file(&path);
+        let store = HistoryStore::new(&path).unwrap();
+
+        let padding = "x".repeat(20_000);
+        let iterations = (HISTORY_ROTATE_MAX_BYTES / 20_000) as usize + 50;
+        for i in 0..iterations {
+            let evt = DetectionEvent::new("yara", Severity::Medium, format!("event {i}"), padding.clone());
+            store.record(&evt).unwrap();
+        }
+
+        let final_size = std::fs::metadata(&path).unwrap().len();
+        assert!(final_size < HISTORY_ROTATE_MAX_BYTES, "the file must have been rotated back down below the threshold, got {final_size} bytes");
+
+        let data = std::fs::read_to_string(&path).unwrap();
+        let line_count = data.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(line_count <= HISTORY_ROTATE_KEEP_LINES, "rotation must not keep more than HISTORY_ROTATE_KEEP_LINES lines, got {line_count}");
+
+        let events = store.recent(1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, format!("event {}", iterations - 1), "the newest record must survive rotation");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(store.lock_path()).ok();
     }
 
     #[test]
