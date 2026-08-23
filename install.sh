@@ -155,15 +155,47 @@ export HOME="$INSTALL_FOR_HOME"
 # ---------------------------------------------------------------------------
 # Step 1: OS packages
 #
-# Only the apt (Debian/Ubuntu/Kali) path has actually been exercised
-# end-to-end tonight, on a real Kali VM - the dnf/pacman branches follow
-# the same package-name conventions documented for gtk4-devel/libadwaita
-# in the RockyLinux build image (including CRB needing to be enabled
-# there for libadwaita-devel/gobject-introspection-devel), but have not
-# been run for real yet. Say so rather than implying equal confidence.
+# All four branches below (apt/dnf/pacman/zypper) have been exercised
+# end-to-end for real: apt on two real VMs (Debian 13, Ubuntu 25.10),
+# dnf/pacman/zypper each in a dedicated systemd-as-PID1 Docker test image
+# (see docker/Dockerfile.test.fedora/.arch/.opensuse) - full build,
+# install, and a live detection confirmed on every one.
 # ---------------------------------------------------------------------------
 
+# `pkexec`'s providing package name is not stable even within one distro
+# family: Debian 13 (trixie) split the long-standing `policykit-1` into
+# separate `pkexec`/`polkitd` packages - found live, the hard way, when
+# `policykit-1` alone made `apt-get install` (with it in the same
+# invocation as every other build dependency) abort *entirely*, since a
+# single unresolvable package name fails the whole command. Isolated into
+# its own best-effort step for exactly that reason: a naming mismatch
+# here must degrade to "the GUI's pkexec-gated actions won't work,
+# everything else still installs" - not take down the rest of the
+# install over one optional package.
+install_polkit_apt() {
+    if apt-get install -y --no-install-recommends policykit-1 2>/dev/null; then
+        return
+    fi
+    if apt-get install -y --no-install-recommends pkexec polkitd 2>/dev/null; then
+        return
+    fi
+    warn "could not install policykit-1 or pkexec+polkitd - the GUI's authenticated actions (restore, exceptions, quarantine-file, mode switch) will not work until you install your distro's PolicyKit package by hand"
+}
+
 install_packages() {
+    # `policykit-1`/`polkit` (whichever name the distro uses) is not a
+    # build dependency - it's what actually *provides* `pkexec`, which
+    # every consequential GUI action (restore from quarantine, add/remove
+    # exception, manual quarantine, mode switch) shells out to for real
+    # root authentication (see `warden-gui/src/ui.rs`'s `run_pkexec_warden`).
+    # Found live: a minimal install with no desktop environment already
+    # pulling it in as a dependency (a bare Debian VM, every one of this
+    # project's own systemd-test containers) has no `pkexec` on `PATH` at
+    # all, and every one of those GUI buttons fails immediately with
+    # "Could not run pkexec: No such file or directory" - not a crash,
+    # but a silently unusable GUI for anything that actually matters. A
+    # full desktop install (GNOME/KDE/...) almost always already has this,
+    # which is exactly why it went unnoticed until tested on a minimal one.
     case "$DISTRO_ID" in
         debian | ubuntu | kali | linuxmint | pop)
             log "installing build dependencies via apt (validated path)"
@@ -172,9 +204,10 @@ install_packages() {
                 build-essential pkg-config curl git \
                 libgtk-4-dev libadwaita-1-dev \
                 clang llvm libelf-dev
+            install_polkit_apt
             ;;
         fedora | rhel | rocky | almalinux | centos)
-            warn "dnf path is untested end-to-end - please report back if this breaks"
+            log "installing build dependencies via dnf (validated end-to-end on Fedora)"
             if command -v dnf5 >/dev/null 2>&1 || dnf --version >/dev/null 2>&1; then
                 dnf install -y dnf-plugins-core
                 dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null || true
@@ -182,23 +215,25 @@ install_packages() {
             dnf install -y gcc pkgconf-pkg-config make curl git \
                 gtk4-devel libadwaita-devel glib2-devel gobject-introspection-devel \
                 pango-devel cairo-devel cairo-gobject-devel gdk-pixbuf2-devel graphene-devel \
-                clang llvm elfutils-libelf-devel
+                clang llvm elfutils-libelf-devel \
+                polkit
             ;;
         arch | manjaro)
-            warn "pacman path is untested end-to-end - please report back if this breaks"
-            pacman -Sy --needed --noconfirm base-devel pkgconf curl git gtk4 libadwaita clang llvm libelf
+            log "installing build dependencies via pacman (validated end-to-end on Arch)"
+            pacman -Sy --needed --noconfirm base-devel pkgconf curl git gtk4 libadwaita clang llvm libelf polkit
             ;;
         opensuse* | sles)
-            warn "zypper path is untested end-to-end - please report back if this breaks"
-            zypper --non-interactive install gcc pkg-config curl git gtk4-devel libadwaita-devel clang llvm libelf-devel
+            log "installing build dependencies via zypper (validated end-to-end on openSUSE)"
+            zypper --non-interactive install gcc pkg-config curl git gtk4-devel libadwaita-devel clang llvm libelf-devel polkit
             ;;
         *)
             if [[ "$DISTRO_ID_LIKE" == *debian* ]]; then
                 warn "unrecognized distro id '$DISTRO_ID' but ID_LIKE contains debian - trying the apt path"
                 apt-get update -qq
                 apt-get install -y --no-install-recommends build-essential pkg-config curl git libgtk-4-dev libadwaita-1-dev clang llvm libelf-dev
+                install_polkit_apt
             else
-                die "unsupported distro '$DISTRO_ID' - install build-essential/gcc, pkg-config, gtk4-devel, libadwaita-devel, clang/llvm and libelf-devel manually, then re-run"
+                die "unsupported distro '$DISTRO_ID' - install build-essential/gcc, pkg-config, gtk4-devel, libadwaita-devel, clang/llvm, libelf-devel, and policykit/polkit manually, then re-run"
             fi
             ;;
     esac
