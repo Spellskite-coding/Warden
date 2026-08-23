@@ -28,9 +28,11 @@ const KNOWN_CONTAINER_MAGIC: &[&[u8]] = &[
     b"\x89PNG\r\n\x1a\n", // PNG
 ];
 
-/// Whether `sample` (the first `sample_bytes` of a file, as already read
-/// for entropy scoring) starts with a recognized container/compressed
-/// format signature.
+/// Whether `sample` (the file's first chunk, as already read for entropy
+/// scoring - see `fanotify_monitor::sample_entropy_via_fd`) starts with a
+/// recognized container/compressed format signature. Every signature
+/// here is well under the first chunk's size, so sampling less than the
+/// full file from offset 0 doesn't affect this check.
 pub fn is_known_container_format(sample: &[u8]) -> bool {
     KNOWN_CONTAINER_MAGIC.iter().any(|magic| sample.starts_with(magic))
 }
