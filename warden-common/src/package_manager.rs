@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -63,12 +64,12 @@ const PACKAGE_MANAGER_PROCESS_NAMES: &[&str] = &[
 /// watched files are written well before dpkg/rpm/pacman's own process
 /// exits).
 ///
-/// Checks three independent signals and requires all to agree: `comm`
+/// Checks four independent signals and requires all to agree: `comm`
 /// (fast, but any process can rename itself to "apt" via
 /// `prctl(PR_SET_NAME)`), the basename of the process's real executable
 /// path via `/proc/<pid>/exe` (kernel-resolved, not spoofable by the
-/// process itself), and - the one that actually matters - that `exe`'s
-/// *directory* canonicalizes to one of `SYSTEM_BIN_DIRS`.
+/// process itself), that `exe`'s *directory* canonicalizes to one of
+/// `SYSTEM_BIN_DIRS`, and that the process is actually running as root.
 ///
 /// A real red-team finding, not a hypothetical: an earlier version of
 /// this function stopped at the first two checks, on the reasoning that
@@ -83,6 +84,24 @@ const PACKAGE_MANAGER_PROCESS_NAMES: &[&str] = &[
 /// directory check closes it - `/tmp` (or anywhere else a decoy could be
 /// dropped) can never canonicalize to a `SYSTEM_BIN_DIRS` entry, no
 /// matter what the binary is named or renamed to.
+///
+/// A second, independently reported finding: none of the checks above
+/// actually require privilege. The real `rpm`/`dpkg`/`apt`/`pacman`
+/// binaries all support harmless, unprivileged read-only invocations
+/// (`--version`, `-l`, `-Q`, ...) that pass `comm`, `exe`-basename, AND
+/// the directory check while running as a completely unprivileged user -
+/// `while :; do /usr/bin/rpm --version >/dev/null; done &` run by any
+/// local account keeps `is_active()` permanently true with zero
+/// privilege required, suppressing Enforce-mode auto-quarantine
+/// indefinitely for anyone willing to leave that loop running. Every
+/// legitimate case this function exists to recognize - a real package
+/// install, `unattended-upgrade`'s timer, `update-initramfs` - runs as
+/// root by the time it's actually writing to `SYSTEM_BIN_DIRS`,
+/// `/etc/cron.d`, `/etc/sudoers.d`, or system systemd units in the first
+/// place (those paths aren't writable by an unprivileged user regardless
+/// of what `is_active()` returns), so requiring uid 0 here costs nothing
+/// against the real threat model while closing the unprivileged bypass
+/// completely.
 /// Whether `exe_name` is an interpreter binary that a legitimate
 /// package-manager script is known to run under. `unattended-upgrade` is
 /// the motivating case: it's a Python script (shebang `#!/usr/bin/python3`),
@@ -120,6 +139,17 @@ pub fn is_active() -> bool {
             continue;
         }
         let path = entry.path();
+
+        // The kernel sets a /proc/<pid> directory's owning uid to that
+        // process's real uid - cheaper than parsing /proc/<pid>/status,
+        // and not spoofable by the process itself. See this function's
+        // doc comment: every legitimate case this recognizes runs as
+        // root by the time it matters, so this is a hard requirement,
+        // not a soft signal like `comm`.
+        let Ok(proc_meta) = fs::metadata(&path) else { continue };
+        if proc_meta.uid() != 0 {
+            continue;
+        }
 
         let Ok(comm) = fs::read_to_string(path.join("comm")) else { continue };
         if !PACKAGE_MANAGER_PROCESS_NAMES.contains(&comm.trim()) {
@@ -261,5 +291,62 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for the second red-team-confirmed bypass: none of
+    /// the checks above ever verified privilege, so a binary correctly
+    /// placed in a `SYSTEM_BIN_DIRS` entry and correctly named after a
+    /// real package manager still passed every check while running as a
+    /// completely unprivileged user - a background loop re-running a
+    /// harmless, unprivileged `rpm --version` needs no root at all.
+    /// Isolates exactly the uid check (comm, exe-basename, and directory
+    /// are all otherwise satisfied here) by placing a real binary
+    /// correctly and spawning it under uid 65534 ("nobody" on every
+    /// distro in the test matrix). Needs root itself (to write into a
+    /// system bin dir and to spawn a child under a different uid via
+    /// `Command::uid`) - both already true of the Docker build container
+    /// this runs in; skips gracefully rather than failing in an
+    /// environment that can't set that up.
+    #[test]
+    fn a_correctly_placed_binary_running_as_a_non_root_uid_does_not_count_as_active() {
+        if unsafe { libc::getuid() } != 0 {
+            eprintln!("skipping: needs root to place a binary in a system bin dir and spawn under another uid");
+            return;
+        }
+        let named = PathBuf::from("/usr/local/bin/pacman");
+        if named.exists() {
+            eprintln!("skipping: /usr/local/bin/pacman already exists in this environment, refusing to overwrite it");
+            return;
+        }
+        std::fs::copy("/bin/sleep", &named).expect("copying /bin/sleep into a system bin dir to build the decoy");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o755)).expect("making the decoy world-executable");
+        }
+
+        use std::os::unix::process::CommandExt;
+        let mut child = None;
+        for attempt in 0..10 {
+            match std::process::Command::new(&named).arg("2").uid(65534).gid(65534).spawn() {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < 9 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("spawning decoy process under uid 65534: {e}"),
+            }
+        }
+        let mut child = child.expect("spawning decoy process after retries");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let result = is_active();
+
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_file(&named).ok();
+
+        assert!(!result, "a correctly-placed, correctly-named package-manager binary running as a non-root uid must not count as an active install");
     }
 }
