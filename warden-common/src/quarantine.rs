@@ -1,8 +1,15 @@
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Linux's `NAME_MAX`: the hard kernel limit on a single path component,
+/// in bytes. `take` below must never build a `quarantine_name` longer
+/// than this - see its doc comment.
+const QUARANTINE_NAME_MAX_BYTES: usize = 255;
 
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{Flock, FlockArg};
@@ -106,7 +113,42 @@ impl Quarantine {
 
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let sanitized = original.to_string_lossy().replace('/', "_");
-        let quarantine_name = format!("{stamp}_{module}_{pid}_{sanitized}");
+
+        // A review found this used to be `{stamp}_{module}_{pid}_{sanitized}`
+        // with no bound on `sanitized`'s length - the flattened original
+        // path, which for any real file can be up to `PATH_MAX` (4096
+        // bytes). The kernel caps a single path component at `NAME_MAX`
+        // (255 bytes), so any sufficiently long path made `fs::rename`
+        // *and* the cross-device `copy` fallback both fail with
+        // `ENAMETOOLONG` - silently, since the error path below is only
+        // logged, not treated as fatal. For persistence/privesc/YARA
+        // (which have no process to kill and rely entirely on quarantine
+        // to remediate) that meant a 100% reliable Enforce-mode bypass:
+        // drop the malicious payload under a long enough filename and it
+        // is detected but never actually removed. Truncating the
+        // human-readable tail at a safe byte budget fixes the immediate
+        // failure; the fingerprint below (a hash of the *full,
+        // untruncated* original path) is what actually guarantees
+        // uniqueness once that tail is lossy - two different overlong
+        // paths that happen to share the same truncated prefix must still
+        // never collide on the same quarantine_name.
+        let mut hasher = DefaultHasher::new();
+        original.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        let prefix = format!("{stamp}_{module}_{pid}_{fingerprint:016x}_");
+        let budget = QUARANTINE_NAME_MAX_BYTES.saturating_sub(prefix.len());
+        // NAME_MAX is a byte limit, not a char limit, and `sanitized` can
+        // contain multi-byte UTF-8 (an original path with non-ASCII
+        // characters) - truncate at the nearest valid char boundary at or
+        // before `budget`, never mid-codepoint, so the result is always
+        // valid UTF-8.
+        let mut cut = budget.min(sanitized.len());
+        while cut > 0 && !sanitized.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let quarantine_name = format!("{prefix}{}", &sanitized[..cut]);
+        debug_assert!(quarantine_name.len() <= QUARANTINE_NAME_MAX_BYTES);
         let dest = self.dir.join(&quarantine_name);
 
         match fs::rename(original, &dest) {
@@ -514,6 +556,67 @@ mod tests {
         let remaining = quarantine.list().unwrap();
         assert_eq!(remaining.len(), 1, "the concurrently-quarantined second file must still be recorded in the manifest, not silently dropped");
         assert!(remaining[0].original_path.ends_with("second.sh"));
+
+        fs::remove_dir_all(&qdir).ok();
+        fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// Regression test for WD-01: a filename long enough that the old
+    /// unbounded `{stamp}_{module}_{pid}_{sanitized}` format would exceed
+    /// `NAME_MAX` (255 bytes) and make both `fs::rename` and the
+    /// cross-device `copy` fallback fail with `ENAMETOOLONG`, silently
+    /// leaving the malicious file in place despite being "detected".
+    #[test]
+    fn take_succeeds_on_an_overlong_original_path() {
+        let qdir = temp_dir("overlong-name");
+        let quarantine = Quarantine::new(&qdir).unwrap();
+
+        let src_dir = temp_dir("overlong-name-src");
+        fs::create_dir_all(&src_dir).unwrap();
+        // NAME_MAX itself also bounds a single component we can actually
+        // create on most filesystems, so build the length up through
+        // nested directories instead - `take`'s flattening (`/` -> `_`)
+        // is what turns that back into one long component.
+        let long_name = "a".repeat(200);
+        let nested = src_dir.join(&long_name).join(&long_name).join("payload.sh");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"echo hi").unwrap();
+
+        let dest = quarantine.take(&nested, "yara", -1, "matched a rule").unwrap().unwrap();
+        assert!(dest.exists(), "quarantined copy must exist despite the overlong original path");
+        assert!(!nested.exists(), "original must be gone (moved or removed after copy)");
+        assert!(
+            dest.file_name().unwrap().len() <= QUARANTINE_NAME_MAX_BYTES,
+            "quarantine_name must never exceed NAME_MAX"
+        );
+
+        fs::remove_dir_all(&qdir).ok();
+        fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// Regression test for the fingerprint added alongside the truncation
+    /// fix above: two distinct overlong paths that share the same 200-byte
+    /// prefix (and so would truncate to an identical tail) must still
+    /// produce distinct quarantine_names, not silently collide.
+    #[test]
+    fn truncated_overlong_names_still_stay_unique() {
+        let qdir = temp_dir("overlong-name-unique");
+        let quarantine = Quarantine::new(&qdir).unwrap();
+
+        let src_dir = temp_dir("overlong-name-unique-src");
+        let shared_prefix = "b".repeat(200);
+        let dir_a = src_dir.join(format!("{shared_prefix}-first"));
+        let dir_b = src_dir.join(format!("{shared_prefix}-second"));
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let file_a = dir_a.join("payload.sh");
+        let file_b = dir_b.join("payload.sh");
+        fs::write(&file_a, b"echo a").unwrap();
+        fs::write(&file_b, b"echo b").unwrap();
+
+        let dest_a = quarantine.take(&file_a, "yara", -1, "a").unwrap().unwrap();
+        let dest_b = quarantine.take(&file_b, "yara", -1, "b").unwrap().unwrap();
+        assert_ne!(dest_a, dest_b, "distinct original paths must never collide on the same quarantine_name");
 
         fs::remove_dir_all(&qdir).ok();
         fs::remove_dir_all(&src_dir).ok();
