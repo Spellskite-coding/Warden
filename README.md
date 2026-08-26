@@ -99,6 +99,12 @@ docker run --rm -v "$PWD:/build" \
   "cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
 ```
 
+[`.github/workflows/test.yml`](.github/workflows/test.yml) runs the same
+build/test/clippy/`cargo-audit` checks automatically on every push and
+pull request (not inside the Docker build container there, but on a
+plain `ubuntu-latest` runner with the GTK4/libadwaita dev packages
+installed directly).
+
 ## Installing (on a real machine)
 
 ```sh
@@ -108,9 +114,14 @@ sudo ./install.sh
 Detects your distro's package manager (apt, dnf, pacman, or zypper),
 installs build dependencies, builds Warden from source, installs the
 systemd units (with a computed sandboxing drop-in for the target user's
-actual home directory), and starts protection immediately in `enforce`
-mode. Safe to re-run to upgrade an existing install in place — it never
-overwrites an existing `config.toml`.
+actual home directory), and starts protection in either `enforce` mode
+(kills/quarantines immediately) or `monitor` mode (logs only) — asked
+interactively on a fresh install (defaults to `enforce` if not run
+interactively; set `WARDEN_INSTALL_MODE=monitor` to skip the prompt).
+Either way it's switchable anytime afterward from the GUI or
+`warden --set-mode`. Safe to re-run to upgrade an existing install in
+place — it never overwrites an existing `config.toml`, so re-running
+never resets a mode you already chose.
 
 To remove it:
 
