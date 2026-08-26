@@ -222,14 +222,26 @@ mod tests {
     use super::*;
     use crate::event::Severity;
 
+    // A bare file directly under `std::env::temp_dir()` (`/tmp`) used to be
+    // returned here. `HistoryStore::new` unconditionally re-asserts `0700`
+    // on its path's parent directory - the same "never trust it survived,
+    // always re-apply it" pattern `Quarantine::new` uses - which is exactly
+    // right for the dedicated directory a real deployment always gives it
+    // (e.g. `/var/lib/warden`, owned outright by the daemon), but meant
+    // these tests tried to `chmod` `/tmp` itself: harmless when `cargo
+    // test` happens to run as root (owns `/tmp`), but a guaranteed
+    // `EPERM` for the far more ordinary case of a non-root developer
+    // running the test suite locally. Each test now gets its own
+    // subdirectory it actually owns, matching `quarantine.rs`'s tests.
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("warden-history-test-{name}-{}.jsonl", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("warden-history-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("history.jsonl")
     }
 
     #[test]
     fn records_and_reads_back_events() {
         let path = temp_path("roundtrip");
-        let _ = std::fs::remove_file(&path);
         let store = HistoryStore::new(&path).unwrap();
 
         let evt = DetectionEvent::new("persistence", Severity::High, "summary", "detail");
@@ -241,13 +253,12 @@ mod tests {
         assert_eq!(events[0].module, "persistence");
         assert_eq!(events[0].severity, "high");
 
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn recent_limits_and_keeps_newest_last() {
         let path = temp_path("limit");
-        let _ = std::fs::remove_file(&path);
         let store = HistoryStore::new(&path).unwrap();
 
         for i in 0..5 {
@@ -260,7 +271,7 @@ mod tests {
         assert_eq!(events[0].summary, "event 3");
         assert_eq!(events[1].summary, "event 4");
 
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Regression test for the finding that `history.jsonl` had nothing
@@ -275,7 +286,6 @@ mod tests {
     #[test]
     fn record_rotates_the_file_once_it_exceeds_the_size_threshold() {
         let path = temp_path("rotate");
-        let _ = std::fs::remove_file(&path);
         let store = HistoryStore::new(&path).unwrap();
 
         let padding = "x".repeat(20_000);
@@ -296,15 +306,14 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, format!("event {}", iterations - 1), "the newest record must survive rotation");
 
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(store.lock_path()).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn recent_on_missing_file_returns_empty() {
         let path = temp_path("missing");
-        let _ = std::fs::remove_file(&path);
         let store = HistoryStore::new(&path).unwrap();
         assert!(store.recent(10).unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
