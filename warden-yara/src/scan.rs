@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -90,6 +93,11 @@ fn walk(dir: &Path, scanner: &mut yara_x::Scanner, files_scanned: &AtomicUsize, 
         }
 
         let Ok(file_type) = entry.file_type() else { continue };
+        // Fast-path skip only - not the authoritative guard against a
+        // symlink. `entry.file_type()` is an `lstat` taken while reading
+        // the directory; the actual open below happens afterward, so
+        // relying on this check alone would leave the same TOCTOU window
+        // O_NOFOLLOW closes there.
         if file_type.is_symlink() {
             continue;
         }
@@ -107,12 +115,45 @@ fn walk(dir: &Path, scanner: &mut yara_x::Scanner, files_scanned: &AtomicUsize, 
         }
 
         files_scanned.fetch_add(1, Ordering::Relaxed);
-        let Ok(meta) = entry.metadata() else { continue };
+
+        // A review found this used to call `scanner.scan_file(&path)`
+        // after only the lstat-based checks above - yara-x's own
+        // `scan_file` reopens the path itself with a plain `fs::File::open`
+        // (no `O_NOFOLLOW`), a second, separate resolution of the same
+        // path. Anything with write access to a directory being scanned
+        // could swap a symlink into place in the gap between the check
+        // and that reopen, making the daemon (running as root, since an
+        // on-demand scan can be pointed anywhere) read and report on an
+        // arbitrary target of the attacker's choosing instead of what was
+        // actually walked - the same class of bug the live fanotify
+        // monitors (`read_via_fd`) were already hardened against.
+        // `O_NOFOLLOW` makes the kernel enforce "final component is not a
+        // symlink" atomically as part of this single open, closing the
+        // window instead of racing it; reading and scanning through that
+        // one already-open handle (rather than re-deriving anything from
+        // `path` again) means nothing after this point can be swapped out
+        // from under us.
+        let mut file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "opening file for scan failed (or it is a symlink), skipping");
+                continue;
+            }
+        };
+        let Ok(meta) = file.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
         if meta.len() > MAX_FILE_SIZE_BYTES {
             debug!(path = %path.display(), size = meta.len(), "file exceeds scan size cap, skipping");
             continue;
         }
-        let Ok(results) = scanner.scan_file(&path) else { continue };
+        let mut content = Vec::new();
+        if let Err(e) = file.read_to_end(&mut content) {
+            debug!(path = %path.display(), error = %e, "reading file for scan failed, skipping");
+            continue;
+        }
+        let Ok(results) = scanner.scan(&content) else { continue };
         let matched_rules: Vec<String> = results.matching_rules().map(|r| r.identifier().to_string()).collect();
         if !matched_rules.is_empty() {
             on_match(ScanMatch { path, matched_rules });
@@ -149,6 +190,64 @@ mod tests {
         assert_eq!(files_scanned.load(Ordering::Relaxed), 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for WD-02's actual TOCTOU closure, not just the
+    /// end-to-end behavior: `O_NOFOLLOW` must deterministically refuse to
+    /// open a path whose final component is a symlink, with no race
+    /// needed to prove it - unlike the old `entry.file_type().is_symlink()`
+    /// check followed by a separate `scan_file(&path)` reopen, where a
+    /// symlink swapped into place in between the two would win, this
+    /// makes "is the final component a symlink" and "open it" one atomic
+    /// kernel operation, so there is no window left to race at all.
+    #[test]
+    fn opening_a_symlink_with_o_nofollow_is_deterministically_refused() {
+        let dir = scratch_dir("o-nofollow");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"content").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&link);
+        assert!(result.is_err(), "O_NOFOLLOW must refuse to open a path whose final component is a symlink");
+
+        // Control: the exact same call against a real (non-symlink) file
+        // must still succeed - the fix must not have broken ordinary scans.
+        let ok = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&target);
+        assert!(ok.is_ok(), "O_NOFOLLOW must not affect opening a real, non-symlink file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for WD-02: a symlinked *file* discovered while
+    /// walking a real (non-symlinked) directory must never be opened or
+    /// scanned - not just a symlinked scan root, which
+    /// `a_symlinked_scan_root_is_not_followed` above already covers.
+    /// Exercises both layers of the fix: the `file_type.is_symlink()`
+    /// fast-path skip, and `O_NOFOLLOW` as the authoritative guard behind
+    /// it.
+    #[test]
+    fn a_symlinked_file_inside_a_real_directory_is_not_followed() {
+        // The real EICAR content must live *outside* the scanned root -
+        // otherwise `walk` would find and match it directly as a regular
+        // file in its own right, making the test pass regardless of
+        // whether the symlink pointing at it was followed.
+        let outside = scratch_dir("symlink-file-target");
+        let target = outside.join("eicar_target.txt");
+        std::fs::write(&target, b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*").unwrap();
+
+        let dir = scratch_dir("symlink-file");
+        let link = dir.join("innocuous_name.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let files_scanned = AtomicUsize::new(0);
+        let mut matches = Vec::new();
+        scan_paths(std::slice::from_ref(&dir), None, &files_scanned, |m| matches.push(m)).unwrap();
+
+        assert!(matches.is_empty(), "a symlinked file must not be followed and scanned");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
