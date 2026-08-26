@@ -104,19 +104,54 @@ install_rustup_for() {
     run_as_install_user 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default'
 }
 
-# Checks root's own PATH first, then $INSTALL_FOR_USER's `~/.cargo/bin`
-# (covers a rustup install that already exists but isn't on root's PATH)
-# before concluding cargo is genuinely missing.
-if ! command -v cargo >/dev/null 2>&1; then
-    if [ -n "$INSTALL_FOR_HOME" ] && [ -x "$INSTALL_FOR_HOME/.cargo/bin/cargo" ]; then
-        export PATH="$INSTALL_FOR_HOME/.cargo/bin:$PATH"
-    fi
+# Prepends $INSTALL_FOR_USER's rustup-managed `~/.cargo/bin` to PATH
+# whenever it exists, even if a `cargo` is ALSO already reachable via the
+# plain system PATH (e.g. root's own PATH). A review found the previous
+# version only looked at `~/.cargo/bin` as a fallback when `command -v
+# cargo` had already failed - so a distro-packaged `cargo` sitting
+# earlier on PATH than any rustup toolchain silently won every time, even
+# when a perfectly good rustup install existed right there in
+# `$INSTALL_FOR_HOME/.cargo/bin`. rustup's stable channel is what this
+# workspace's `Cargo.lock` is actually built and tested against, so it
+# should always be preferred when available, not merely used as a last
+# resort.
+if [ -n "$INSTALL_FOR_HOME" ] && [ -x "$INSTALL_FOR_HOME/.cargo/bin/cargo" ]; then
+    export PATH="$INSTALL_FOR_HOME/.cargo/bin:$PATH"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-    warn "cargo/rustc not found."
+# The minimum rustc version this workspace's current Cargo.lock actually
+# needs. Found live: a system-packaged `cargo` (1.85.0, from an unrelated
+# apt package - nothing this script installs itself) on root's PATH, with
+# no rustup toolchain to prefer it over, passed the old "does cargo
+# exist" check and then failed the real build two steps later with a
+# cargo dependency-resolution wall of text ("requires rustc 1.91.0",
+# repeated for two dozen crates) instead of a clear, actionable message.
+# Bump this if a future dependency update raises the real requirement
+# further - a value left too low just means this check silently stops
+# catching that later case and cargo's own opaque error resurfaces, same
+# as before this fix existed.
+MIN_RUSTC_VERSION="1.91.0"
+
+# True if `cargo` is on PATH AND its rustc is at least $MIN_RUSTC_VERSION.
+# `sort -V` (version sort) on the two-line input puts the smaller version
+# first; if that's still $MIN_RUSTC_VERSION after sorting, $found_version
+# is >= it.
+cargo_is_usable() {
+    command -v cargo >/dev/null 2>&1 || return 1
+    local found_version
+    found_version="$(rustc --version 2>/dev/null | awk '{print $2}')"
+    [ -n "$found_version" ] || return 1
+    [ "$(printf '%s\n%s\n' "$MIN_RUSTC_VERSION" "$found_version" | sort -V | head -n1)" = "$MIN_RUSTC_VERSION" ]
+}
+
+if ! cargo_is_usable; then
+    if command -v cargo >/dev/null 2>&1; then
+        warn "found cargo, but rustc $(rustc --version 2>/dev/null | awk '{print $2}') is older than the $MIN_RUSTC_VERSION this workspace's Cargo.lock needs."
+    else
+        warn "cargo/rustc not found."
+    fi
     if [ -t 0 ]; then
-        read -r -p "Install rustup now for '$INSTALL_FOR_USER' to build Warden? [y/N] " reply
+        read -r -p "Install/upgrade rustup now for '$INSTALL_FOR_USER' to build Warden? [y/N] " reply
     else
         reply="n"
         warn "not running interactively - skipping the prompt."
@@ -129,8 +164,10 @@ if ! command -v cargo >/dev/null 2>&1; then
             die "rustup installation failed. Install Rust yourself (https://rustup.rs) and re-run this script."
         fi
     else
-        die "cargo/rustc required to build Warden from source. Install Rust (https://rustup.rs) for '$INSTALL_FOR_USER' and re-run this script. Nothing on this system has been changed yet."
+        die "a recent enough cargo/rustc (>= $MIN_RUSTC_VERSION) is required to build Warden from source. Install or update Rust via rustup (https://rustup.rs) for '$INSTALL_FOR_USER' and re-run this script. Nothing on this system has been changed yet."
     fi
+
+    cargo_is_usable || die "cargo/rustc still isn't usable (or still too old) after installing rustup for '$INSTALL_FOR_USER' - check the output above."
 fi
 log "found cargo: $(cargo --version)"
 
@@ -443,17 +480,49 @@ done
 
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    log "writing default config to $CONFIG_DIR/config.toml (mode=enforce - protection is active immediately; switch to monitor from the GUI or here if you'd rather watch first)"
+    # Asked interactively (with a non-interactive/env-var override, same
+    # pattern as the rustup-install prompt above and $WARDEN_TARGET_USER)
+    # rather than always defaulting to enforce: a first-time user who
+    # just wants to watch what Warden would do before trusting it to
+    # actually kill/quarantine things has no way to express that at
+    # install time otherwise, and would need to know in advance that
+    # --set-mode or the GUI exists to switch afterward. Only asked when
+    # writing a FRESH config - an upgrade re-run never reaches this
+    # branch at all (see the block comment above), so this can't
+    # surprise-flip an existing install's mode.
+    INSTALL_MODE="${WARDEN_INSTALL_MODE:-}"
+    if [ -n "$INSTALL_MODE" ] && [ "$INSTALL_MODE" != "enforce" ] && [ "$INSTALL_MODE" != "monitor" ]; then
+        warn "WARDEN_INSTALL_MODE='$INSTALL_MODE' is not 'enforce' or 'monitor', ignoring it"
+        INSTALL_MODE=""
+    fi
+    if [ -z "$INSTALL_MODE" ]; then
+        if [ -t 0 ]; then
+            echo
+            echo "Warden can start in one of two modes (switchable anytime later from the"
+            echo "GUI, or by re-running 'warden --set-mode <mode>'):"
+            echo "  enforce  - kills/quarantines detected threats immediately"
+            echo "  monitor  - only logs/notifies what it would have done, no action taken"
+            read -r -p "Install in enforce or monitor mode? [E/m] " mode_reply
+            if [[ "$mode_reply" =~ ^[Mm] ]]; then
+                INSTALL_MODE="monitor"
+            else
+                INSTALL_MODE="enforce"
+            fi
+        else
+            INSTALL_MODE="enforce"
+            warn "not running interactively - defaulting to enforce mode (set WARDEN_INSTALL_MODE=monitor before running this script, or switch from the GUI afterward, if you'd rather watch first)"
+        fi
+    fi
+
+    log "writing config to $CONFIG_DIR/config.toml (mode=$INSTALL_MODE)"
     cat > "$CONFIG_DIR/config.toml" <<EOF
 # Warden EDR configuration.
 #
 # mode: "enforce" actually kills/quarantines/strips what it detects;
-# "monitor" only logs/notifies what it would have done. Enforce is the
-# default so protection is active as soon as this install finishes - flip
-# to monitor here (or from the GUI's Dashboard, which also requires your
-# root/admin password to change) if you'd rather watch it for a while on
-# this machine first.
-mode = "enforce"
+# "monitor" only logs/notifies what it would have done. Flip this here
+# (or from the GUI's Dashboard, which also requires your root/admin
+# password to change) at any time.
+mode = "$INSTALL_MODE"
 target_user = "$TARGET_USER"
 EOF
 else
@@ -561,8 +630,8 @@ fi
 echo
 log "Warden installed."
 # Read back the actual configured mode rather than assuming - it's
-# "enforce" on a fresh install (as written above) but could be anything
-# an existing config.toml already had, which this script never touches.
+# whatever was chosen above on a fresh install, or anything an existing
+# config.toml already had (this script never touches one that exists).
 CURRENT_MODE="$(grep -E '^\s*mode\s*=' "$CONFIG_DIR/config.toml" 2>/dev/null | head -1 | sed -E 's/^\s*mode\s*=\s*"?([a-z]+)"?.*/\1/')"
 echo "  Config:    $CONFIG_DIR/config.toml (mode=${CURRENT_MODE:-enforce})"
 echo "  Services:  systemctl status $UNITS"
