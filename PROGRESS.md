@@ -1609,3 +1609,98 @@ poussé aussi loin que sur la VM - couverture jugée suffisante puisque le
 code Rust est strictement le même binaire partout, seule la partie
 gestionnaire de paquets d'`install.sh` change réellement d'un OS à
 l'autre).
+
+## `install.sh` - choix interactif du mode (enforce/monitor) à l'install (25 août)
+
+Demande utilisateur : pouvoir choisir enforce ou monitor pendant
+l'installation plutôt que de toujours démarrer en enforce, pour que les
+gens qui veulent juste observer sans risque de faux positif puissent le
+faire dès le départ (le mode reste interchangeable après coup depuis la
+GUI ou `--set-mode`, donc ce choix n'est jamais définitif).
+
+Ajouté un prompt interactif (`[ -t 0 ]`-gated, même pattern que le prompt
+rustup existant) juste avant l'écriture de `config.toml`, uniquement sur
+une install neuve - un re-run sur une install existante ne touche jamais
+le config déjà là, donc ce prompt ne peut pas surprendre-basculer une
+machine déjà protégée. Ajouté `WARDEN_INSTALL_MODE` (valeurs valides:
+`enforce`/`monitor`) comme override non-interactif, même précédence que
+`WARDEN_TARGET_USER`. Sans TTY et sans variable d'env, retombe sur
+enforce (comportement identique à avant ce changement) - un install
+scripté/CI n'est pas affecté.
+
+Pas de nouvelle surface de sécurité : ce code ne s'exécute qu'après le
+check `[ "$(id -u)" -eq 0 ]`, donc déjà en tant que root ; le choix
+"monitor" n'est pas une nouvelle capacité (déjà possible après coup via
+la GUI ou `--set-mode`, tous deux pkexec-gated) ; l'entrée est validée
+strictement contre `enforce`/`monitor` avant d'être écrite dans le TOML.
+
+**Testé en direct sur `debian13`, les 4 chemins :**
+- `WARDEN_INSTALL_MODE=monitor` (override, sans tty) → `mode = "monitor"`.
+- Prompt interactif, réponse "m" → `mode = "monitor"`, 4 modules ready.
+- Prompt interactif, Entrée (défaut) → `mode = "enforce"`.
+- Sans tty et sans override → `mode = "enforce"` avec warning, pas de
+  hang.
+
+**Effet de bord découvert en testant "root direct vs sudo" (question
+explicite de l'utilisateur) :** en relançant `install.sh` en tant que
+root littéral (`su -`, sans passer par `sudo` - `$SUDO_USER` vide dans ce
+cas), la résolution de `TARGET_USER` retombe correctement sur le prompt
+"Desktop username..." (déjà le comportement voulu, code inchangé,
+confirmé en direct). Mais la détection cargo/rustc a trouvé un `cargo`
+système (paquet `cargo` installé sur cette VM, sans rapport avec
+`install.sh` - `dpkg -S /usr/bin/cargo` confirme que ce n'est pas un
+paquet que ce script installe) trop ancien (1.85.0) pour le `Cargo.lock`
+actuel (a besoin de 1.91.0), faisant échouer le build avec une erreur de
+résolution de dépendances cargo assez peu claire plutôt qu'un message
+explicite. Root a son propre rustup maintenant installé sur cette VM
+pour continuer le test - le script fonctionne bien une fois un toolchain
+compatible sur le PATH. Reste une vraie limitation générale
+(indépendante de root vs sudo) : `install.sh` vérifie seulement que
+`cargo` existe, jamais sa version, avant de tenter le build - sur une
+machine où un `cargo` système trop vieux traîne déjà sur le PATH, l'échec
+serait confus. Pas corrigé pour l'instant (hors scope de la demande du
+jour), signalé à l'utilisateur pour décision.
+
+## Correctif du `cargo` système périmé, validé de bout en bout (25-26 août)
+
+Suite demandée par l'utilisateur ("corrige ça stp") : `install.sh`
+préfère maintenant systématiquement le toolchain rustup de
+`$INSTALL_FOR_USER` (`$INSTALL_FOR_HOME/.cargo/bin`) même quand un
+`cargo` est déjà trouvable sur le PATH courant - avant ce fix, il ne
+regardait `~/.cargo/bin` qu'en dernier recours, si `command -v cargo`
+avait déjà échoué, laissant un `cargo` distro-packagé plus tôt sur le
+PATH gagner silencieusement à chaque fois. Ajouté aussi un vrai check de
+version minimale (`MIN_RUSTC_VERSION`, actuellement 1.91.0) via
+`sort -V` - un `cargo` trop vieux est maintenant traité exactement comme
+"absent" (même prompt/même flux d'installation rustup), au lieu de
+foncer dans un `cargo build` voué à l'échec avec un mur d'erreurs de
+résolution de dépendances peu clair.
+
+**Validé en direct sur `debian13`, dans un environnement non confondu**
+(via `sudo bash -c` non-login, PATH vanilla sans `.profile`/`.bashrc` -
+`which cargo` y résolvait bien `/usr/bin/cargo` 1.85.0 avant le fix) :
+process `cargo build` observé en train d'utiliser
+`/home/claude/.rustup/toolchains/stable-.../cargo`, pas le `/usr/bin/cargo`
+périmé. Build complet + install + démarrage des 3 services réussi,
+`mode=enforce`, les 4 modules ready, aucun panic.
+
+**Incident pendant cette validation, signalé par l'utilisateur avant que
+je m'en rende compte moi-même** : une commande SSH lancée sans
+`setsid nohup ... & disown` (la même erreur déjà identifiée et évitée
+plus tôt dans cette session) a été tuée silencieusement quand la
+connexion a expiré côté client - le process distant est mort sans que je
+le remarque, et j'ai continué à dire "ça tourne encore" en me basant sur
+une hypothèse plutôt qu'une vérification. L'utilisateur a relevé "c'est
+pas normal que ce soit si long" / "ça a jamais pris plus de 20 minutes"
+avant que je vérifie l'état réel du process - vérification qui a
+confirmé qu'il était bien mort. Relancé correctement en détaché, terminé
+en ~5 minutes (3m17s pour le workspace principal + 1m28s pour l'eBPF),
+cohérent avec l'attente de l'utilisateur. Leçon reconfirmée : toujours
+vérifier l'état réel du process distant plutôt que de supposer qu'il
+tourne encore, surtout après un silence prolongé - et faire confiance au
+signal de l'utilisateur quand une durée lui semble anormale plutôt que
+de la rationaliser.
+
+`README.md` mis à jour pour refléter le nouveau choix de mode interactif
+à l'install (n'affirme plus que `enforce` démarre "immédiatement" sans
+nuance) et pour mentionner `.github/workflows/test.yml`.
