@@ -1704,3 +1704,127 @@ de la rationaliser.
 `README.md` mis à jour pour refléter le nouveau choix de mode interactif
 à l'install (n'affirme plus que `enforce` démarre "immédiatement" sans
 nuance) et pour mentionner `.github/workflows/test.yml`.
+
+## SAST complet + 3 correctifs (WD-01/02/03), validés en direct sur `debian13` (26 août)
+
+Suite à la demande explicite de l'utilisateur d'un SAST poussé (failles
+de sécurité, erreurs métier, robustesse), une lecture attentive de tout
+le workspace (~8700 lignes, 9 crates + le workspace eBPF séparé) a
+identifié 3 failles réelles ne recoupant aucun des points déjà fermés
+ci-dessus. Un rapport PDF détaillé avait été généré dans une session
+précédente mais son fichier temporaire a été perdu entre deux sessions
+(nettoyage du `/tmp` éphémère) - cette section fait donc foi comme trace
+durable des 3 findings et de leurs correctifs.
+
+**WD-01 (CRITIQUE) - Bypass total du mode Enforce via nom de quarantaine
+trop long.** `Quarantine::take()` (`warden-common/src/quarantine.rs`)
+construisait `quarantine_name` en aplatissant le chemin original complet
+en un seul nom de fichier (`{stamp}_{module}_{pid}_{sanitized}`), sans
+jamais vérifier `NAME_MAX` (255 octets, la limite du noyau pour un seul
+composant de chemin). N'importe quel fichier détecté sous un chemin
+assez long faisait échouer `fs::rename` **et** le fallback `copy` avec
+`ENAMETOOLONG`, silencieusement (l'erreur n'était que loggée) - pour
+`persistence`/`privesc`/`yara` (aucun process à tuer, la quarantaine est
+leur seule remédiation), un contournement fiable à 100% du mode Enforce.
+Corrigé : le nom est maintenant tronqué à 255 octets (troncature au
+dernier point de coupure UTF-8 valide, jamais en plein milieu d'un
+caractère multi-octets), avec une empreinte (`DefaultHasher` du
+`&Path` original complet, avant troncature) insérée dans le nom pour
+garantir qu'aucune troncature ne peut faire collisionner deux chemins
+distincts sur le même nom de quarantaine. Tests ajoutés :
+`take_succeeds_on_an_overlong_original_path`,
+`truncated_overlong_names_still_stay_unique`.
+**Validé en direct** : fichier EICAR déposé sous `/tmp` avec un nom de
+254 caractères (composant aplati de 259 octets, au-delà de `NAME_MAX`)
+- détecté et **effectivement quarantiné** (`file quarantined
+original=/tmp/AAAA...(254 car).txt quarantined_as=.../1787768861_yara_
+-1_486ea380b2efa725__tmp_AAAA...(tronqué).txt`), aucun `ENAMETOOLONG`,
+fichier original bien disparu du système de fichiers.
+
+**WD-02 (MOYEN) - TOCTOU sur le scan YARA à la demande.**
+`warden-yara/src/scan.rs::walk()` vérifiait qu'un fichier n'était pas un
+symlink via `lstat` (`entry.file_type()`), puis rouvrait le fichier par
+chemin via `scanner.scan_file(&path)` - une deuxième résolution du
+chemin, séparée dans le temps de la première. N'importe quel process
+avec accès en écriture au répertoire scanné pouvait remplacer le
+fichier par un symlink entre les deux, faisant lire au démon (root, un
+scan à la demande peut être pointé n'importe où sous le home de
+l'appelant) un fichier arbitraire de son choix. Les moniteurs fanotify
+temps réel avaient déjà été corrigés pour ce même problème (lecture via
+fd `dup()`, cf. plus haut) ; ce chemin de code-là ne l'avait pas été.
+Corrigé : ouverture avec `O_NOFOLLOW` (le noyau refuse atomiquement
+d'ouvrir si le composant final est un symlink - plus de fenêtre entre
+un check et un open séparés), lecture et scan (`scanner.scan(&bytes)`,
+même approche que `read_via_fd`) via le descripteur déjà ouvert, jamais
+une deuxième résolution du chemin. Tests ajoutés :
+`opening_a_symlink_with_o_nofollow_is_deterministically_refused` (prouve
+le mécanisme sans course, de façon déterministe),
+`a_symlinked_file_inside_a_real_directory_is_not_followed`.
+**Validé en direct** via le socket de contrôle (`StartScan` en tant que
+`test`, uid gate) : un répertoire ne contenant qu'un symlink vers un
+fichier EICAR situé hors de la racine scannée donne `files_scanned=0,
+matches_found=0` (le lien n'est pas suivi) ; un répertoire contenant un
+vrai fichier EICAR donne `files_scanned=1, matches_found=1` et
+l'entrée d'historique attendue (`module=yara-scan, action_taken=false`)
+- confirme qu'`O_NOFOLLOW` n'a introduit aucune régression fonctionnelle
+sur un scan légitime.
+
+**WD-03 (MOYEN) - DoS structurel du scan à la demande via panic non
+catché.** `ScanState::spawn()` (`warden-core/src/scan.rs`) lançait le
+scan sur un thread bloquant (`spawn_blocking`) sans jamais attendre son
+`JoinHandle`, et ne remettait `state.running` à `false` que sur un
+retour normal de la closure. Une panique n'importe où dans
+`scan_paths` (y compris dans `yara-x` lui-même, sur du contenu de
+fichier arbitraire) aurait unwind directement au-delà du `store(false,
+...)`, bloquant `running` à `true` pour toujours - plus aucun
+`StartScan` possible jusqu'au redémarrage du démon. Corrigé : l'appel à
+`scan_paths` tourne maintenant dans `std::panic::catch_unwind`, et
+`state.running.store(false, ...)` est déplacé hors du `catch_unwind`
+pour s'exécuter dans tous les cas (succès, `Err` métier, ou panique).
+Pas de test automatisé ajouté ici : forcer une vraie panique dans
+`yara-x` nécessiterait d'injecter un point de défaillance artificiel
+rien que pour la testabilité, ce qui serait de la sur-ingénierie pour
+ce dépôt (cf. philosophie KISS du projet) ; la correction est un
+idiome Rust standard, simple à vérifier par relecture, et validée
+indirectement en direct : les deux scans du test WD-02 ci-dessus
+montrent tous deux `running: false` après complétion normale, et un
+second `StartScan` immédiatement après le premier a bien été accepté
+(`ScanStarted`, pas `Error`) - donc `running` se réinitialise
+correctement sur le chemin normal. Comme lors de l'audit initial, aucun
+déclencheur de panique réel n'a été trouvé dans `yara-x` - ce risque
+reste structurel, pas démontré en conditions réelles.
+
+**Méthodologie de validation** : `cargo build/clippy -D warnings/test
+--workspace/audit` dans `warden-build:rockylinux` (0 warning, 0 échec,
+aucune nouvelle alerte `cargo-audit` au-delà du `bincode` "unmaintained"
+déjà présent avant ces changements) ; puis build + `cargo test
+--workspace` natif sur `debian13` (0 échec) - avec une découverte
+notable au passage : le démon Warden réel, actif sur cette VM et
+surveillant `/tmp` (module yara), quarantine les fichiers EICAR des
+tests unitaires en quelques dizaines de millisecondes, faisant
+échouer `scan::tests::a_real_directory_root_is_still_scanned_normally`
+par interférence (confirmé reproductible avec l'ancien ET le nouveau
+code - pas une régression, un conflit d'environnement entre le produit
+live et sa propre suite de tests). Services arrêtés le temps du `cargo
+test` natif, puis binaire `release` reconstruit et redéployé sur
+`debian13`, services redémarrés, et les 3 correctifs validés en direct
+contre le démon réel (voir ci-dessus) avant nettoyage complet des
+artefacts de test et confirmation finale : `mode=enforce`, 3 services
+`active`, aucun fichier setuid résiduel.
+
+**Effet de bord découvert et corrigé au passage, sans rapport avec
+WD-01/02/03** : les tests de `warden-common/src/history.rs`
+utilisaient un chemin directement sous `std::env::temp_dir()` (`/tmp`)
+comme fichier cible ; `HistoryStore::new` réaffirme `0700` sur le
+répertoire parent de son chemin (même pattern que `Quarantine::new`),
+ce qui revenait à tenter un `chmod` sur `/tmp` lui-même - silencieusement
+inoffensif quand les tests tournent en root (le conteneur Docker), mais
+un `EPERM` garanti pour le cas bien plus ordinaire d'un développeur non-
+root lançant `cargo test` localement (exactement ce qui s'est produit
+sur `debian13`). Corrigé en donnant à chaque test son propre
+sous-répertoire qu'il possède réellement, comme le fait déjà
+`quarantine.rs`.
+
+Fichiers modifiés dans cette session :
+`warden-common/src/quarantine.rs`, `warden-common/src/history.rs`,
+`warden-core/src/scan.rs`, `warden-yara/src/scan.rs`.
