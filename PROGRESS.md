@@ -1,208 +1,201 @@
-# Warden — état d'avancement
+# Warden — Progress Log
 
-Warden est un EDR autonome pour workstations Linux, écrit en Rust. Ce
-fichier existe pour reprendre le projet proprement après une coupure de
-session — le lire en entier avant de continuer.
+Warden is an autonomous EDR for Linux workstations, written in Rust. This
+file exists to resume the project cleanly after a session break — read it
+in full before continuing.
 
-L'utilisateur a donné le feu vert pour travailler en autonomie complète
-(core, agents, DAST, SAST, GUI, tests réels en conteneurs, YARA/Sigma,
-tout) sans notifier chaque avancée dans le chat — un point d'étape complet
-suffit. Priorité explicite : **finir tous les agents de détection + le core
-d'abord, GUI ensuite, `install.sh` en tout dernier.**
+The user has given the green light to work in full autonomy (core,
+agents, DAST, SAST, GUI, real container-based testing, YARA/Sigma, all of
+it) without reporting every step in chat — a complete checkpoint is
+enough. Explicit priority: **finish all detection agents + the core
+first, GUI next, `install.sh` dead last.**
 
-## Module réseau + SAST — faits et validés (reprise après pause)
+## Network module + SAST — done and validated (resumed after a break)
 
-**Module réseau** (`ebpf-probe/warden-network-ebpf` + `warden-network`,
-même structure que le module exec) : hook sur le tracepoint
-`sock:inet_sock_set_state`, ne traite que la transition vers
-`TCP_SYN_SENT` (pas `TCP_ESTABLISHED` - cette dernière est souvent
-atteinte de façon asynchrone dans un contexte softirq quand le SYN-ACK
-arrive, où le pid "courant" n'est plus celui qui a initié la connexion).
-Résout `/proc/<pid>/exe` côté userspace et applique la même heuristique de
-localisation suspecte que le module exec (`warden_common::heuristics::is_suspicious_exec_location`,
-maintenant partagée par les deux modules) - défense en profondeur : si un
-process depuis `/tmp` ouvre une connexion sortante, tué + binaire
-quarantiné, même si le module exec ne l'avait pas déjà attrapé au
-lancement.
+**Network module** (`ebpf-probe/warden-network-ebpf` + `warden-network`,
+same structure as the exec module): hooks the `sock:inet_sock_set_state`
+tracepoint, only handles the transition to `TCP_SYN_SENT` (not
+`TCP_ESTABLISHED` — the latter is often reached asynchronously in a
+softirq context when the SYN-ACK arrives, where the "current" pid is no
+longer the one that initiated the connection). Resolves `/proc/<pid>/exe`
+in userspace and applies the same suspicious-location heuristic as the
+exec module (`warden_common::heuristics::is_suspicious_exec_location`,
+now shared by both modules) — defense in depth: if a process from `/tmp`
+opens an outbound connection, it gets killed and the binary quarantined,
+even if the exec module hadn't already caught it at launch.
 
-**Bug réel trouvé et corrigé par test** : le champ `common_pid` du
-tracepoint (offset 4, documenté dans son propre format) donnait une valeur
-absurde (négative, et IDENTIQUE pour deux process pourtant différents) une
-fois lu côté eBPF - alors que `dport`/`daddr` lus depuis le même tracepoint
-étaient corrects, écartant un bug d'offset généralisé. Remplacé par
-`bpf_get_current_pid_tgid() >> 32`, lu depuis la tâche en cours plutôt que
-depuis l'enregistrement de trace - l'approche standard qu'utilisent aussi
-bcc/bpftrace pour ce tracepoint précis. Revalidé par test : pid correct
-pour deux connexions simultanées distinctes.
+**Real bug found and fixed through testing**: the tracepoint's
+`common_pid` field (offset 4, documented in its own format) returned an
+absurd value (negative, and IDENTICAL for two different processes) once
+read on the eBPF side — while `dport`/`daddr` read from the same
+tracepoint were correct, ruling out a generalized offset bug. Replaced
+with `bpf_get_current_pid_tgid() >> 32`, read from the current task
+rather than from the trace record — the standard approach also used by
+bcc/bpftrace for this specific tracepoint. Re-validated by testing:
+correct pid for two distinct simultaneous connections.
 
-**Bug structurel réel trouvé et corrigé dans `ebpf-probe/Cargo.toml`** :
-un `cargo build`/`test`/`clippy` NU (sans `-p`) à la racine du workspace
-tentait de compiler les crates `*-ebpf` (`#![no_std]`/`#![no_main]`) pour
-la cible hôte par défaut - échec direct ("unwinding panics are not
-supported without std" en build, "undefined symbol: main" en test), plus
-une collision de nom de binaire de sortie entre `warden-exec` (userspace)
-et le bin du crate `warden-exec-ebpf` qui porte le même nom. L'hypothèse
-initiale ("un build nu ne les touche jamais, seul le build.rs les
-compile") était fausse et corrigée en le testant réellement. Fix :
-`default-members = ["warden-exec", "warden-network"]` dans
-`ebpf-probe/Cargo.toml` - les crates `*-ebpf` restent des `members`
-(donc toujours accessibles via `-p` explicite ou via le `build.rs`), mais
-un `cargo build`/`test`/`clippy` sans arguments ne cible plus qu'elles.
+**Real structural bug found and fixed in `ebpf-probe/Cargo.toml`**: a
+BARE `cargo build`/`test`/`clippy` (without `-p`) at the workspace root
+tried to compile the `*-ebpf` crates (`#![no_std]`/`#![no_main]`) for the
+default host target — direct failure ("unwinding panics are not
+supported without std" at build time, "undefined symbol: main" at test
+time), plus an output-binary name collision between `warden-exec`
+(userspace) and the bin from the `warden-exec-ebpf` crate, which carries
+the same name. The initial assumption ("a bare build never touches them,
+only build.rs compiles them") was wrong and was corrected by actually
+testing it. Fix: `default-members = ["warden-exec", "warden-network"]`
+in `ebpf-probe/Cargo.toml` — the `*-ebpf` crates remain `members` (so
+still reachable via an explicit `-p` or via `build.rs`), but a bare
+`cargo build`/`test`/`clippy` now only targets the userspace ones.
 
-**Testé en conditions réelles** (conteneur `--privileged --pid=host`,
-tracefs monté, listener `nc -l` local) : connexion depuis `/usr/bin/nc`
-(légitime) jamais flaguée ; le même binaire copié vers `/tmp` et utilisé
-pour se connecter → détecté, tué, quarantiné en Enforce. `cargo test`
-(9 tests sur tout `ebpf-probe/` : 6 exec + 3 network) et `cargo clippy`
-propres sur les 4 crates (2 userspace + 2 kernel, ces derniers avec leur
-target/toolchain propres).
+**Tested under real conditions** (`--privileged --pid=host` container,
+tracefs mounted, local `nc -l` listener): connection from `/usr/bin/nc`
+(legitimate) never flagged; the same binary copied to `/tmp` and used to
+connect → detected, killed, quarantined in Enforce. `cargo test` (9 tests
+across all of `ebpf-probe/`: 6 exec + 3 network) and `cargo clippy` clean
+on all 4 crates (2 userspace + 2 kernel, the latter with their own
+target/toolchain).
 
-**SAST intégré** : `cargo-audit` installé (persisté dans le volume
-`warden-cargo-home`), `scripts/check-updates.sh` écrit et testé de bout
-en bout - vérifie la correspondance LLVM/nightly (voir plus haut) ET lance
-`cargo audit` sur les deux workspaces (le principal ET `ebpf-probe/`).
-Résultat actuel : **0 vulnérabilité connue**, toolchain eBPF toujours
-aligné (LLVM 23/LLVM 23). À relancer périodiquement, surtout après tout
-`cargo update` ou changement de toolchain.
+**SAST integrated**: `cargo-audit` installed (persisted in the
+`warden-cargo-home` volume), `scripts/check-updates.sh` written and
+tested end-to-end — checks the LLVM/nightly match (see above) AND runs
+`cargo audit` on both workspaces (the main one AND `ebpf-probe/`).
+Current result: **0 known vulnerabilities**, eBPF toolchain still aligned
+(LLVM 23/LLVM 23). To be re-run periodically, especially after any
+`cargo update` or toolchain change.
 
-## Module privesc — fait, mais PAS en fanotify (limitation kernel réelle, pas un choix)
+## Privesc module — done, but NOT via fanotify (a real kernel limitation, not a choice)
 
-Nouveau crate `warden-privesc` (dans le workspace principal, pas
-`ebpf-probe/` - pas besoin d'eBPF pour celui-ci). Détecte l'apparition
-d'un bit setuid/setgid : sur un binaire système déjà connu (technique
-GTFOBins, ex. `chmod +s /usr/bin/find`) → le bit est retiré (Enforce),
-le binaire n'est jamais supprimé ; sur un fichier tout nouveau dans
-`/tmp`, `/var/tmp`, `/dev/shm` ou `$HOME` (ex. copie de bash + `chmod +s`)
-→ mis en quarantaine comme les autres modules "nouveau fichier".
+New `warden-privesc` crate (in the main workspace, not `ebpf-probe/` — no
+eBPF needed for this one). Detects the appearance of a setuid/setgid bit:
+on an already-known system binary (GTFOBins technique, e.g. `chmod +s
+/usr/bin/find`) → the bit is stripped (Enforce), the binary is never
+deleted; on a brand-new file in `/tmp`, `/var/tmp`, `/dev/shm` or `$HOME`
+(e.g. a copy of bash + `chmod +s`) → quarantined like the other
+"new file" modules.
 
-**Tentative fanotify abandonnée après un vrai test, pas une supposition** :
-`FAN_ATTRIB` échoue systématiquement avec `EINVAL`, quel que soit le scope
-du mark (filesystem-wide OU un simple dossier non-récursif) - confirmé en
-isolant le test (`FAN_MODIFY` marche en contrôle, `FAN_ATTRIB` échoue
-systématiquement, y compris combiné à `FAN_EVENT_ON_CHILD`/`FAN_ONDIR`).
-Raison : `FAN_ATTRIB` fait partie des "directory entry events" du kernel
-qui nécessitent que le groupe fanotify soit initialisé avec
-`FAN_REPORT_FID` - un flag que les bindings `nix` 0.31.3 n'exposent PAS
-dans `InitFlags` (vérifié dans le source de la crate). Contourner ça
-demanderait soit des appels syscall bruts (et `nix` ne sait de toute façon
-pas parser le format d'event FID différent que ça produirait), soit un
-hook eBPF sur la famille de syscalls `chmod`. Les deux sont plus lourds
-que ce qu'une surface privesc (pas aussi time-critique qu'un ransomware
-actif ou un exec/connexion en direct) justifie pour une première version.
+**fanotify attempt abandoned after a real test, not a guess**:
+`FAN_ATTRIB` systematically fails with `EINVAL`, regardless of mark scope
+(filesystem-wide OR a simple non-recursive folder) — confirmed by
+isolating the test (`FAN_MODIFY` works as a control, `FAN_ATTRIB` fails
+consistently, including combined with
+`FAN_EVENT_ON_CHILD`/`FAN_ONDIR`). Reason: `FAN_ATTRIB` is part of the
+kernel's "directory entry events" which require the fanotify group to be
+initialized with `FAN_REPORT_FID` — a flag that the `nix` 0.31.3
+bindings do NOT expose in `InitFlags` (verified in the crate's source).
+Working around this would require either raw syscalls (and `nix` can't
+parse the different FID event format that would produce anyway), or an
+eBPF hook on the `chmod` syscall family. Both are heavier than what a
+privesc surface (not as time-critical as an active ransomware or a live
+exec/connection) justifies for a first version.
 
-**Solution retenue : polling toutes les 5 secondes.** Plus simple, correct,
-sans acrobaties sur les syscalls. Modèle d'état à deux ensembles :
-`baseline` (immuable, établi une fois au démarrage - tout ce qui est déjà
-setuid/setgid à ce moment-là est présumé légitime pour toujours) et
-`already_flagged` (mutable, évite de re-notifier à chaque tick de 5s pour
-une même anomalie non résolue, réinitialisé dès que le fichier disparaît
-du scan - une vraie ré-infection après remédiation redevient un incident
-neuf).
+**Solution adopted: polling every 5 seconds.** Simpler, correct, no
+syscall acrobatics. Two-set state model: `baseline` (immutable,
+established once at startup — everything already setuid/setgid at that
+moment is presumed legitimate forever) and `already_flagged` (mutable,
+avoids re-notifying on every 5s tick for the same unresolved anomaly,
+reset as soon as the file disappears from the scan — a genuine
+re-infection after remediation becomes a fresh incident again).
 
-**Bug réel trouvé et corrigé en testant** : `/bin` et `/sbin` sont des
-symlinks vers `/usr/bin`/`/usr/sbin` sur toute distro usr-merge (la
-plupart des distros modernes). Sans déduplication, le même fichier
-physique était scanné deux fois sous deux chemins différents,
-produisant deux détections pour un seul `chmod +s` (`/usr/bin/find` ET
-`/bin/find` flagués séparément, vu en pratique). Corrigé en canonicalisant
-et dédupliquant les dossiers de watch avant le scan (`known_suid_sgid`
-est passé de 22 à 11 après le fix - preuve que le doublon existait bel et
-bien, pas juste une hypothèse).
+**Real bug found and fixed through testing**: `/bin` and `/sbin` are
+symlinks to `/usr/bin`/`/usr/sbin` on any usr-merge distro (most modern
+distros). Without deduplication, the same physical file was scanned
+twice under two different paths, producing two detections for a single
+`chmod +s` (`/usr/bin/find` AND `/bin/find` flagged separately, observed
+in practice). Fixed by canonicalizing and deduplicating watch folders
+before the scan (`known_suid_sgid` went from 22 to 11 after the fix —
+proof the duplicate genuinely existed, not just a hypothesis).
 
-**Testé en conditions réelles** (conteneur `--privileged`, `mode=enforce`) :
-- Binaire déjà setuid au démarrage (`/usr/bin/passwd`) re-touché →
-  jamais flagué (baseline).
-- Binaire système gagnant le bit pour la première fois
-  (`chmod +s /usr/bin/find`, technique GTFOBins) → détecté Critical, bit
-  retiré, binaire toujours présent et fonctionnel.
-- Nouveau fichier setuid dans `/tmp` (bash copié + `chmod +s`) → détecté
-  Critical, **mis en quarantaine** (jamais de kill pour ce module : le
-  polling ne fournit aucun PID, contrairement à fanotify), fichier
-  effectivement retiré de `/tmp`.
+**Tested under real conditions** (`--privileged` container,
+`mode=enforce`):
+- Binary already setuid at startup (`/usr/bin/passwd`) touched again →
+  never flagged (baseline).
+- System binary gaining the bit for the first time
+  (`chmod +s /usr/bin/find`, GTFOBins technique) → detected Critical, bit
+  stripped, binary still present and functional.
+- New setuid file in `/tmp` (bash copied + `chmod +s`) → detected
+  Critical, **quarantined** (never a kill for this module: polling
+  provides no PID, unlike fanotify), file actually removed from `/tmp`.
 
-**`warden-core/src/main.rs` refactorisé** : avec un 3ème module, dupliquer
-le pattern manuel "spawn + oneshot ready + branche `select!`" par module
-devenait source d'erreurs (exactement le genre de bug que je viens de
-corriger dans la logique privesc elle-même). Remplacé par un superviseur
-générique basé sur `tokio::task::JoinSet<(&'static str, Result<()>)>` +
-une fonction `spawn_module` réutilisable - le nom du module transite dans
-la valeur de retour de la tâche elle-même, donc `JoinSet::join_next`
-identifie directement quel module vient de se terminer sans table de
-correspondance séparée à tenir à jour.
+**`warden-core/src/main.rs` refactored**: with a 3rd module, duplicating
+the manual "spawn + oneshot ready + `select!` branch" pattern per module
+was becoming a source of errors (exactly the kind of bug just fixed in
+the privesc logic itself). Replaced with a generic supervisor based on
+`tokio::task::JoinSet<(&'static str, Result<()>)>` + a reusable
+`spawn_module` function — the module name travels in the task's own
+return value, so `JoinSet::join_next` directly identifies which module
+just finished without a separate lookup table to maintain.
 
-## Module YARA — fait et validé
+## YARA module — done and validated
 
-Nouveau crate `warden-yara` (workspace principal), même pattern fanotify
-que ransomware (`FAN_CLOSE_WRITE`, mount-dedup, filtrage userspace) mais
-scanne le fichier fermé avec `yara-x` (réimplémentation pure Rust de YARA,
-compile les conditions de règles en WASM exécuté via `wasmtime` en interne
-- pas quelque chose qu'on pilote directement) au lieu de calculer
-l'entropie. Watch dirs par défaut : `Downloads`, `Desktop`, `Documents`
-sous `$HOME`, + `/tmp`. Jamais de kill (contrairement à ransomware) : le
-process qui a fermé le fichier (navigateur, `curl`, gestionnaire de
-téléchargement) n'a fait qu'écrire le contenu, il ne l'exécute pas -
-`response::handle_file_only_detection` (quarantine seule) suffit et évite
-de tuer un programme par ailleurs parfaitement légitime.
+New `warden-yara` crate (main workspace), same fanotify pattern as
+ransomware (`FAN_CLOSE_WRITE`, mount-dedup, userspace filtering) but
+scans the closed file with `yara-x` (a pure-Rust reimplementation of
+YARA, compiles rule conditions to WASM executed internally via
+`wasmtime` — not something you drive directly) instead of computing
+entropy. Default watch dirs: `Downloads`, `Desktop`, `Documents` under
+`$HOME`, plus `/tmp`. Never a kill (unlike ransomware): the process that
+closed the file (browser, `curl`, download manager) only wrote the
+content, it doesn't execute it — `response::handle_file_only_detection`
+(quarantine only) is enough and avoids killing an otherwise perfectly
+legitimate program.
 
-**Règles intégrées** (`warden-yara/rules/builtin.yar`, testées
-individuellement contre des échantillons réalistes avant intégration, pas
-juste écrites à l'aveugle) : fichier de test EICAR (le standard de
-l'industrie AV, inoffensif par design), reverse shell bash
-(`/dev/tcp`+`exec`), reverse shell netcat (`-e`), reverse shell Python
-(`socket`+`dup2`+`pty.spawn`), webshell PHP obfusqué
-(`eval`/`system`+`base64_decode`+`$_POST`), pipe base64→shell. Extensible
-via `/etc/warden/yara-rules/*.yar` (custom_rules_dir configurable),
-compilés en plus du set intégré au démarrage.
+**Built-in rules** (`warden-yara/rules/builtin.yar`, tested individually
+against realistic samples before integration, not just written blind):
+EICAR test file (the AV industry standard, harmless by design), bash
+reverse shell (`/dev/tcp`+`exec`), netcat reverse shell (`-e`), Python
+reverse shell (`socket`+`dup2`+`pty.spawn`), obfuscated PHP webshell
+(`eval`/`system`+`base64_decode`+`$_POST`), base64→shell pipe.
+Extensible via `/etc/warden/yara-rules/*.yar` (configurable
+`custom_rules_dir`), compiled in addition to the built-in set at
+startup.
 
-**Dépendances allégées, un vrai souci trouvé et corrigé** : les features
-par défaut de `yara-x` tirent les modules PE/Mach-O/.NET/DEX/CRX/LNK
-(parsers de formats binaires Windows/macOS/Android) et leur crypto
-associée (RSA, X.509, ECDSA, DSA) - rien de pertinent pour un EDR
-workstation Linux dont les règles ne référencent que du texte/regex.
-Compilé avec `default-features = false` + seulement
-`constant-folding, exact-atoms, fast-regexp, generate-proto-code,
-elf-module, string-module, hash-module, math-module, time-module` -
-confirmé par test que ça retire bien `rsa`/`x509-parser`/`ecdsa`/`dsa`/
-`zip`/`uuid`/`roxmltree` de l'arbre de dépendances sans casser la
-compilation ni les règles. `wasmtime` reste : ce n'est pas un module
-optionnel, c'est le moteur d'exécution central de yara-x pour TOUTE
-condition de règle, impossible à retirer.
+**Lighter dependencies, a real issue found and fixed**: `yara-x`'s
+default features pull in the PE/Mach-O/.NET/DEX/CRX/LNK modules
+(Windows/macOS/Android binary format parsers) and their associated
+crypto (RSA, X.509, ECDSA, DSA) — none of it relevant to a Linux
+workstation EDR whose rules only reference text/regex. Compiled with
+`default-features = false` + only `constant-folding, exact-atoms,
+fast-regexp, generate-proto-code, elf-module, string-module,
+hash-module, math-module, time-module` — confirmed by testing that this
+does remove `rsa`/`x509-parser`/`ecdsa`/`dsa`/`zip`/`uuid`/`roxmltree`
+from the dependency tree without breaking the build or the rules.
+`wasmtime` stays: it's not an optional module, it's yara-x's central
+execution engine for EVERY rule condition, impossible to remove.
 
-**Finding SAST réel traité, pas juste ignoré** : `cargo audit` a remonté
-`RUSTSEC-2026-0222` (wasmtime "Stores can mix up type indices between
-engines", CVSS 3.8 bas, `AV:L/AC:H/PR:H/UI:R` - accès local, complexité
-et privilèges élevés ET interaction utilisateur requis) tiré
-transitivement par `yara-x` 1.19.0 (déjà la dernière version disponible,
-pas de fix à obtenir en bumpant). Le bug ne se manifeste que si
-l'application mélange plusieurs instances `wasmtime::Engine` - yara-x
-n'en utilise qu'une en interne, donc pas atteignable via notre usage.
-Décision documentée (pas un silence) dans `.cargo/audit.toml` avec le
-raisonnement complet et un rappel de réévaluer dès qu'une nouvelle
-version de `yara-x` sort. Un warning "unmaintained" séparé sur `bincode`
-(transitif via wasmtime aussi) reste affiché mais ne fait pas échouer le
-check (politique par défaut de `cargo audit` pour les advisories de type
-"warning").
+**Real SAST finding addressed, not just ignored**: `cargo audit`
+flagged `RUSTSEC-2026-0222` (wasmtime "Stores can mix up type indices
+between engines", low CVSS 3.8, `AV:L/AC:H/PR:H/UI:R` — local access,
+high complexity and privileges AND user interaction required) pulled
+transitively by `yara-x` 1.19.0 (already the latest available version,
+no fix to get by bumping). The bug only manifests if the application
+mixes several `wasmtime::Engine` instances — yara-x only uses one
+internally, so it's not reachable through our usage. Decision documented
+(not silence) in `.cargo/audit.toml` with the full reasoning and a
+reminder to re-evaluate as soon as a new `yara-x` version ships. A
+separate "unmaintained" warning on `bincode` (also transitive via
+wasmtime) is still shown but doesn't fail the check (`cargo audit`'s
+default policy for "warning"-type advisories).
 
-**Testé en conditions réelles** (conteneur, `mode=enforce`) : fichier
-EICAR déposé dans `Downloads` → détecté (`Eicar_Test_File`), quarantiné,
-retiré du dossier. Script reverse-shell bash déposé → détecté
-(`Bash_Dev_Tcp_Reverse_Shell`), quarantiné. Fichier texte ordinaire →
-jamais touché. Confirmé aussi que plusieurs modules fanotify indépendants
-(ransomware ET yara, groupes fanotify séparés) peuvent surveiller le même
-mount avec des masques d'events différents sans conflit - le honeypot de
-ransomware (`.warden_canary`) reste intact et non perturbé par le module
-yara tournant en parallèle sur le même dossier.
+**Tested under real conditions** (container, `mode=enforce`): EICAR file
+dropped in `Downloads` → detected (`Eicar_Test_File`), quarantined,
+removed from the folder. Bash reverse-shell script dropped → detected
+(`Bash_Dev_Tcp_Reverse_Shell`), quarantined. Ordinary text file → never
+touched. Also confirmed that several independent fanotify modules
+(ransomware AND yara, separate fanotify groups) can watch the same mount
+with different event masks without conflict — the ransomware honeypot
+(`.warden_canary`) stays intact and undisturbed by the yara module
+running in parallel on the same folder.
 
-## Règle absolue de workflow
+## Absolute workflow rule
 
-**Rien ne compile ni ne s'exécute jamais sur l'hôte.** Le code est écrit et
-édité ici, dans `/home/user/warden`, mais :
-- **build** → uniquement dans le conteneur `warden-build:rockylinux`
-- **run/test** → uniquement dans les conteneurs de test par distro
+**Nothing ever compiles or runs on the host.** The code is written and
+edited here, in `/home/user/warden`, but:
+- **build** → only inside the `warden-build:rockylinux` container
+- **run/test** → only inside the per-distro test containers
 
-Commande de build de référence (3 volumes persistants à toujours monter
-ensemble pour ne pas perdre rustup/clippy/le registry cargo entre les
-runs) :
+Reference build command (3 persistent volumes to always mount together
+so rustup/clippy/the cargo registry aren't lost between runs):
 ```
 docker run --rm -v /home/user/warden:/build \
   -v warden-cargo-registry:/usr/local/cargo/registry \
@@ -210,1621 +203,1591 @@ docker run --rm -v /home/user/warden:/build \
   -v warden-rustup-home:/usr/local/rustup \
   -w /build warden-build:rockylinux cargo build --release
 ```
-Clippy (une fois par volume neuf) : `rustup component add clippy` puis
+Clippy (once per fresh volume): `rustup component add clippy` then
 `cargo clippy --release --all-targets`.
 
-## Architecture générale
+## General architecture
 
-Workspace Cargo principal à 6 crates (plus le workspace séparé
-`ebpf-probe/` pour les modules exec/network, voir plus bas) :
-- `warden-common` — types partagés (`DetectionEvent`, `Severity`, `Mode`),
-  et les briques réutilisables par tout module de détection :
+Main Cargo workspace with 6 crates (plus the separate `ebpf-probe/`
+workspace for the exec/network modules, see below):
+- `warden-common` — shared types (`DetectionEvent`, `Severity`, `Mode`),
+  and the reusable building blocks for every detection module:
   `process::stop_then_kill`, `quarantine::Quarantine`,
-  `permissions::strip_setuid_setgid`, `heuristics` (localisations
-  suspectes, partagé entre plusieurs modules), `target::resolve` (résolution
-  de l'utilisateur cible), `response::handle_detection` (réponse avec PID,
-  kill+quarantine), `response::handle_file_only_detection` (réponse SANS
-  PID, quarantine seule — voir point 6 ci-dessous), `notify::Notifier`.
-- `warden-ransomware` — détection ransomware par fanotify, porté et adapté
-  de RansomShield (`/home/user/ransomshield`, projet séparé, jamais modifié
-  par Warden).
-- `warden-persistence` — détection de persistance par inotify (bashrc,
-  cron, autostart XDG, unités systemd, sudoers, authorized_keys,
-  ld.so.preload). Détails complets plus bas.
-- `warden-privesc` — détection SUID/SGID par polling (pas fanotify, voir
-  section dédiée plus haut pour pourquoi).
-- `warden-yara` — scan YARA (`yara-x`) des fichiers nouvellement écrits
-  dans Downloads/Desktop/Documents/tmp, par fanotify.
-- `warden-core` — binaire `warden` : config TOML, résolution de
-  l'utilisateur cible, orchestrateur multi-module (`tokio::task::JoinSet`),
-  dispatcher d'events.
+  `permissions::strip_setuid_setgid`, `heuristics` (suspicious
+  locations, shared across several modules), `target::resolve` (target
+  user resolution), `response::handle_detection` (response with a PID,
+  kill+quarantine), `response::handle_file_only_detection` (response
+  WITHOUT a PID, quarantine only — see point 6 below),
+  `notify::Notifier`.
+- `warden-ransomware` — fanotify-based ransomware detection, ported and
+  adapted from RansomShield (`/home/user/ransomshield`, a separate
+  project, never modified by Warden).
+- `warden-persistence` — inotify-based persistence detection (bashrc,
+  cron, XDG autostart, systemd units, sudoers, authorized_keys,
+  ld.so.preload). Full details below.
+- `warden-privesc` — SUID/SGID detection via polling (not fanotify, see
+  the dedicated section above for why).
+- `warden-yara` — YARA scan (`yara-x`) of files newly written to
+  Downloads/Desktop/Documents/tmp, via fanotify.
+- `warden-core` — the `warden` binary: TOML config, target-user
+  resolution, multi-module orchestrator (`tokio::task::JoinSet`), event
+  dispatcher.
 
-### Décisions d'architecture importantes (et pourquoi)
+### Important architecture decisions (and why)
 
-1. **Réponse synchrone dans le module détecteur, jamais via le channel
-   async.** Un module qui a besoin d'agir vite (tuer un process, mettre en
-   quarantaine) le fait directement dans son propre thread bloquant, puis
-   construit un `DetectionEvent` envoyé au dispatcher *seulement* pour
-   log/notif/historique futur. Un design où le module "proposerait" une
-   action exécutée plus tard par le dispatcher via channel async a été
-   rejeté : latence inacceptable face à une menace active.
+1. **Synchronous response inside the detector module, never through the
+   async channel.** A module that needs to act fast (kill a process,
+   quarantine) does so directly on its own blocking thread, then builds
+   a `DetectionEvent` sent to the dispatcher *only* for future
+   log/notification/history purposes. A design where the module would
+   "propose" an action executed later by the dispatcher via an async
+   channel was rejected: unacceptable latency against an active threat.
 
-2. **fanotify (ransomware) marque tout le mount, filtré en userspace.**
-   `$HOME` d'une workstation est presque toujours sur la partition racine,
-   donc `FAN_MARK_FILESYSTEM` watche tout `/`. On filtre en userspace
-   (`fanotify_monitor::is_under_watch_dirs`) pour ne traiter que les events
-   sous les dossiers réellement configurés (canonicalisés, `~` expansé
-   manuellement puisque TOML n'est pas un shell).
+2. **fanotify (ransomware) marks the whole mount, filtered in
+   userspace.** A workstation's `$HOME` is almost always on the root
+   partition, so `FAN_MARK_FILESYSTEM` watches all of `/`. Filtered in
+   userspace (`fanotify_monitor::is_under_watch_dirs`) to only process
+   events under the folders actually configured (canonicalized, `~`
+   expanded manually since TOML isn't a shell).
 
-3. **inotify (persistence) watche des DOSSIERS, jamais des fichiers
-   directement.** De nombreux éditeurs sauvegardent en écrivant un fichier
-   temporaire puis en le renommant à la place de l'original — ça remplace
-   l'inode et invaliderait silencieusement un watch posé sur le fichier
-   lui-même. On watche systématiquement le dossier parent (`$HOME`,
-   `~/.ssh`, `/etc`, `/etc/cron.d`, etc.) et on filtre par nom de fichier
-   côté userspace, exactement le même principe que le filtrage fanotify.
+3. **inotify (persistence) watches DIRECTORIES, never files directly.**
+   Many editors save by writing a temporary file then renaming it over
+   the original — that replaces the inode and would silently invalidate
+   a watch placed on the file itself. The parent directory is always
+   watched (`$HOME`, `~/.ssh`, `/etc`, `/etc/cron.d`, etc.) and filtered
+   by filename on the userspace side, the exact same principle as
+   fanotify filtering.
 
-4. **Notification desktop : jamais de connexion D-Bus directe depuis le
-   démon root.** dbus-daemon refuse par construction qu'un uid étranger
-   au bus de session complète le `Hello` (confirmé sur vraie VM, voir la
-   section dédiée plus bas) - donc `Notifier` spawn un binaire séparé,
-   `warden-notify-helper`, avec privilèges tombés à l'uid/gid de
-   l'utilisateur cible (`Command::uid()/gid()`), qui lui seul se connecte
-   au bus (`unix:path=/run/user/<uid>/bus`) et communique avec le démon
-   parent en JSON sur stdin/stdout. Validé end-to-end sur VM réelle.
+4. **Desktop notification: never a direct D-Bus connection from the
+   root daemon.** dbus-daemon refuses by design to let a foreign uid
+   complete the `Hello` on the session bus (confirmed on a real VM, see
+   the dedicated section below) — so `Notifier` spawns a separate
+   binary, `warden-notify-helper`, with privileges dropped to the target
+   user's uid/gid (`Command::uid()/gid()`), which alone connects to the
+   bus (`unix:path=/run/user/<uid>/bus`) and talks to the parent daemon
+   in JSON over stdin/stdout. Validated end-to-end on a real VM.
 
-5. **`target_user` explicite en config, pas d'auto-détection.** Root n'a
-   pas de `$HOME` personnel à protéger. Résolu via
+5. **`target_user` explicit in config, no auto-detection.** Root has no
+   personal `$HOME` to protect. Resolved via
    `nix::unistd::User::from_name` → uid + home dir.
 
-6. **Persistence n'a JAMAIS de PID et ne tue donc jamais de process.**
-   Contrairement à fanotify, inotify ne rapporte pas le PID de l'auteur
-   d'un changement. `warden_common::response::handle_file_only_detection`
-   existe spécifiquement pour ça : jamais d'appel à `stop_then_kill`.
-   Piège explicitement évité : passer un PID factice comme `0` à un chemin
-   qui tue des process aurait envoyé le signal à *tout le groupe de
-   process appelant* (sémantique POSIX de `kill(0, sig)`) — potentiellement
-   Warden lui-même. Le champ `pid` de `DetectionEvent` est un `Option<i32>`
-   précisément pour ça (pas de sentinelle `0`/`-1` ambiguë dans les types
-   partagés ; `-1` n'apparaît que comme valeur opaque dans le nom de
-   fichier de quarantaine, jamais passé à un signal).
+6. **Persistence NEVER has a PID and therefore never kills a process.**
+   Unlike fanotify, inotify doesn't report the PID of the author of a
+   change. `warden_common::response::handle_file_only_detection` exists
+   specifically for this: never a call to `stop_then_kill`. Trap
+   explicitly avoided: passing a fake `0` PID to a process-killing code
+   path would have sent the signal to the *entire calling process
+   group* (POSIX semantics of `kill(0, sig)`) — potentially Warden
+   itself. `DetectionEvent`'s `pid` field is an `Option<i32>` precisely
+   for this (no ambiguous `0`/`-1` sentinel in the shared types; `-1`
+   only appears as an opaque value in the quarantine file name, never
+   passed to a signal).
 
-7. **Persistence distingue `Dotfile` (report-only, toujours) de `UnitDir`
-   (quarantinable si nouveau fichier, en mode Enforce).** Éditer
-   `~/.bashrc`/`authorized_keys`/`/etc/sudoers` en place n'est jamais
-   automatiquement annulé (risque de casser une vraie modification
-   utilisateur, et pour sudoers : un revert raté peut verrouiller tous les
-   admins hors de sudo). Un *nouveau* fichier apparaissant dans un
-   `UnitDir` (cron.d, sudoers.d, autostart, unités systemd) est en
-   revanche sûr à mettre en quarantaine tel quel : rien de légitime n'y
-   stocke de vrai travail, le fichier EST le mécanisme de persistance ou
-   il ne l'est pas.
+7. **Persistence distinguishes `Dotfile` (report-only, always) from
+   `UnitDir` (quarantinable if a new file, in Enforce mode).** Editing
+   `~/.bashrc`/`authorized_keys`/`/etc/sudoers` in place is never
+   auto-reverted (risk of breaking a genuine user change, and for
+   sudoers: a botched revert can lock all admins out of sudo). A *new*
+   file appearing in a `UnitDir` (cron.d, sudoers.d, autostart, systemd
+   units) is, on the other hand, safe to quarantine as-is: nothing
+   legitimate stores real work there, the file EITHER IS the
+   persistence mechanism or it isn't.
 
-8. **Capacités systemd : `CAP_SYS_ADMIN`, `CAP_KILL`, `CAP_DAC_OVERRIDE`.**
-   Le troisième a été ajouté après un vrai bug trouvé en testant en
-   conteneur : `$HOME` est en `0700` par défaut (`useradd -m`), et sans
-   `CAP_DAC_OVERRIDE`, même root reçoit `EACCES`. Ne pas retirer cette
-   capability sans re-tester contre un `$HOME` en 0700.
+8. **systemd capabilities: `CAP_SYS_ADMIN`, `CAP_KILL`,
+   `CAP_DAC_OVERRIDE`.** The third was added after a real bug found
+   while testing in a container: `$HOME` is `0700` by default
+   (`useradd -m`), and without `CAP_DAC_OVERRIDE`, even root gets
+   `EACCES`. Don't remove this capability without re-testing against a
+   `0700` `$HOME`.
 
-## Bugs réels trouvés et corrigés en testant (pas juste écrits puis oubliés)
+## Real bugs found and fixed through testing (not just written then forgotten)
 
-- **`CAP_DAC_OVERRIDE` manquante** → root ne pouvait pas lire un `$HOME` en
-  0700 (mode par défaut de `useradd -m` sur toute distro). Trouvé en
-  testant dans un conteneur Debian réel, pas en relisant le code.
-- **Duplication de détections persistence** : une seule opération d'écriture
-  (`printf ... > f`) déclenche plusieurs events inotify (IN_CREATE puis
-  IN_MODIFY/IN_CLOSE_WRITE) souvent regroupés dans le même batch
-  `read_events()`. Traiter chaque event indépendamment produisait deux
-  détections différentes (contenu partiel puis complet) pour un seul
-  changement ressenti par l'utilisateur. Corrigé par dédoublonnage par
-  chemin au sein d'un même batch (`seen_this_batch`), en relisant toujours
-  le contenu final sur disque au moment du traitement.
-- **Faux-négatif de sécurité en mode Enforce (le plus sérieux)** : le tout
-  premier event pour un nouveau fichier (IN_CREATE, fichier encore vide à
-  0 octet car le contenu n'a pas encore été flush par l'écrivain) était
-  traité, produisait un diff vide, et **committait quand même une entrée
-  baseline vide** avant de passer au event suivant. Ça marquait
-  silencieusement le chemin comme "déjà connu", donc l'event suivant
-  (contenu réel complet) était traité comme une *édition* d'un fichier
-  préexistant plutôt que sa vraie première apparition — pour un `UnitDir`,
-  ça faisait sauter la quarantaine automatique en Enforce. Reproduit de
-  façon fiable (fichier autostart malveillant jamais mis en quarantaine),
-  corrigé en ne committant la baseline pour un chemin encore inconnu que
-  si le contenu lu est non-vide. Revalidé par test après le fix : le même
-  scénario met désormais correctement le fichier en quarantaine.
+- **Missing `CAP_DAC_OVERRIDE`** → root couldn't read a `0700` `$HOME`
+  (the default mode of `useradd -m` on any distro). Found by testing in
+  a real Debian container, not by re-reading code.
+- **Duplicate persistence detections**: a single write operation
+  (`printf ... > f`) triggers several inotify events (IN_CREATE then
+  IN_MODIFY/IN_CLOSE_WRITE) often batched together in the same
+  `read_events()` call. Processing each event independently produced
+  two different detections (partial then full content) for a single
+  change as experienced by the user. Fixed by deduplicating by path
+  within a single batch (`seen_this_batch`), always re-reading the final
+  on-disk content at processing time.
+- **Security false negative in Enforce mode (the most serious one)**:
+  the very first event for a new file (IN_CREATE, file still 0 bytes
+  since the content hasn't been flushed by the writer yet) was
+  processed, produced an empty diff, and **still committed an empty
+  baseline entry** before moving to the next event. This silently marked
+  the path as "already known", so the next event (the real, full
+  content) was treated as an *edit* of a pre-existing file rather than
+  its true first appearance — for a `UnitDir`, that skipped automatic
+  quarantine in Enforce. Reliably reproduced (malicious autostart file
+  never quarantined), fixed by only committing the baseline for a still
+  unknown path if the content read is non-empty. Re-validated by testing
+  after the fix: the same scenario now correctly quarantines the file.
 
-## Ce qui est fait et validé par test (pas juste écrit)
+## What's done and validated by testing (not just written)
 
-Testé dans `docker/Dockerfile.test.debian` (conteneur Debian, utilisateur
-`tester` avec `$HOME` en 0700, binaire lancé directement avec
-`--cap-add SYS_ADMIN --cap-add KILL --cap-add DAC_OVERRIDE --cap-drop ALL`) :
+Tested in `docker/Dockerfile.test.debian` (Debian container, `tester`
+user with `$HOME` at 0700, binary launched directly with `--cap-add
+SYS_ADMIN --cap-add KILL --cap-add DAC_OVERRIDE --cap-drop ALL`):
 
-**Ransomware :**
-- Mode Monitor : rafale de 5 fichiers haute-entropie par un seul process
-  (Perl, un seul PID — un test avec `head` en boucle bash avait d'abord
-  donné un faux négatif car chaque `head` est un PID différent, confirmant
-  que le tracking per-PID marche comme prévu) → détection, event au
-  dispatcher, notif desktop échoue proprement (pas de session graphique).
-- Mode Enforce : process attaquant simulé tué après exactement 5 fichiers
-  sur 20 prévus (exit code 137), 5 fichiers quarantainés + manifest JSONL.
-- Re-testé après l'ajout du module persistence (non-régression) : toujours
+**Ransomware:**
+- Monitor mode: burst of 5 high-entropy files by a single process (Perl,
+  a single PID — a test with `head` in a bash loop had first given a
+  false negative because each `head` is a different PID, confirming
+  per-PID tracking works as intended) → detection, event to the
+  dispatcher, desktop notification fails cleanly (no graphical session).
+- Enforce mode: simulated attacker process killed after exactly 5 files
+  out of 20 planned (exit code 137), 5 files quarantined + JSONL
+  manifest.
+- Re-tested after adding the persistence module (non-regression): still
   OK.
 
-**Persistence :**
-- `.bashrc` : injection de ligne `curl | bash` → détectée High, jamais
-  quarantainée (Dotfile), même en Enforce.
-- `authorized_keys` : ajout de clé SSH inconnue → détectée High,
-  report-only.
-- `/etc/ld.so.preload` : apparition → détectée High, report-only.
-- `/etc/cron.d/*` nouveau fichier (y compris rafale de 5 fichiers
-  simultanés) → détecté, quarantainé en Enforce.
-- `~/.config/autostart/*.desktop` nouveau, `Exec=` pointant vers `/tmp/` →
-  détecté High (motif "chemin d'exécution suspect"), quarantainé en
+**Persistence:**
+- `.bashrc`: `curl | bash` line injection → detected High, never
+  quarantined (Dotfile), even in Enforce.
+- `authorized_keys`: unknown SSH key added → detected High, report-only.
+- `/etc/ld.so.preload`: appearance → detected High, report-only.
+- `/etc/cron.d/*` new file (including a burst of 5 simultaneous files) →
+  detected, quarantined in Enforce.
+- `~/.config/autostart/*.desktop` new, `Exec=` pointing to `/tmp/` →
+  detected High ("suspicious execution path" pattern), quarantined in
   Enforce.
-- `~/.config/systemd/user/*.service` nouveau avec `ExecStart=curl|bash` →
-  détecté High, quarantainé en Enforce.
-- `/etc/sudoers.d/*` nouveau fichier → détecté Critical, quarantainé en
-  Enforce (seulement si le dossier existe déjà au démarrage - voir gaps).
-- Édition anodine (`alias gs="git status"`) → détectée Medium générique,
-  pas de faux "High".
+- `~/.config/systemd/user/*.service` new with `ExecStart=curl|bash` →
+  detected High, quarantined in Enforce.
+- `/etc/sudoers.d/*` new file → detected Critical, quarantined in
+  Enforce (only if the folder already exists at startup — see gaps).
+- Innocuous edit (`alias gs="git status"`) → detected generic Medium, no
+  false "High".
 
-`cargo test` (10 tests unitaires : 3 entropy + 4 heuristics persistence + 3
-diff persistence) : OK. `cargo clippy --all-targets` sur tout le workspace :
-propre, 0 warning après corrections.
+`cargo test` (10 unit tests: 3 entropy + 4 persistence heuristics + 3
+persistence diff): OK. `cargo clippy --all-targets` on the whole
+workspace: clean, 0 warnings after fixes.
 
-## Toolchain eBPF — validé de bout en bout (docker/Dockerfile.build-ebpf)
+## eBPF toolchain — validated end-to-end (docker/Dockerfile.build-ebpf)
 
-Le blocage initial était côté HÔTE uniquement (pas de rustup) ; aucun
-blocage réel dans un conteneur Docker dédié. Toolchain fonctionnel construit
-et **validé par un chargement réel dans le kernel**, pas juste compilé :
+The initial blocker was HOST-side only (no rustup); no real blocker
+inside a dedicated Docker container. Functional toolchain built and
+**validated by an actual kernel load**, not just compiled:
 
-- Base Debian bookworm, LLVM 23 installé via `apt.llvm.org` (script `llvm.sh
-  23`), rustup avec toolchain stable (pour `bpf-linker`) + nightly +
-  `rust-src` (pour compiler la cible `bpfel-unknown-none` via `-Z
-  build-std=core`), `cargo install bpf-linker --no-default-features
+- Debian bookworm base, LLVM 23 installed via `apt.llvm.org` (`llvm.sh
+  23` script), rustup with stable toolchain (for `bpf-linker`) +
+  nightly + `rust-src` (to compile the `bpfel-unknown-none` target via
+  `-Z build-std=core`), `cargo install bpf-linker --no-default-features
   --features llvm-23`.
-- **Piège découvert par test, pas évident à l'avance** : `bpf-linker` doit
-  être lié contre la MÊME version majeure de LLVM que celle embarquée dans
-  le rustc nightly actif (`rustup run nightly rustc --version --verbose` →
-  `LLVM version: 23.1.0`), sinon erreur cryptique `ERROR llvm: Invalid
-  record` au link. Comme les toolchains nightly changent de version LLVM
-  interne au fil du temps, **revérifier cette correspondance avant de
-  réutiliser cette image après une longue pause** (voir section
-  "Maintenance" plus bas).
-- **Piège Docker découvert par test** : ne jamais monter les volumes
-  `warden-cargo-home`/`warden-rustup-home` (ceux du conteneur RockyLinux
-  stable) sur le conteneur `warden-build:ebpf` — ça masque le nightly +
-  bpf-linker installés dans l'image avec un volume vide d'un autre
-  toolchain. Pour ce conteneur, monter uniquement `warden-cargo-registry`
-  (cache de paquets, sans rapport avec le toolchain, sans risque).
-- Crates : `aya` 0.14.0 / `aya-ebpf` 0.2.1 / `aya-build` 0.2.0 (gère la
-  compilation croisée de la crate eBPF via `build.rs`, voir
+- **Trap discovered by testing, not obvious upfront**: `bpf-linker` must
+  be linked against the SAME major LLVM version as the one embedded in
+  the active nightly rustc (`rustup run nightly rustc --version
+  --verbose` → `LLVM version: 23.1.0`), otherwise a cryptic `ERROR llvm:
+  Invalid record` at link time. Since nightly toolchains change their
+  internal LLVM version over time, **re-check this match before reusing
+  this image after a long pause** (see the "Maintenance" section
+  below).
+- **Docker trap discovered by testing**: never mount the
+  `warden-cargo-home`/`warden-rustup-home` volumes (the ones for the
+  stable RockyLinux container) onto the `warden-build:ebpf` container —
+  it masks the nightly + bpf-linker installed in the image with an
+  empty volume from a different toolchain. For this container, mount
+  only `warden-cargo-registry` (package cache, unrelated to the
+  toolchain, no risk).
+- Crates: `aya` 0.14.0 / `aya-ebpf` 0.2.1 / `aya-build` 0.2.0 (handles
+  cross-compilation of the eBPF crate via `build.rs`, see
   `ebpf-probe/warden-exec/build.rs`).
-- **`aya-log`/`aya-log-ebpf` (0.3.0/0.2.0) cassent le chargement** :
-  `BPF_PROG_LOAD` échoue avec `fd 10 is not pointing to valid bpf_map`
-  (vérifié par test, pas juste supposé). Contournement adopté pour la
-  probe de validation : pas de `aya-log`, une simple map `Array<u64>`
-  incrémentée côté kernel et lue en polling côté userspace. Marche
-  parfaitement. À creuser avant d'utiliser `aya-log` dans un vrai module
-  (bug de version, ou map créée dans le mauvais ordre - pas encore
-  diagnostiqué).
-## Module exec (`ebpf-probe/`) — implémenté et validé end-to-end
+- **`aya-log`/`aya-log-ebpf` (0.3.0/0.2.0) break loading**:
+  `BPF_PROG_LOAD` fails with `fd 10 is not pointing to valid bpf_map`
+  (verified by testing, not just assumed). Workaround adopted for the
+  validation probe: no `aya-log`, a simple `Array<u64>` map incremented
+  kernel-side and read via polling on the userspace side. Works
+  perfectly. To investigate before using `aya-log` in a real module
+  (version bug, or map created in the wrong order — not yet diagnosed).
 
-`ebpf-probe/` reste un **workspace séparé** de celui principal de warden
-(voir "Pourquoi `ebpf-probe/` reste un workspace séparé" plus bas pour la
-raison structurelle - ce n'est pas un oubli). Deux crates :
+## Exec module (`ebpf-probe/`) — implemented and validated end-to-end
 
-- `warden-exec-ebpf` (programme kernel) : tracepoint
-  `sched:sched_process_exec`, parse le champ `__data_loc filename` du
-  format tracepoint (vérifié via `/sys/kernel/tracing/events/sched/
-  sched_process_exec/format` - offset 8 = `__data_loc` du filename, offset
-  12 = pid) via `bpf_probe_read_kernel_str_bytes` (pas la variante
-  `bpf_probe_read_kernel_str`, dépréciée), pousse `{pid, filename}` dans
-  une `RingBuf`.
-- `warden-exec` (loader userspace) : charge/attache la probe, lit la
-  `RingBuf` en async via `tokio::io::unix::AsyncFd`, résout `target_user`
-  (config TOML partagée avec le `warden` principal - seuls `mode` et
-  `target_user` sont lus, le reste ignoré par serde), flague toute
-  exécution depuis un chemin suspect (`warden_common::heuristics`,
-  factorisé et réutilisé aussi par le module persistence) ou depuis
-  `~/Downloads` du `target_user`, puis appelle
-  `warden_common::response::handle_detection` (kill + quarantine du
-  binaire exécuté) - **contrairement à persistence, ce module A un PID
-  fiable** (fourni par le tracepoint), donc peut légitimement tuer le
-  process, pas juste observer.
+`ebpf-probe/` remains a **separate workspace** from Warden's main one
+(see "Why `ebpf-probe/` stays a separate workspace" below for the
+structural reason — not an oversight). Two crates:
 
-**Testé en conditions réelles**, pas juste compilé :
-- `cargo test -p warden-exec` : 6/6 (parsing d'event, détection de
-  chemin suspect).
-- `cargo clippy` propre sur les deux crates (le crate kernel avec son
-  toolchain/target propres : `rustup run nightly cargo clippy --target
-  bpfel-unknown-none -Z build-std=core`, sinon clippy tente de le
-  compiler pour l'hôte et échoue - "unwinding panics are not supported
-  without std", pas un vrai bug).
-- Chargé dans un vrai conteneur privilégié avec `/sys/kernel/debug` et
-  `/sys/kernel/tracing` montés : exécution d'un faux malware depuis
-  `/tmp` → tué + binaire quarantiné en quelques millisecondes ; exécutions
-  normales (`whoami`, `ls`, `cat`) jamais touchées.
-- **Piège de test découvert et documenté** : sans `--pid=host` sur le
-  conteneur de test, le kill échoue avec `ESRCH` - eBPF rapporte le PID
-  *global de l'hôte* (le kernel n'est pas namespace-aware pour les
-  tracepoints), alors que le process warden-exec tournant dans un
-  conteneur voit son PROPRE PID namespace. Sur un vrai déploiement
-  (systemd sur la machine hôte, sans conteneur), ce problème n'existe pas
-  puisqu'il n'y a qu'un seul PID namespace - mais tout test futur de ce
-  module doit utiliser `--pid=host` pour être représentatif.
+- `warden-exec-ebpf` (kernel program): `sched:sched_process_exec`
+  tracepoint, parses the `__data_loc filename` field of the tracepoint
+  format (verified via `/sys/kernel/tracing/events/sched/
+  sched_process_exec/format` — offset 8 = filename's `__data_loc`,
+  offset 12 = pid) via `bpf_probe_read_kernel_str_bytes` (not the
+  `bpf_probe_read_kernel_str` variant, deprecated), pushes
+  `{pid, filename}` into a `RingBuf`.
+- `warden-exec` (userspace loader): loads/attaches the probe, reads the
+  `RingBuf` asynchronously via `tokio::io::unix::AsyncFd`, resolves
+  `target_user` (TOML config shared with the main `warden` — only
+  `mode` and `target_user` are read, the rest ignored by serde), flags
+  any execution from a suspicious path (`warden_common::heuristics`,
+  factored out and also reused by the persistence module) or from the
+  `target_user`'s `~/Downloads`, then calls
+  `warden_common::response::handle_detection` (kill + quarantine of the
+  executed binary) — **unlike persistence, this module DOES have a
+  reliable PID** (provided by the tracepoint), so it can legitimately
+  kill the process, not just observe.
 
-**Capacités utilisées pour le test** : `--privileged` (large, pour aller
-vite). Pas encore réduit à l'ensemble minimal réel (`CAP_BPF` +
-`CAP_PERFMON` + `CAP_KILL` + accès tracefs probablement suffisant sur
-kernel 5.8+) - à déterminer avant d'écrire l'unit systemd de ce module.
+**Tested under real conditions**, not just compiled:
+- `cargo test -p warden-exec`: 6/6 (event parsing, suspicious-path
+  detection).
+- `cargo clippy` clean on both crates (the kernel crate with its own
+  toolchain/target: `rustup run nightly cargo clippy --target
+  bpfel-unknown-none -Z build-std=core`, otherwise clippy tries to
+  compile it for the host and fails — "unwinding panics are not
+  supported without std", not a real bug).
+- Loaded in a real privileged container with `/sys/kernel/debug` and
+  `/sys/kernel/tracing` mounted: executing a fake malware from `/tmp` →
+  killed + binary quarantined within milliseconds; normal executions
+  (`whoami`, `ls`, `cat`) never touched.
+- **Test trap discovered and documented**: without `--pid=host` on the
+  test container, the kill fails with `ESRCH` — eBPF reports the
+  *host-global* PID (the kernel isn't namespace-aware for tracepoints),
+  while the warden-exec process running in a container sees its OWN PID
+  namespace. On a real deployment (systemd on the host machine, no
+  container), this problem doesn't exist since there's only one PID
+  namespace — but any future testing of this module must use
+  `--pid=host` to be representative.
 
-**`aya-log` toujours cassé** (voir plus haut, `fd 10 is not pointing to
-valid bpf_map`) - non utilisé, pas nécessaire pour ce module qui pousse
-des données structurées via sa propre `RingBuf`, pas des logs texte.
+**Capabilities used for testing**: `--privileged` (broad, for speed).
+Not yet narrowed down to the real minimal set (`CAP_BPF` + `CAP_PERFMON`
++ `CAP_KILL` + tracefs access is probably enough on kernel 5.8+) — to be
+determined before writing this module's systemd unit.
 
-### Pourquoi `ebpf-probe/` reste un workspace séparé (pas un oubli)
+**`aya-log` still broken** (see above, `fd 10 is not pointing to valid
+bpf_map`) — not used, not needed for this module which pushes structured
+data via its own `RingBuf`, not text logs.
 
-`warden-exec-ebpf` est `#![no_std]` et ne peut être compilé QUE pour la
-cible `bpfel-unknown-none` via nightly + `-Z build-std=core` - le
-compiler pour la cible hôte (ce qu'un `cargo build --release` nu à la
-racine d'un workspace ferait pour TOUS ses membres) échoue purement et
-simplement. Si `warden-exec-ebpf`/`warden-exec` rejoignaient le workspace
-principal (celui de `warden-build:rockylinux`, toolchain stable
-uniquement, pas de nightly/bpf-linker), la commande de build habituelle
-`cargo build --release` casserait. `warden-exec` dépend bien de
-`warden-common` par chemin relatif (`../../warden-common`) et se compile
-très bien avec le toolchain stable de `warden-build:ebpf` (Debian
-bookworm a aussi un rustc stable normal) - seul le crate kernel a besoin
-du nightly, via le `build.rs` de `warden-exec` (`aya-build`) qui shell-out
-vers `rustup run nightly cargo build --target bpfel-unknown-none`,
-une invocation cargo totalement séparée qui ne pollue jamais la
-résolution du workspace principal.
+### Why `ebpf-probe/` stays a separate workspace (not an oversight)
 
-**Prochaine étape** : soit garder `warden-exec` comme binaire/service
-systemd autonome (notifie via son propre `Notifier`, pas de bus
-d'événements partagé avec `warden-core` pour l'instant - duplication
-mineure et acceptée pour l'instant), soit construire un bus d'événements
-local (socket Unix, JSON ligne par ligne) une fois que 2-3 modules eBPF
-de plus existent et que la duplication commence à peser - pas fait
-maintenant, noté comme refacto propre à venir.
+`warden-exec-ebpf` is `#![no_std]` and can ONLY be compiled for the
+`bpfel-unknown-none` target via nightly + `-Z build-std=core` —
+compiling it for the host target (which a bare `cargo build --release`
+at a workspace root would do for ALL its members) fails outright. If
+`warden-exec-ebpf`/`warden-exec` joined the main workspace (the one
+built by `warden-build:rockylinux`, stable toolchain only, no
+nightly/bpf-linker), the usual `cargo build --release` command would
+break. `warden-exec` does depend on `warden-common` via a relative path
+(`../../warden-common`) and compiles perfectly fine with
+`warden-build:ebpf`'s stable toolchain (Debian bookworm also has a
+normal stable rustc) — only the kernel crate needs nightly, via
+`warden-exec`'s `build.rs` (`aya-build`) which shells out to `rustup run
+nightly cargo build --target bpfel-unknown-none`, a completely separate
+cargo invocation that never pollutes the main workspace's resolution.
 
-## Maintenance et mises à jour (question posée par l'utilisateur, à traiter sérieusement)
+**Next step**: either keep `warden-exec` as a standalone binary/systemd
+service (notifies via its own `Notifier`, no shared event bus with
+`warden-core` for now — minor duplication accepted for the moment), or
+build a local event bus (Unix socket, line-delimited JSON) once 2-3 more
+eBPF modules exist and the duplication starts to weigh — not done now,
+noted as a clean refactor to come.
 
-Warden aura besoin d'un vrai cycle de maintenance, pas d'un build unique :
-- **Dépendances Rust** : `Cargo.lock` est committé exprès pour des builds
-  reproductibles ; toute mise à jour doit être délibérée (bump +
-  re-test complet sur la matrice de conteneurs), jamais un `cargo update`
-  aveugle sur un outil qui tourne en root. `aya` est encore pré-1.0 (0.14.x)
-  et casse son API entre versions mineures - étudier le changelog avant de
-  bumper.
-- **Pin LLVM/nightly pour le toolchain eBPF** : le plus fragile des deux
-  toolchains. Avant de reconstruire `warden-build:ebpf` après une longue
-  pause, revérifier `rustup run nightly rustc --version --verbose` contre
-  la version LLVM installée dans le Dockerfile - un nightly plus récent
-  peut embarquer une version LLVM différente et recasser `bpf-linker`.
-- **Tâche restant à faire** (demandée explicitement par l'utilisateur) :
-  un mécanisme simple pour vérifier rapidement "y a-t-il une mise à jour à
-  appliquer" et l'appliquer vite. Idée pas encore implémentée : un script
-  `scripts/check-updates.sh` qui lance `cargo outdated`/`cargo audit` sur
-  le workspace principal ET sur `ebpf-probe/`, et vérifie la correspondance
-  LLVM/nightly ci-dessus automatiquement (compare la version LLVM du
-  nightly actif à celle indiquée dans `Dockerfile.build-ebpf`). Pas encore
-  écrit - à faire.
-- Module privesc : **fait pour SUID/SGID** (voir plus haut, polling 5s -
-  fanotify `FAN_ATTRIB` s'est révélé impossible avec les bindings `nix`
-  actuels, pas juste "pas encore évalué"). Pas encore couvert :
-  capabilities Linux via `setcap` (`getcap`/`setcap` sur un binaire,
-  vecteur privesc équivalent au SUID mais orthogonal, même limitation
-  fanotify probable), transitions uid inattendues (nécessiterait eBPF,
-  voir le module exec pour le pattern à réutiliser).
-- Module réseau : **fait** (voir plus haut) - couvre les connexions TCP
-  sortantes (IPv4/IPv6) depuis un binaire en localisation suspecte. Pas
-  encore couvert : UDP, connexions entrantes/écoute (utile pour détecter
-  un binaire malveillant qui ouvre un port en backdoor), et une liste
-  blanche pour les faux positifs légitimes (ex. un vrai outil de backup
-  qui tournerait depuis un chemin inhabituel).
-- YARA / Sigma / signatures binaires — pas commencé (explicitement
-  "si trop difficile, on skip" selon l'utilisateur, mais à tenter).
-- Détection fileless (navigateur, documents piégés) — **partiellement
-  couvert** par les modules exec + réseau (exécution et connexions
-  sortantes depuis `/tmp`, `/dev/shm`, `~/Downloads`). Ce qui manque
-  encore : visibilité sur la chaîne parent→enfant (ex. navigateur qui
-  spawn un shell) et sur le contenu réellement piégé d'un document avant
-  exécution (couverture a priori, pas juste a posteriori).
-- Gap connu et documenté (pas un bug) : un dossier persistence qui
-  n'existe pas au démarrage (`/etc/cron.d`, `/etc/sudoers.d`, etc. sur un
-  système qui ne les a pas encore) n'est surveillé qu'après un redémarrage
-  du service, pas rétroactivement. Confirmé par test explicite. Contrairement
-  au module ransomware, ce module ne crée jamais de dossier manquant
-  lui-même (créer `/etc/sudoers.d` serait too invasif pour un EDR).
-- `install.sh` — **volontairement repoussé en tout dernier**, après GUI,
-  sur directive explicite de l'utilisateur ("faire en sorte que tous les
-  agents et le core soient parfaits, puis la GUI, puis le script"). Un
-  premier brouillon existe déjà (`/home/user/warden/install.sh`, inspiré de
-  celui de RansomShield) mais n'est pas la priorité tant que les modules
-  de détection ne sont pas exhaustifs.
-- Dockerfiles de test pour les 6 autres distros de la matrice (Ubuntu,
-  Fedora, RockyLinux, AlmaLinux, Arch, openSUSE Tumbleweed) — seul Debian
-  existe, et en version simplifiée (binaire lancé direct, pas de systemd
-  PID1 complet comme RansomShield le fait). Vrai test systemd multi-distro
-  à faire une fois `install.sh` repris.
-- Test de la notif desktop avec une vraie session graphique/DE simulée —
-  seul le cas "pas de session" (échec propre) a été testé.
-- SAST : **fait pour cargo-audit** (voir plus haut,
-  `scripts/check-updates.sh`). `cargo-deny` (licences + bans de crates,
-  au-delà des seules CVE) pas encore ajouté - amélioration possible mais
-  pas critique.
-- GUI de contrôle — explicitement après les agents/core.
-- Intégration GitHub (repo distant, CI) — pas abordé.
+## Maintenance and updates (question raised by the user, to be taken seriously)
 
-## Images et volumes Docker déjà créés sur cette machine
+Warden will need a real maintenance cycle, not a one-off build:
+- **Rust dependencies**: `Cargo.lock` is committed on purpose for
+  reproducible builds; any update must be deliberate (bump + full
+  re-test across the container matrix), never a blind `cargo update` on
+  a tool that runs as root. `aya` is still pre-1.0 (0.14.x) and breaks
+  its API between minor versions — check the changelog before bumping.
+- **Pin LLVM/nightly for the eBPF toolchain**: the more fragile of the
+  two toolchains. Before rebuilding `warden-build:ebpf` after a long
+  pause, re-check `rustup run nightly rustc --version --verbose` against
+  the LLVM version installed in the Dockerfile — a newer nightly can
+  embed a different LLVM version and re-break `bpf-linker`.
+- **Task still to do** (explicitly requested by the user): a simple
+  mechanism to quickly check "is there an update to apply" and apply it
+  fast. Idea not yet implemented: a `scripts/check-updates.sh` script
+  that runs `cargo outdated`/`cargo audit` on both the main workspace
+  AND `ebpf-probe/`, and automatically checks the LLVM/nightly match
+  above (compares the active nightly's LLVM version against the one
+  stated in `Dockerfile.build-ebpf`). Not written yet — to do.
+- Privesc module: **done for SUID/SGID** (see above, 5s polling —
+  fanotify's `FAN_ATTRIB` turned out to be impossible with the current
+  `nix` bindings, not just "not yet evaluated"). Not yet covered: Linux
+  capabilities via `setcap` (`getcap`/`setcap` on a binary, a privesc
+  vector equivalent to SUID but orthogonal, likely the same fanotify
+  limitation), unexpected uid transitions (would need eBPF, see the exec
+  module for the pattern to reuse).
+- Network module: **done** (see above) — covers outbound TCP connections
+  (IPv4/IPv6) from a binary in a suspicious location. Not yet covered:
+  UDP, inbound/listening connections (useful for detecting a malicious
+  binary opening a backdoor port), and an allowlist for legitimate false
+  positives (e.g. a real backup tool running from an unusual path).
+- YARA / Sigma / binary signatures — not started (explicitly "if too
+  hard, skip it" per the user, but worth attempting).
+- Fileless detection (browser, booby-trapped documents) —
+  **partially covered** by the exec + network modules (execution and
+  outbound connections from `/tmp`, `/dev/shm`, `~/Downloads`). Still
+  missing: visibility into the parent→child chain (e.g. a browser
+  spawning a shell) and into a document's actually booby-trapped
+  content before execution (a-priori coverage, not just after the
+  fact).
+- Known and documented gap (not a bug): a persistence folder that
+  doesn't exist at startup (`/etc/cron.d`, `/etc/sudoers.d`, etc. on a
+  system that doesn't have them yet) is only watched after a service
+  restart, not retroactively. Confirmed by explicit testing. Unlike the
+  ransomware module, this module never creates a missing folder itself
+  (creating `/etc/sudoers.d` would be too invasive for an EDR).
+- `install.sh` — **deliberately pushed to dead last**, after the GUI, on
+  the user's explicit directive ("make sure all the agents and the core
+  are perfect, then the GUI, then the script"). A first draft already
+  exists (`/home/user/warden/install.sh`, inspired by RansomShield's)
+  but isn't the priority while the detection modules aren't exhaustive.
+- Test Dockerfiles for the 6 other distros in the matrix (Ubuntu,
+  Fedora, RockyLinux, AlmaLinux, Arch, openSUSE Tumbleweed) — only
+  Debian exists, and in a simplified version (binary launched directly,
+  no full systemd-as-PID1 the way RansomShield does it). Real
+  multi-distro systemd testing to do once `install.sh` is picked back
+  up.
+- Testing desktop notification with a real/simulated graphical
+  session/DE — only the "no session" case (clean failure) has been
+  tested.
+- SAST: **done for cargo-audit** (see above,
+  `scripts/check-updates.sh`). `cargo-deny` (licenses + crate bans,
+  beyond just CVEs) not yet added — a possible improvement but not
+  critical.
+- Control GUI — explicitly after the agents/core.
+- GitHub integration (remote repo, CI) — not addressed.
 
-- `warden-build:rockylinux` — conteneur de build principal (rustc 1.97.1
-  stable, clippy + **cargo-audit** installés dans le volume
-  `warden-rustup-home`/`warden-cargo-home`)
-- `warden-build:ebpf` — conteneur de build eBPF (Debian bookworm, nightly +
-  rust-src + bpf-linker(LLVM 23) + clippy pour les deux toolchains,
-  baked-in dans l'image elle-même, ne PAS monter
-  `warden-cargo-home`/`warden-rustup-home` dessus - voir la section
-  toolchain eBPF plus haut pour pourquoi)
-- `warden-test:debian` — smoke test (reconstruire après tout changement de
-  code : `docker build -t warden-test:debian -f docker/Dockerfile.test.debian .`)
-- volumes : `warden-cargo-registry` (partagé, sans risque sur tous les
-  conteneurs), `warden-cargo-home` + `warden-rustup-home` (réservés à
-  `warden-build:rockylinux`, jamais montés sur `warden-build:ebpf`)
-- Images de distro déjà disponibles pour construire les futurs Dockerfiles
-  de test : debian, ubuntu, fedora, rockylinux, almalinux, archlinux,
-  opensuse/tumbleweed sont toutes déjà pull. Alpine dispo mais hors
-  périmètre officiel (musl + OpenRC, pas systemd).
+## Docker images and volumes already created on this machine
 
-## Historique persistant + notifications actionnables (2 des 3 prérequis GUI) — faits
+- `warden-build:rockylinux` — main build container (rustc 1.97.1
+  stable, clippy + **cargo-audit** installed in the
+  `warden-rustup-home`/`warden-cargo-home` volume)
+- `warden-build:ebpf` — eBPF build container (Debian bookworm, nightly +
+  rust-src + bpf-linker (LLVM 23) + clippy for both toolchains, baked
+  into the image itself, do NOT mount
+  `warden-cargo-home`/`warden-rustup-home` on it — see the eBPF
+  toolchain section above for why)
+- `warden-test:debian` — smoke test (rebuild after any code change:
+  `docker build -t warden-test:debian -f docker/Dockerfile.test.debian .`)
+- volumes: `warden-cargo-registry` (shared, no risk across all
+  containers), `warden-cargo-home` + `warden-rustup-home` (reserved for
+  `warden-build:rockylinux`, never mounted on `warden-build:ebpf`)
+- Distro images already available to build future test Dockerfiles:
+  debian, ubuntu, fedora, rockylinux, almalinux, archlinux,
+  opensuse/tumbleweed are all already pulled. Alpine available but out
+  of official scope (musl + OpenRC, not systemd).
 
-**Historique** : `warden_common::history::HistoryStore` - chaque
-`DetectionEvent` a désormais un `id` stable (module + timestamp
-nanoseconde, pas besoin de compteur partagé entre modules qui tournent
-chacun sur leur propre thread, ni de dépendance uuid/rand en plus).
-Chaque event est append-only en JSONL dans `/var/lib/warden/history.jsonl`
-via le dispatcher. Testé en conteneur : deux détections persistence
-atterrissent bien dans le fichier avec des ids distincts.
+## Persistent history + actionable notifications (2 of the 3 GUI prerequisites) — done
 
-**Notifications actionnables** : `Notifier` déclare maintenant une action
-D-Bus (`"default"`, "View details") sur chaque `Notify()`, capture l'id
-de notification retourné, et un thread de fond persistant écoute le
-signal `ActionInvoked` sur le bus de session de l'utilisateur cible pour
-faire le lien avec l'`id` de l'incident (corrélation en mémoire, purge
-après 24h si jamais cliqué). Le lancement effectif de la GUI au clic est
-un `TODO` explicite (`warden_common::notify::run_action_listener`) tant
-que `warden-gui` n'existe pas - la corrélation elle-même est du code
-fonctionnel, pas un stub.
+**History**: `warden_common::history::HistoryStore` — every
+`DetectionEvent` now has a stable `id` (module + nanosecond timestamp,
+no need for a counter shared across modules each running on their own
+thread, nor an extra uuid/rand dependency). Every event is append-only
+JSONL in `/var/lib/warden/history.jsonl` via the dispatcher. Tested in a
+container: two persistence detections do land in the file with distinct
+ids.
 
-### Investigation D-Bus : root cause réelle trouvée sur vraie VM Kali, corrigée, et round-trip validé de bout en bout
+**Actionable notifications**: `Notifier` now declares a D-Bus action
+(`"default"`, "View details") on every `Notify()`, captures the returned
+notification id, and a persistent background thread listens for the
+`ActionInvoked` signal on the target user's session bus to correlate it
+with the incident's `id` (in-memory correlation, purged after 24h if
+never clicked). Actually launching the GUI on click is an explicit
+`TODO` (`warden_common::notify::run_action_listener`) until `warden-gui`
+exists — the correlation itself is working code, not a stub.
 
-L'hypothèse "limitation de sandbox" notée précédemment ici était
-**incomplète et en partie fausse** - corrigée après test sur une vraie VM
-Kali fournie par l'utilisateur (pas de conteneurs imbriqués). Le même
-échec de connexion `zbus` s'est reproduit à l'identique sur dbus-daemon
-1.16.2 (Kali) comme sur 1.14.10 (sandbox d'origine), ce qui écartait
-définitivement "artefact de sandbox" comme explication complète.
+### D-Bus investigation: real root cause found on a real Kali VM, fixed, and round-trip validated end-to-end
 
-**Root cause réelle, confirmée par `strace` comparatif côte à côte** :
-quand le process qui se connecte a un uid différent du propriétaire du
-bus de session (ex. root, uid 0, essayant de joindre le bus de `kali`,
-uid 1000), dbus-daemon accepte le `AUTH EXTERNAL` (root peut ouvrir le
-socket 0700 malgré les permissions, les vérifications DAC ne s'appliquant
-pas à root), négocie même `AGREE_UNIX_FD`, puis **ferme silencieusement
-la connexion sans jamais traiter le `Hello` pipeliné** - confirmé
-identique sur les deux versions de dbus-daemon testées. À l'inverse, une
-connexion **même uid** (testé : `kali` se connectant à son propre bus)
-réussit avec exactement le même pattern de négociation pipelinée. Un
-troisième test avec un uid tiers non-root (`wardentest`, 1001) échoue
-encore plus tôt, avec un `EACCES` au niveau du socket lui-même (les
-permissions fichier 0700 bloquent tout uid non-root et non-propriétaire).
-La policy XML de session (`session.conf`) est entièrement permissive
-(`allow send_destination="*"`, `allow own="*"`) - ce n'est donc pas une
-policy XML qui bloque, c'est un contrôle interne de dbus-daemon,
-indépendant de toute configuration, qui refuse silencieusement le `Hello`
-d'un uid étranger au bus. **Conclusion : ce n'est ni un bug Warden, ni un
-bug zbus, ni un artefact de sandbox - c'est un durcissement volontaire de
-dbus-daemon qui empêche par construction un process root de rejoindre le
-bus de session d'un autre utilisateur.**
+The "sandbox limitation" hypothesis noted earlier here was **incomplete
+and partly wrong** — corrected after testing on a real Kali VM provided
+by the user (no nested containers). The same `zbus` connection failure
+reproduced identically on dbus-daemon 1.16.2 (Kali) as on 1.14.10 (the
+original sandbox), which definitively ruled out "sandbox artifact" as a
+complete explanation.
 
-**Fix appliqué** : `Notifier` (`warden_common::notify`) ne se connecte
-plus jamais lui-même à un bus D-Bus. Il spawn désormais un nouveau
-binaire, `warden-notify-helper` (nouveau crate), avec ses privilèges
-tombés à l'uid/gid de l'utilisateur cible via
-`tokio::process::Command::uid()/gid()` - ce qui fait que la connexion se
-fait bien avec le même uid que le propriétaire du bus, cas qui marche.
-Le helper est entièrement non-privilégié, communique avec le démon root
-parent via stdin/stdout en JSON ligne-par-ligne (requêtes de notification
-dans un sens, clics `ActionInvoked` corrélés dans l'autre), et reprend
-telle quelle la logique de reconnexion/écoute qui existait déjà côté
-`Notifier` avant ce changement.
+**Real root cause, confirmed by side-by-side comparative `strace`**:
+when the connecting process has a different uid than the session bus
+owner (e.g. root, uid 0, trying to join `kali`'s bus, uid 1000),
+dbus-daemon accepts the `AUTH EXTERNAL` (root can open the 0700 socket
+despite the permissions, DAC checks not applying to root), even
+negotiates `AGREE_UNIX_FD`, then **silently closes the connection
+without ever processing the pipelined `Hello`** — confirmed identical on
+both tested dbus-daemon versions. Conversely, a **same-uid** connection
+(tested: `kali` connecting to its own bus) succeeds with the exact same
+pipelined negotiation pattern. A third test with a non-root third-party
+uid (`wardentest`, 1001) fails even earlier, with an `EACCES` at the
+socket level itself (the 0700 file permissions block any non-root,
+non-owner uid). The session's XML policy (`session.conf`) is entirely
+permissive (`allow send_destination="*"`, `allow own="*"`) — so it's not
+an XML policy blocking it, it's an internal dbus-daemon control,
+independent of any configuration, that silently refuses the `Hello` of a
+uid foreign to the bus. **Conclusion: this is neither a Warden bug, nor
+a zbus bug, nor a sandbox artifact — it's a deliberate dbus-daemon
+hardening measure that prevents, by design, a root process from joining
+another user's session bus.**
 
-**Validé en conditions réelles, de bout en bout, sur la VM Kali** : après
-déploiement du nouveau binaire, déclenchement d'une vraie détection
-persistence (ajout d'une clé dans `~/.ssh/authorized_keys`), le log
-confirme `warden_notify_helper: listening for desktop notification
-clicks` (connexion réussie, plus d'erreur), puis 3 secondes plus tard
-`notification clicked ... incident_id=... action="default"` - et
-l'utilisateur a confirmé de visu avoir vu la popup apparaître en haut à
-droite de son écran Kali et l'avoir cliquée. C'est la toute première
-validation end-to-end réelle (popup affiché + clic + corrélation
-d'incident) de tout le projet, sur une vraie session graphique.
+**Fix applied**: `Notifier` (`warden_common::notify`) never connects to
+a D-Bus bus itself anymore. It now spawns a new binary,
+`warden-notify-helper` (new crate), with its privileges dropped to the
+target user's uid/gid via `tokio::process::Command::uid()/gid()` — which
+means the connection is made with the same uid as the bus owner, the
+case that works. The helper is entirely unprivileged, communicates with
+the parent root daemon over stdin/stdout in line-delimited JSON
+(notification requests one way, correlated `ActionInvoked` clicks the
+other way), and reuses as-is the reconnection/listening logic that
+already existed on the `Notifier` side before this change.
 
-## Vision GUI de l'utilisateur (à garder en tête, pas encore commencé)
+**Validated under real conditions, end-to-end, on the Kali VM**: after
+deploying the new binary, triggering a real persistence detection (a key
+added to `~/.ssh/authorized_keys`), the log confirms `warden_notify_helper:
+listening for desktop notification clicks` (successful connection, no
+more error), then 3 seconds later `notification clicked ...
+incident_id=... action="default"` — and the user confirmed visually
+seeing the popup appear in the top-right of their Kali screen and
+clicking it. This is the very first real end-to-end validation (popup
+displayed + click + incident correlation) of the whole project, on a
+real graphical session.
 
-Décrite explicitement par l'utilisateur : une appli GUI **séparée** du
-démon (démon = root, GUI = utilisateur normal), qui apparaît dans le menu
-applications/recherche du DE (fichier `.desktop`), montre l'état/historique,
-permet des actions live (quarantaine manuelle, whitelist, changement de
-mode). Les notifications desktop doivent être **actionnables** : cliquer
-dessus ouvre la GUI directement sur le détail de cet incident précis, puis
-on peut revenir au tableau de bord et naviguer vers d'autres menus.
+## User's GUI vision (to keep in mind, not started yet)
 
-Trois prérequis côté démon identifiés (pas encore construits) avant de
-pouvoir attaquer la vraie GUI :
-1. **Socket de contrôle** (`/run/warden/control.sock`) - la GUI doit
-   pouvoir interroger le démon root et déclencher des actions. Bien
-   restreindre les permissions à l'utilisateur cible.
-2. **Notifications actionnables** - `Notifier` ne fait actuellement que
-   `Notify()` fire-and-forget. Il faudra écouter le signal D-Bus
-   `ActionInvoked` du serveur de notifications et faire le lien avec
-   l'ID de l'incident correspondant.
-3. **Historique persistant des events** - actuellement chaque détection
-   part dans les logs journald uniquement. Il faut un stockage
-   (SQLite ou JSONL) alimenté par le dispatcher pour que la GUI ait
-   quelque chose à interroger.
+Explicitly described by the user: a GUI app **separate** from the daemon
+(daemon = root, GUI = normal user), which appears in the DE's
+applications/search menu (`.desktop` file), shows status/history, allows
+live actions (manual quarantine, whitelist, mode switch). Desktop
+notifications must be **actionable**: clicking one opens the GUI
+directly on that specific incident's detail, then you can go back to
+the dashboard and navigate to other menus.
 
-Toolkit GUI pas encore tranché - GTK4/libadwaita pressenti pour un look
-natif GNOME, à confirmer quand on y sera vraiment.
+Three daemon-side prerequisites identified (not yet built) before
+tackling the real GUI:
+1. **Control socket** (`/run/warden/control.sock`) — the GUI needs to be
+   able to query the root daemon and trigger actions. Permissions must
+   be tightly restricted to the target user.
+2. **Actionable notifications** — `Notifier` currently only does a
+   fire-and-forget `Notify()`. Will need to listen for the notification
+   server's `ActionInvoked` D-Bus signal and link it to the matching
+   incident ID.
+3. **Persistent event history** — currently every detection only goes
+   to journald logs. A storage layer (SQLite or JSONL) fed by the
+   dispatcher is needed so the GUI has something to query.
 
-**Branding — fait et validé par l'utilisateur.** 4 pistes explorées via
-un canvas de design (bouclier plein+serrure, contour minimal, écrou
-hexagonal "clin d'œil Rust", lockup+palette). L'utilisateur a choisi :
-- **Logo officiel** = concept 1 "Solid + Keyhole" (bouclier rouge plein,
-  serrure ambre au centre) → `branding/logo.svg` + `branding/logo.png`.
-- **Bannière** = concept 4 "Lockup" (le logo + wordmark "WARDEN" en
-  JetBrains Mono + tagline "AUTONOMOUS LINUX EDR") → `branding/banner.svg`
-  + `branding/banner.png`.
+GUI toolkit not yet decided — GTK4/libadwaita favored for a native
+GNOME look, to be confirmed once actually there.
 
-Palette retenue : `#8c1f1b` (fond de tuile), `#c33a2e` (bouclier),
-`#d9a441` (accent ambre/serrure), `#101114` (fond sombre). Les 4 concepts
-explorés restent dans `branding/` sous leurs noms d'origine
-(`1-solid-keyhole`, `2-outline`, `3-rustnod`, `4-lockup`) pour référence/
-archivage. Pas encore fait : export multi-résolutions (16/32/48/64/128/256
-px) pour l'icône d'appli GNOME/KDE - à faire quand la GUI sera vraiment
-attaquée, pas urgent maintenant.
+**Branding — done and validated by the user.** 4 directions explored via
+a design canvas (solid shield+keyhole, minimal outline, hex nut "Rust
+nod", lockup+palette). The user chose:
+- **Official logo** = concept 1 "Solid + Keyhole" (solid red shield,
+  amber keyhole in the center) → `branding/logo.svg` +
+  `branding/logo.png`.
+- **Banner** = concept 4 "Lockup" (the logo + "WARDEN" wordmark in
+  JetBrains Mono + tagline "AUTONOMOUS LINUX EDR") →
+  `branding/banner.svg` + `branding/banner.png`.
 
-## GUI, socket de contrôle, exceptions, scan à la demande — faits (session du 22 août, pas encore committés au moment d'écrire ceci)
+Palette settled on: `#8c1f1b` (tile background), `#c33a2e` (shield),
+`#d9a441` (amber/keyhole accent), `#101114` (dark background). The 4
+explored concepts stay in `branding/` under their original names
+(`1-solid-keyhole`, `2-outline`, `3-rustnod`, `4-lockup`) for
+reference/archival. Not done yet: multi-resolution export
+(16/32/48/64/128/256 px) for the GNOME/KDE app icon — to do once the GUI
+is really tackled, not urgent now.
 
-Les 3 prérequis GUI listés dans la section précédente sont faits : socket
-de contrôle (`warden-core/src/control.rs` + `warden-common/src/
-control_protocol.rs`, `/run/warden/control.sock`, 0600 chowné à
-`target_user`), notifications actionnables (voir plus haut, résolu via
-`warden-notify-helper`), historique persistant (`HistoryStore`, déjà
-documenté plus haut). `warden-gui` (GTK4) existe et consomme le socket.
-Nouveau système d'exceptions ancré SHA-256 (`warden-common/src/
-exceptions.rs`, `/etc/warden/exceptions.toml`), jamais modifiable par le
-démon ni par le socket - uniquement via `warden --add-exception`/
-`--remove-exception` en `pkexec`. `QuarantineFile`/`RestoreQuarantine`
-ont été délibérément exclus du protocole du socket après qu'une revue a
-trouvé qu'ils permettaient à n'importe quel process au même uid de
-désactiver la protection sans authentification réelle - voir les
-commentaires dans `control_protocol.rs`. Scan YARA à la demande
-(`warden-core/src/scan.rs`, `warden-yara/src/scan.rs`) ajouté aussi,
-report-only par construction. Pas encore committé - faire un commit par
-lot logique avant la prochaine coupure de session plutôt que de laisser
-~2800 lignes non versionnées.
+## GUI, control socket, exceptions, on-demand scan — done (Aug 22 session, not yet committed as of writing)
 
-## Audit red team du 22 août - deux bypass réels trouvés et corrigés
+The 3 GUI prerequisites listed in the previous section are done: control
+socket (`warden-core/src/control.rs` + `warden-common/src/
+control_protocol.rs`, `/run/warden/control.sock`, 0600 chowned to
+`target_user`), actionable notifications (see above, solved via
+`warden-notify-helper`), persistent history (`HistoryStore`, already
+documented above). `warden-gui` (GTK4) exists and consumes the socket.
+New SHA-256-anchored exceptions system (`warden-common/src/
+exceptions.rs`, `/etc/warden/exceptions.toml`), never modifiable by the
+daemon nor by the socket — only via `warden --add-exception`/
+`--remove-exception` under `pkexec`. `QuarantineFile`/`RestoreQuarantine`
+were deliberately excluded from the socket protocol after a review found
+they'd let any process at the same uid disable protection without real
+authentication — see the comments in `control_protocol.rs`. On-demand
+YARA scan (`warden-core/src/scan.rs`, `warden-yara/src/scan.rs`) also
+added, report-only by design. Not committed yet — do a commit per
+logical batch before the next session break rather than leaving ~2800
+lines unversioned.
 
-Contexte : l'utilisateur a demandé un audit red team poussé sur cette
-même vague de fonctionnalités dans une session séparée ("EDR Rust pour
-Linux workstations"), qui a fini par être flaguée pour être allée trop
-loin dans l'intensité de l'audit demandé - pas un problème dans le code
-produit, qui est resté propre et bien documenté (voir les commentaires de
-review déjà présents dans `control_protocol.rs`, `quarantine.rs`,
-`process.rs`). Infra de test laissée en place et vérifiée vivante dans
-cette session : deux VMs libvirt/KVM (`debian13` locale FR, `ubuntu25.10`
-locale EN, toutes deux avec un compte `claude:claude` sudo dédié, warden
-installé et actif en Enforce) + un conteneur Docker `warden-redteam`
-(Kali) comme poste attaquant. Deux scripts de PoC red team trouvés sur
-`debian13` (`/home/claude/test_pkgmgr_spoof.sh`,
-`/home/claude/test_ransomware_bypass.sh`) - reproduits et validés dans
-cette session, pas juste relus :
+## Aug 22 red-team audit — two real bypasses found and fixed
 
-**Bypass 1 - `package_manager::is_active()` spoofable par emplacement**
-(`warden-common/src/package_manager.rs`). L'ancienne version vérifiait
-`comm` ET le basename de `/proc/<pid>/exe`, mais jamais le RÉPERTOIRE du
-binaire - `cp /bin/sleep /tmp/apt && /tmp/apt 300 &` satisfait les deux
-checks sans être le vrai gestionnaire de paquets. Confirmé exploitable en
-direct sur `debian13` : un `/etc/cron.d/redteam_v3` a échappé à la
-quarantaine automatique en Enforce pendant que le faux `/tmp/apt`
-tournait (`persistence: package manager active, leaving file untouched`
-dans le journal). **Fix** : le répertoire de l'exécutable doit en plus
-canonicaliser vers un des `SYSTEM_BIN_DIRS` connus (même liste que
-`warden-privesc`). Testé : nouveau test unitaire reproduisant exactement
-la technique (`decoy_binary_outside_system_bin_dirs_does_not_count_as_active`),
-ET revalidé en conditions réelles - build redéployé sur `debian13`,
-`test_pkgmgr_spoof.sh` relancé, `ATTACK RESULT: file gone -> quarantined
+Context: the user requested a deep red-team audit on this same wave of
+features in a separate session ("Rust EDR for Linux workstations"),
+which ended up being flagged for going too far in the intensity of the
+requested audit — not a problem in the code produced, which stayed
+clean and well documented (see the review comments already present in
+`control_protocol.rs`, `quarantine.rs`, `process.rs`). Test
+infrastructure left in place and verified alive in this session: two
+libvirt/KVM VMs (`debian13` FR locale, `ubuntu25.10` EN locale, both
+with a dedicated `claude:claude` sudo account, warden installed and
+active in Enforce) + a `warden-redteam` Docker container (Kali) as the
+attacking host. Two red-team PoC scripts found on `debian13`
+(`/home/claude/test_pkgmgr_spoof.sh`,
+`/home/claude/test_ransomware_bypass.sh`) — reproduced and validated in
+this session, not just re-read:
+
+**Bypass 1 — `package_manager::is_active()` spoofable by location**
+(`warden-common/src/package_manager.rs`). The old version checked
+`comm` AND the basename of `/proc/<pid>/exe`, but never the binary's
+DIRECTORY — `cp /bin/sleep /tmp/apt && /tmp/apt 300 &` satisfies both
+checks without being the real package manager. Confirmed exploitable
+live on `debian13`: an `/etc/cron.d/redteam_v3` escaped automatic
+quarantine in Enforce while the fake `/tmp/apt` was running
+(`persistence: package manager active, leaving file untouched` in the
+log). **Fix**: the executable's directory must additionally canonicalize
+to one of the known `SYSTEM_BIN_DIRS` (same list as `warden-privesc`).
+Tested: new unit test exactly reproducing the technique
+(`decoy_binary_outside_system_bin_dirs_does_not_count_as_active`), AND
+re-validated under real conditions — build redeployed on `debian13`,
+`test_pkgmgr_spoof.sh` rerun, `ATTACK RESULT: file gone -> quarantined
 despite spoofing, bypass NOT effective`.
 
-**Bypass 2 - détecteur ransomware contournable par fork-per-file +
-répartition multi-dossiers** (`warden-ransomware/src/detector.rs`). Le
-détecteur trackait déjà un compteur par PID ET un compteur par dossier
-(ce dernier ajouté lors d'une revue précédente, justement pour contrer le
-fork-per-file simple) - mais aucun compteur global tous-PID/tous-dossiers
-confondus. Résultat : 8 fichiers par dossier × 6 dossiers surveillés,
-chacun avec son propre PID éphémère, reste sous le seuil (15) sur les
-deux axes existants alors que 48 fichiers au total sont chiffrés en
-quelques secondes. Confirmé exploitable en direct sur `debian13` **après
-correction d'un faux négatif du script de test lui-même** : la première
-tentative (dossiers anglais `Desktop`/`Downloads`/`Pictures`/`Videos`/
-`Music`) donnait 0 fichier restant, mais c'était un faux positif du
-test - cette VM est en locale FR (`Bureau`/`Téléchargements`/`Images`/
-`Vidéos`/`Musique`), donc 5 des 6 dossiers ciblés par le script n'étaient
-simplement pas surveillés. Refait avec les vrais noms localisés : 48/48
-fichiers laissés intacts, zéro entrée dans le journal - bypass bien réel.
-**Fix** : troisième compteur `recent_writes_global`/
-`recent_container_format_writes_global` (clé unique, tous PID/dossiers
-confondus), même seuil que les compteurs existants. Testé : 3 nouveaux
-tests unitaires (burst simple toujours détecté, technique fork-per-file
-multi-dossiers désormais détectée, activité légitime à faible volume
-répartie sur plusieurs dossiers toujours laissée tranquille) + workspace
-entier (`cargo test --workspace`, `cargo clippy --workspace --all-targets
--- -D warnings`) propre.
+**Bypass 2 — ransomware detector bypassable via fork-per-file + spreading
+across multiple folders** (`warden-ransomware/src/detector.rs`). The
+detector already tracked a per-PID counter AND a per-folder counter (the
+latter added in a previous review, precisely to counter simple
+fork-per-file) — but no global counter across all PIDs/all folders
+combined. Result: 8 files per folder × 6 watched folders, each with its
+own short-lived PID, stays under the threshold (15) on both existing
+axes even though 48 files total get encrypted within seconds. Confirmed
+exploitable live on `debian13` **after fixing a false negative in the
+test script itself**: the first attempt (English folder names
+`Desktop`/`Downloads`/`Pictures`/`Videos`/`Music`) gave 0 files
+remaining, but that was a test false positive — this VM is in FR locale
+(`Bureau`/`Téléchargements`/`Images`/`Vidéos`/`Musique`), so 5 of the 6
+folders targeted by the script simply weren't being watched. Redone with
+the real localized names: 48/48 files left intact, zero log entry —
+genuinely real bypass. **Fix**: a third counter
+`recent_writes_global`/`recent_container_format_writes_global` (single
+key, across all PIDs/folders combined), same threshold as the existing
+counters. Tested: 3 new unit tests (simple burst still detected,
+multi-folder fork-per-file technique now detected, legitimate low-volume
+activity spread across several folders still left alone) + whole
+workspace (`cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`) clean.
 
-**Leçon retenue sur la méthodologie de test elle-même** : un script de
-red team qui hardcode des noms de dossiers XDG doit être vérifié contre
-la vraie locale de la VM cible avant de faire confiance à un résultat
-"pas de détection" - sinon un vrai bypass et un simple dossier non
-surveillé sont indiscernables sans creuser.
+**Lesson learned about the testing methodology itself**: a red-team
+script that hardcodes XDG folder names must be checked against the
+target VM's real locale before trusting a "no detection" result —
+otherwise a real bypass and a simply-unwatched folder are
+indistinguishable without digging.
 
-Les deux binaires corrigés sont redéployés et revalidés sur les DEUX VMs
-(build depuis `warden-build:rockylinux`, transfert SFTP vers le compte
-`claude`, copie en root sur `/usr/local/bin/warden`, `systemctl restart
-warden`) : `test_pkgmgr_spoof.sh` relancé sur `debian13` ET une variante
-sur `ubuntu25.10` (`ATTACK RESULT: ... bypass NOT effective` dans les
-deux cas), technique fork-per-file multi-dossiers relancée sur les deux
-(dossiers localisés FR sur `debian13`, EN sur `ubuntu25.10`) - burst
-détecté et 48/48 fichiers quarantinés dans les deux cas, avec des
-`affected_paths` qui mélangent bien plusieurs dossiers différents,
-preuve que c'est le nouveau compteur global qui a déclenché. Reste à
-faire : un nouvel audit red team complet (pas juste ces deux PoC ciblés)
-avant de considérer cette vague de fonctionnalités prête.
+Both fixed binaries were redeployed and revalidated on BOTH VMs (built
+from `warden-build:rockylinux`, transferred via SFTP to the `claude`
+account, copied as root to `/usr/local/bin/warden`, `systemctl restart
+warden`): `test_pkgmgr_spoof.sh` rerun on `debian13` AND a variant on
+`ubuntu25.10` (`ATTACK RESULT: ... bypass NOT effective` in both cases),
+multi-folder fork-per-file technique rerun on both (FR-localized folders
+on `debian13`, EN on `ubuntu25.10`) — burst detected and 48/48 files
+quarantined in both cases, with `affected_paths` correctly mixing
+several different folders, proof it was the new global counter that
+triggered. Still to do: a new, complete red-team audit (not just these
+two targeted PoCs) before considering this wave of features ready.
 
-## Campagne SAST + relecture multi-agents (22 août, soir) — 7 findings critiques corrigés et validés en direct
+## SAST campaign + multi-agent review (Aug 22 evening) — 7 critical findings fixed and validated live
 
-Suite à l'audit red team ci-dessus, l'utilisateur a demandé une passe SAST
-poussée (agent dédié) + une relecture de code anti-régression (6 agents en
-parallèle, un par sous-système) sur tout le lot de fonctionnalités non
-committé. **36 findings remontés au total**, triés par sévérité réelle
-(surface atteignable par un process tournant déjà en tant qu'utilisateur
-cible - le modèle de menace réaliste pour un EDR, pas un attaquant distant).
-Décision utilisateur : corriger les 7 critiques ce soir, documenter le
-reste (HIGH/MEDIUM/LOW) comme backlog pour une session dédiée plutôt que
-tout traiter d'un coup.
+Following the red-team audit above, the user requested a deep SAST pass
+(dedicated agent) + an anti-regression code review (6 agents in
+parallel, one per subsystem) on the entire uncommitted batch of
+features. **36 findings raised in total**, sorted by real severity
+(surface reachable by a process already running as the target user —
+the realistic threat model for an EDR, not a remote attacker). User
+decision: fix the 7 critical ones tonight, document the rest
+(HIGH/MEDIUM/LOW) as backlog for a dedicated session rather than
+handling everything at once.
 
-**Les 7 findings critiques, tous corrigés et validés en direct sur
-`debian13`** (build → `cargo test --workspace` + clippy propres → déploiement
-→ scénario red team rejoué avec le fix en place, pas juste relu) :
+**The 7 critical findings, all fixed and validated live on `debian13`**
+(build → clean `cargo test --workspace` + clippy → deployment → red-team
+scenario replayed with the fix in place, not just re-read):
 
-1. **`ebpf-probe/warden-exec` quarantinait le mauvais binaire** - la
-   résolution `/proc/<pid>/exe` (ajoutée cette session pour contrer
-   l'évasion par symlink) renvoyait l'INTERPRÉTEUR pour un script
-   (`/bin/bash`), pas le script - un script flagué en `/tmp` faisait
-   quarantiner `/bin/bash` lui-même, cassant le système pour tout le
-   monde. **Fix** : résolution du symlink faite directement sur `filename`
-   (readlink/canonicalize si `filename` EST un symlink), plus jamais via
-   l'état du process live - élimine à la fois la confusion interpréteur/
-   script et la race TOCTOU pid-reuse. Testé en direct : script flagué →
-   le script est quarantiné, hash de `/bin/bash` inchangé avant/après,
-   bash reste fonctionnel ; cas légitime (symlink vers un vrai payload en
-   `/tmp`) → le payload réel est bien quarantiné, le symlink intact.
-2. **Honeypot ransomware - privesc locale via symlink** -
-   `honeypot::provision` ne vérifiait jamais si le dossier PARENT du
-   honeypot était un symlink avant de faire `chmod 0755`+`chown` dessus.
-   Un process tournant en tant qu'utilisateur cible pouvait remplacer le
-   dossier honeypot par un symlink vers `/etc/cron.d` et se faire donner
-   la propriété d'un répertoire root par le démon lui-même au redémarrage
-   suivant. **Fix** : même refus explicite que pour le fichier honeypot
-   (déjà protégé). Testé en direct : symlink `Encrypted_Finances ->
-   /etc/cron.d`, redémarrage, `/etc/cron.d` reste `755 root:root`
-   inchangé, warning loggé, le honeypot se re-provisionne normalement une
-   fois le symlink retiré.
-3. **Honeypot énumérable par préfixe fixe** (trouvé par le SAST, pas dans
-   les 7 "critiques" mais corrigé en même temps par cohérence) -
-   `Confidential_Backup_<seed>`/`Banque_<seed>` : le préfixe public et
-   fixe rendait tout l'aléatoire du suffixe inutile face à un glob. **Fix** :
-   nom entier (adjectif+nom) tiré d'une combinatoire de mots-thèmes
-   (15x15, décorrélée pour le honeypot `$HOME` vs les honeypots par
-   dossier) dérivée du seed - ferme le cas trivial (un seul grep), honnête
-   dans les commentaires sur le fait que ça ne ferme pas le cas d'un
-   attaquant motivé prêt à énumérer les 225 combinaisons.
-4. **Résolution XDG non validée - bypass Downloads + DoS quarantaine** -
-   `xdg::resolve_dir` faisait confiance sans limite à
-   `~/.config/user-dirs.dirs` (fichier appartenant à l'utilisateur cible),
-   permettant de faire pointer un dossier surveillé vers `/` entier.
-   **Fix** : refuse explicitement le cas `/` exact (aucune config XDG
-   légitime ne pointe jamais littéralement sur la racine), retombe sur le
-   défaut sûr avec un warning. Testé en direct : `XDG_DOWNLOAD_DIR="/"` →
-   warning loggé 3x (une fois par module qui résout Downloads), aucun
-   module ne watch `/`, `Téléchargements` simplement absent de
-   `watch_dirs` au lieu de planter ou tout surveiller. Limite documentée
-   et assumée : rediriger vers un AUTRE chemin (pas `/`) pour faire
-   disparaître le vrai Downloads du radar reste possible - tension
-   inhérente avec le support légitime des locales/points de montage
-   personnalisés, pas résolue ce soir.
-5. **Bypass permanent du privesc via le cache `already_flagged`** - un
-   setuid déposé pendant qu'un vrai gestionnaire de paquets tourne
-   (fenêtre légitime) était suppressé UNE FOIS puis plus jamais
-   réévalué, même après la fin de l'update - porte dérobée root
-   persistante jamais détectée en Enforce. **Fix** : `handle_system_binary`/
-   `handle_new_file` retournent maintenant `(event, sticky)` - seule
-   l'exemption (`is_exempt`) reste permanente, "package manager actif"
-   n'est plus jamais sticky, donc réévalué à chaque tick (2s). Testé en
-   direct : backdoor setuid déposé pendant qu'un faux `apt` tourne depuis
-   un vrai `SYSTEM_BIN_DIR` (`/usr/local/bin/apt`, seul moyen légitime de
-   déclencher `is_active()` depuis le fix du point 6 ci-dessous) → event
-   "package manager active" à chaque tick tant qu'il tourne, PUIS dès que
-   le faux apt est tué, le tick suivant tente réellement l'action (voir
-   point 7, un second bug caché découvert PENDANT ce test).
-6. **`package_manager::is_active()` spoofable par emplacement** (détail
-   complet plus haut, retrouvé confirmé) - déjà fixé et redéployé plus
-   tôt dans la soirée, revalidé une fois de plus par le test du point 5.
-7. **Socket de contrôle - DoS mémoire qui tue tout le démon** -
-   `AsyncBufReadExt::lines()` n'avait aucune limite de taille de ligne ;
-   un client au même uid pouvait streamer sans `\n` jusqu'à l'OOM du
-   process `warden` entier (les 4 modules cœur partagent l'adresse
-   process). **Fix** : `read_capped_line` (lecture octet par octet sur un
-   `BufReader` déjà tamponné, donc pas de coût syscall réel), plafond
-   64KiB, erreur (connexion fermée) au-delà. 3 tests unitaires via
-   `tokio::io::duplex` (ligne normale, EOF propre, dépassement du
-   plafond).
-8. **`ProtectSystem=strict` disparu du service systemd** - le démon root,
-   avec ses capacités élargies (voir plus bas), n'avait plus aucun
-   confinement filesystem. **Fix** : directive restaurée + `RuntimeDirectory=warden`
-   (pour `/run/warden`, tmpfs recréé à chaque démarrage) + génération d'un
-   drop-in `/etc/systemd/system/warden.service.d/10-paths.conf` par
-   `install.sh` (calculé à l'installation : `$STATE_DIR`, le `$HOME` de
-   l'utilisateur cible, `/tmp`/`/var/tmp`/`/dev/shm`, les dossiers
-   binaires système, les dossiers `UnitDir` de persistence - chaque entrée
-   préfixée `-` pour ignorer un chemin absent selon la distro). Vérifié
-   par `systemd-analyze verify` (exit 0) et déploiement réel sur
-   `debian13` : les 3 services démarrent proprement, honeypots
-   provisionnés, socket de contrôle actif.
-9. **`install.sh` - écriture root via un chemin `/tmp` prévisible** -
-   `2>/tmp/warden-gui-build.log` : classique attaque symlink local (un
-   utilisateur non privilégié pré-crée le fichier comme symlink vers une
-   cible arbitraire avant que root ne lance l'install). **Fix** :
-   `mktemp` à la place. Vérifié : `shellcheck` propre (exit 0) sur tout
-   `install.sh`.
+1. **`ebpf-probe/warden-exec` was quarantining the wrong binary** — the
+   `/proc/<pid>/exe` resolution (added this session to counter symlink
+   evasion) returned the INTERPRETER for a script (`/bin/bash`), not the
+   script itself — a script flagged in `/tmp` caused `/bin/bash` itself
+   to be quarantined, breaking the system for everyone. **Fix**: symlink
+   resolution now done directly on `filename` (readlink/canonicalize if
+   `filename` IS a symlink), never again via live process state —
+   eliminates both the interpreter/script confusion and the pid-reuse
+   TOCTOU race. Tested live: script flagged → the script is quarantined,
+   `/bin/bash`'s hash unchanged before/after, bash stays functional;
+   legitimate case (symlink to a real payload in `/tmp`) → the real
+   payload is properly quarantined, the symlink intact.
+2. **Ransomware honeypot — local privesc via symlink** —
+   `honeypot::provision` never checked whether the honeypot's PARENT
+   folder was a symlink before doing `chmod 0755`+`chown` on it. A
+   process running as the target user could replace the honeypot folder
+   with a symlink to `/etc/cron.d` and get itself handed ownership of a
+   root directory by the daemon itself on the next restart. **Fix**:
+   same explicit refusal as for the honeypot file (already protected).
+   Tested live: symlink `Encrypted_Finances -> /etc/cron.d`, restart,
+   `/etc/cron.d` stays `755 root:root` unchanged, warning logged, the
+   honeypot re-provisions normally once the symlink is removed.
+3. **Honeypot enumerable by fixed prefix** (found by SAST, not among the
+   7 "critical" ones but fixed at the same time for consistency) —
+   `Confidential_Backup_<seed>`/`Banque_<seed>`: the fixed public prefix
+   made the whole point of the random suffix moot against a glob.
+   **Fix**: full name (adjective+noun) drawn from a combinatorial set of
+   theme words (15x15, decorrelated between the `$HOME` honeypot and the
+   per-folder honeypots) derived from the seed — closes the trivial case
+   (a single grep), honest in the comments that this doesn't close the
+   case of a motivated attacker willing to enumerate the 225
+   combinations.
+4. **Unvalidated XDG resolution — Downloads bypass + quarantine DoS** —
+   `xdg::resolve_dir` trusted `~/.config/user-dirs.dirs` (a file owned
+   by the target user) without limit, allowing a watched folder to be
+   pointed at all of `/`. **Fix**: explicitly refuses the exact `/` case
+   (no legitimate XDG config ever literally points at the root), falls
+   back to the safe default with a warning. Tested live:
+   `XDG_DOWNLOAD_DIR="/"` → warning logged 3x (once per module that
+   resolves Downloads), no module watches `/`, `Downloads` simply absent
+   from `watch_dirs` instead of crashing or watching everything.
+   Documented and accepted limitation: redirecting to ANOTHER path (not
+   `/`) to make the real Downloads disappear from the radar is still
+   possible — an inherent tension with legitimate support for custom
+   locales/mount points, not resolved tonight.
+5. **Permanent privesc bypass via the `already_flagged` cache** — a
+   setuid file dropped while a real package manager was running
+   (legitimate window) was suppressed ONCE and then never re-evaluated
+   again, even after the update finished — a persistent root backdoor
+   never detected in Enforce. **Fix**: `handle_system_binary`/
+   `handle_new_file` now return `(event, sticky)` — only the exemption
+   (`is_exempt`) stays permanent, "package manager active" is never
+   sticky anymore, so it's re-evaluated on every tick (2s). Tested live:
+   setuid backdoor dropped while a fake `apt` was running from a real
+   `SYSTEM_BIN_DIR` (`/usr/local/bin/apt`, the only legitimate way to
+   trigger `is_active()` after the fix in point 6 below) → "package
+   manager active" event on every tick while it runs, THEN as soon as
+   the fake apt is killed, the next tick actually takes action (see
+   point 7, a second hidden bug discovered DURING this test).
+6. **`package_manager::is_active()` spoofable by location** (full detail
+   above, found and confirmed) — already fixed and redeployed earlier
+   that evening, revalidated once more by point 5's test.
+7. **Control socket — memory DoS that kills the whole daemon** —
+   `AsyncBufReadExt::lines()` had no line-size limit at all; a client at
+   the same uid could stream without `\n` until OOM-killing the entire
+   `warden` process (the 4 core modules share the process address
+   space). **Fix**: `read_capped_line` (byte-by-byte reading on an
+   already-buffered `BufReader`, so no real syscall cost), 64KiB cap,
+   error (connection closed) beyond that. 3 unit tests via
+   `tokio::io::duplex` (normal line, clean EOF, cap exceeded).
+8. **`ProtectSystem=strict` gone from the systemd service** — the root
+   daemon, with its widened capabilities (see below), had no filesystem
+   confinement left at all. **Fix**: directive restored +
+   `RuntimeDirectory=warden` (for `/run/warden`, a tmpfs recreated on
+   every start) + generation of a
+   `/etc/systemd/system/warden.service.d/10-paths.conf` drop-in by
+   `install.sh` (computed at install time: `$STATE_DIR`, the target
+   user's `$HOME`, `/tmp`/`/var/tmp`/`/dev/shm`, the system binary
+   folders, persistence's `UnitDir` folders — each entry prefixed with
+   `-` to ignore a path absent on a given distro). Verified via
+   `systemd-analyze verify` (exit 0) and a real deployment on
+   `debian13`: the 3 services start cleanly, honeypots provisioned,
+   control socket active.
+9. **`install.sh` — root write via a predictable `/tmp` path** —
+   `2>/tmp/warden-gui-build.log`: a classic local symlink attack (an
+   unprivileged user pre-creates the file as a symlink to an arbitrary
+   target before root runs the install). **Fix**: `mktemp` instead.
+   Verified: `shellcheck` clean (exit 0) on all of `install.sh`.
 
-**Bug supplémentaire trouvé EN VALIDANT le point 5, pas dans la liste des
-7 initiaux mais critique et corrigé dans la foulée** : sous
-`ProtectSystem=strict` fraîchement activé (point 8), `rename()` entre
-`/tmp` et le dossier de quarantaine échoue maintenant systématiquement
-(chaque entrée `ReadWritePaths=` devient son propre bind mount, donc
-`/tmp` et `/var/lib/warden` paraissent être des devices différents au
-noyau même si c'est le même filesystem physique) - `Quarantine::take`
-retombe donc TOUJOURS sur son fallback `fs::copy`, qui préserve les bits
-de permission de la source, y compris setuid/setgid - bloqué par
-`RestrictSUIDSGID=true` (déjà présent dans l'unit, pas ajouté ce soir).
-Résultat : mettre en quarantaine un backdoor setuid échouait en boucle
-avec `error=copying ... to quarantine`, silencieusement, à chaque tick -
-exactement le scénario que le point 5 vient de corriger. **Fix** :
-nouvelle fonction `Quarantine::copy_contents_without_preserving_mode`
-(copie le contenu à la main, laisse le mode par défaut de
-`File::create` - jamais setuid - sur la copie en quarantaine, plutôt que
-`fs::copy` qui tente de reproduire le mode source). Testé (nouveau test
-unitaire + revalidé en direct après redéploiement) : le fichier setuid
-finit bien par disparaître/être neutralisé une fois retesté.
+**Extra bug found WHILE VALIDATING point 5, not on the initial list of 7
+but critical and fixed on the spot**: under freshly-enabled
+`ProtectSystem=strict` (point 8), `rename()` between `/tmp` and the
+quarantine folder now systematically fails (each `ReadWritePaths=`
+entry becomes its own bind mount, so `/tmp` and `/var/lib/warden` look
+like different devices to the kernel even though it's the same physical
+filesystem) — `Quarantine::take` therefore ALWAYS falls back to its
+`fs::copy` fallback, which preserves the source's permission bits,
+including setuid/setgid — blocked by `RestrictSUIDSGID=true` (already
+present in the unit, not added tonight). Result: quarantining a setuid
+backdoor kept failing in a loop with `error=copying ... to quarantine`,
+silently, on every tick — exactly the scenario point 5 just fixed.
+**Fix**: new function `Quarantine::copy_contents_without_preserving_mode`
+(copies the content by hand, leaves `File::create`'s default mode —
+never setuid — on the quarantined copy, instead of `fs::copy` which
+tries to reproduce the source mode). Tested (new unit test + revalidated
+live after redeployment): the setuid file does end up
+disappearing/neutralized once retested.
 
-**Findings HIGH/MEDIUM restants (documentés, pas corrigés ce soir)** -
-retrouvables dans les rapports complets des agents SAST + code-review de
-cette session, à traiter dans une session dédiée avant de considérer
-cette vague de fonctionnalités prête pour la prod :
-- TOCTOU rescan-by-path dans `warden-yara::fanotify_monitor` et dans
-  l'échantillonnage d'entropie `warden-ransomware::fanotify_monitor`
-  (réouverture par chemin au lieu d'utiliser le fd de l'event fanotify).
-- `pidfd_open` qui échoue (hors "process déjà mort") ne retente plus rien
-  du tout - régression par rapport à l'ancien `kill(pid)` best-effort.
-- `control::run`'s `accept()` qui échoue une fois tue le listener IPC en
-  permanence (DoS complémentaire à celui déjà fixé ce soir).
-- Contournement par forgerie de format container (`PK\x03\x04`+ciphertext)
-  plus large que documenté : perd le tracking par-PID entièrement, pas
-  juste un seuil x3.
-- ~~`warden-yara::scan.rs` : pas de vérification symlink sur les racines de
-  scan (`StartScan` via le socket peut être pointé dans `/proc` via un
-  symlink), pas de plafond de taille de fichier avant `scan_file`.~~
-  **fait** (voir "Backlog MEDIUM traité" plus bas).
-- ~~Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding
-  (`filesize < 65536` gate tout le fichier au lieu de juste borner la
-  recherche du motif).~~ **fait** (voir "Backlog MEDIUM traité" plus bas).
-- Dossier de règles YARA custom illisible (pas juste absent) fait échouer
-  tout le module au lieu de dégrader vers les règles builtin seules.
-- **Confirmé en direct** : `StartScan` n'a aucune restriction de chemin -
-  connecté au socket en tant qu'utilisateur `test` (uid non-root, exactement
-  le modèle de menace), une requête `StartScan(["/root"])` est acceptée
-  et exécutée sans broncher (`files_scanned=106` dans `ScanStatus` juste
-  après), alors que `test` ne peut lui-même pas lister `/root` (0700
-  root:root). Oracle réel : même sans root direct, un process compromis
-  au même uid peut faire lire par le démon des fichiers qu'il ne peut pas
-  lire lui-même, et en déduire des choses (existence, correspondance à
-  une règle YARA) via `ScanStatus`/`History`. Pas de DoS testé (aurait
-  fallu un fichier énorme/lent, pas fait pour rester dans le scope
-  "sonde", pas "casse la VM").
-- `NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui` malgré
-  la chute de privilèges (pas de `env_remove` avant `pre_exec`).
-- `--quarantine-file` : le check d'exemption utilise un chemin non
-  canonicalisé (contrairement à `--add-exception`/`--remove-exception`).
-- TOCTOU sur les permissions du socket de contrôle entre `bind()` et
-  `chmod`/`chown` (fenêtre théorique, dépend de l'umask).
-- Fichiers manifest de quarantaine pas durcis à `0600` (incohérence avec
-  le fix appliqué à `history.rs` dans le même lot).
-- Perte d'entrées manifest sous accès concurrent `take()`/`restore()`
-  (6 process différents partagent le même répertoire de quarantaine).
-- ~~**Confirmé en direct** (installé via `apt install unattended-upgrades`,
-  pas juste lu dans le code) : `unattended-upgrade` n'est JAMAIS reconnu
-  par `is_active()`, et la cause réelle est plus profonde que la simple
-  troncature `comm` soupçonnée au départ - c'est un script Python
-  (`#!/usr/bin/python3`), donc `/proc/<pid>/exe` résout vers
-  `/usr/bin/python3.13` (l'interpréteur), pas vers
-  `/usr/bin/unattended-upgrade` du tout - exactement la même classe de
-  bug interpréteur-vs-script que le fix `warden-exec` de ce soir, mais pas
-  encore appliquée ici. Testé : un faux setuid déposé pendant qu'un vrai
-  `unattended-upgrade --debug` tourne est quarantiné immédiatement au lieu
-  d'être suppressé - faux positif garanti sur toute mise à jour
-  automatique programmée (`unattended-upgrades` est activé par défaut sur
-  Debian/Ubuntu).~~ **fait** (voir "Backlog MEDIUM traité" plus bas).
-- Drip-feed lent (rester sous le seuil sur une fenêtre plus longue que
-  `burst_window_secs`) contourne toujours les 3 compteurs - limitation
-  structurelle inhérente à une détection par fenêtre glissante, pas un
-  bug introduit ce soir.
-- Kill symbolique pour un process fork-per-file déjà mort au moment de la
-  détection (la quarantaine des fichiers reste le vrai mécanisme de
-  protection dans ce cas, pas le kill).
+**Remaining HIGH/MEDIUM findings (documented, not fixed tonight)** —
+findable in the full SAST agent + code-review reports from this session,
+to be handled in a dedicated session before considering this wave of
+features production-ready:
+- TOCTOU rescan-by-path in `warden-yara::fanotify_monitor` and in
+  `warden-ransomware::fanotify_monitor`'s entropy sampling (reopening by
+  path instead of using the fanotify event's fd).
+- `pidfd_open` failing (beyond "process already dead") no longer retries
+  anything at all — a regression compared to the old best-effort
+  `kill(pid)`.
+- `control::run`'s `accept()` failing once permanently kills the IPC
+  listener (a DoS in addition to the one already fixed tonight).
+- Container-format-forgery bypass wider than documented (`PK\x03\x04`+
+  ciphertext): loses per-PID tracking entirely, not just a x3 threshold.
+- ~~`warden-yara::scan.rs`: no symlink check on scan roots (`StartScan`
+  via the socket can be pointed at `/proc` via a symlink), no file-size
+  cap before `scan_file`.~~ **done** (see "MEDIUM backlog handled"
+  below).
+- ~~The `Bash_Dev_Tcp_Reverse_Shell` YARA rule was bypassable via
+  padding (`filesize < 65536` gates the whole file instead of just
+  bounding the pattern search).~~ **done** (see "MEDIUM backlog handled"
+  below).
+- An unreadable (not just absent) custom YARA rules folder fails the
+  entire module instead of degrading to built-in rules only.
+- **Confirmed live**: `StartScan` had no path restriction at all —
+  connected to the socket as the `test` user (non-root uid, exactly the
+  threat model), a `StartScan(["/root"])` request was accepted and
+  executed without complaint (`files_scanned=106` in the `ScanStatus`
+  right after), even though `test` itself can't list `/root` (0700
+  root:root). Real oracle: even without direct root, a compromised
+  process at the same uid can have the daemon read files it can't read
+  itself, and infer things (existence, match against a YARA rule) via
+  `ScanStatus`/`History`. No DoS tested (would have needed a huge/slow
+  file, not done to stay within "probe" scope, not "break the VM").
+- `NOTIFY_SOCKET` inherited by `warden-notify-helper`/`warden-gui`
+  despite the privilege drop (no `env_remove` before `pre_exec`).
+- `--quarantine-file`: the exemption check uses a non-canonicalized path
+  (unlike `--add-exception`/`--remove-exception`).
+- TOCTOU on the control socket's permissions between `bind()` and
+  `chmod`/`chown` (theoretical window, depends on umask).
+- Quarantine manifest files not hardened to `0600` (inconsistent with
+  the fix applied to `history.rs` in the same batch).
+- Loss of manifest entries under concurrent `take()`/`restore()` access
+  (6 different processes share the same quarantine folder).
+- ~~**Confirmed live** (installed via `apt install unattended-upgrades`,
+  not just read in the code): `unattended-upgrade` is NEVER recognized
+  by `is_active()`, and the real cause is deeper than the simple `comm`
+  truncation initially suspected — it's a Python script
+  (`#!/usr/bin/python3`), so `/proc/<pid>/exe` resolves to
+  `/usr/bin/python3.13` (the interpreter), not to
+  `/usr/bin/unattended-upgrade` at all — exactly the same
+  interpreter-vs-script bug class as tonight's `warden-exec` fix, but
+  not yet applied here. Tested: a fake setuid dropped while a real
+  `unattended-upgrade --debug` is running gets quarantined immediately
+  instead of being suppressed — a guaranteed false positive on every
+  scheduled automatic update (`unattended-upgrades` is enabled by
+  default on Debian/Ubuntu).~~ **done** (see "MEDIUM backlog handled"
+  below).
+- Slow drip-feed (staying under the threshold over a window longer than
+  `burst_window_secs`) still bypasses all 3 counters — a structural
+  limitation inherent to sliding-window detection, not a bug introduced
+  tonight.
+- Symbolic kill for a fork-per-file process already dead by detection
+  time (file quarantine remains the real protection mechanism in that
+  case, not the kill).
 
-## Backlog HIGH traité (22 août, suite) - 2 TOCTOU + l'oracle StartScan
+## HIGH backlog handled (Aug 22, continued) — 2 TOCTOUs + the StartScan oracle
 
-Sur directive explicite de l'utilisateur ("traite le backlog HIGH, surtout
-les deux TOCTOU et l'oracle StartScan"), 3 findings HIGH corrigés,
-testés, et en cours de validation live :
+On the user's explicit direction ("handle the HIGH backlog, especially
+the two TOCTOUs and the StartScan oracle"), 3 HIGH findings fixed,
+tested, and validated live:
 
-**TOCTOU `warden-yara::fanotify_monitor`** - le code relisait le fichier
-en réouvrant par CHEMIN (`scanner.scan_file(&path)`) après avoir résolu
-ce chemin depuis le fd de l'event fanotify, jetant ce fd au passage. Entre
-l'event `FAN_CLOSE_WRITE` et la réouverture, un attaquant avec accès
-écriture au dossier surveillé peut substituer le contenu (ou un symlink) -
-faisant scanner à root un contenu différent de ce qui a réellement été
-fermé. **Fix** : nouvelle fonction `read_via_fd` (dup(2) du fd de l'event,
-lecture complète via ce dup, jamais de réouverture par chemin) + bascule
-de `scanner.scan_file(path)` vers `scanner.scan(&bytes)` (existe déjà dans
-l'API yara-x, scanne des données en mémoire). Nécessite `libc` en
-dépendance directe de `warden-yara` (déjà dans le workspace, juste pas
-déclaré dans ce crate).
+**`warden-yara::fanotify_monitor` TOCTOU** — the code re-read the file
+by reopening it by PATH (`scanner.scan_file(&path)`) after resolving
+that path from the fanotify event's fd, discarding that fd along the
+way. Between the `FAN_CLOSE_WRITE` event and the reopen, an attacker
+with write access to the watched folder can swap the content (or a
+symlink) — making root scan content different from what was actually
+closed. **Fix**: new `read_via_fd` function (dup(2) of the event's fd,
+full read via that dup, never a reopen by path) + switch from
+`scanner.scan_file(path)` to `scanner.scan(&bytes)` (already exists in
+the yara-x API, scans in-memory data). Requires `libc` as a direct
+dependency of `warden-yara` (already in the workspace, just not
+declared in this crate).
 
-**TOCTOU `warden-ransomware::fanotify_monitor`** - exactement le même
-défaut, sur le chemin d'échantillonnage d'entropie ("matches
-`warden-yara`'s own fanotify listener... works reliably" disait
-l'ancien commentaire - vrai uniquement parce que warden-yara avait
-exactement le même bug à l'époque, pas parce que réouvrir par chemin
-était sûr). **Fix** : même schéma, `read_sample_via_fd` (dup + lecture
-bornée à `sample_bytes`, pas tout le fichier - direction opposée à YARA
-qui a besoin du contenu complet pour le matching de règles).
+**`warden-ransomware::fanotify_monitor` TOCTOU** — the exact same flaw,
+on the entropy-sampling path ("matches `warden-yara`'s own fanotify
+listener... works reliably" said the old comment — true only because
+warden-yara had the exact same bug at the time, not because reopening by
+path was safe). **Fix**: same pattern, `read_sample_via_fd` (dup + read
+bounded to `sample_bytes`, not the whole file — the opposite direction
+from YARA, which needs the full content for rule matching).
 
-**Oracle `StartScan`** (confirmé en direct la nuit dernière : `test`
-demandait un scan de `/root` et le démon le faisait, alors que `test` ne
-peut pas lire `/root` lui-même) - **fix** : `control::run`/
-`handle_connection` reçoivent maintenant `target_home: PathBuf` (déjà
-résolu dans `main.rs`, juste jamais passé jusqu'ici), et
-`is_scannable_path` refuse toute requête `StartScan` dont un chemin ne
-canonicalise pas sous `target_home` OU `/tmp` (déjà lisible/inscriptible
-par n'importe quel utilisateur local, déjà surveillé en direct par YARA -
-pas un nouveau privilège). Le placeholder du champ de saisie GUI
-(`/home/you/Downloads, /tmp, ...`) correspondait déjà exactement à ce
-périmètre, aucun changement nécessaire côté `warden-gui`.
+**`StartScan` oracle** (confirmed live the night before: `test` asked
+for a scan of `/root` and the daemon did it, even though `test` can't
+read `/root` itself) — **fix**: `control::run`/`handle_connection` now
+receive `target_home: PathBuf` (already resolved in `main.rs`, just
+never passed down until now), and `is_scannable_path` refuses any
+`StartScan` request where a path doesn't canonicalize under
+`target_home` OR `/tmp` (already readable/writable by any local user,
+already watched live by YARA — not a new privilege). The GUI input
+field's placeholder (`/home/you/Downloads, /tmp, ...`) already matched
+exactly this scope, no change needed on `warden-gui`'s side.
 
-Testé : `cargo test --workspace` + `cargo clippy --workspace --all-targets
--- -D warnings` propres (nouveaux tests : `is_scannable_path` refuse
-`/root`/`/etc`, accepte le home et `/tmp`).
+Tested: clean `cargo test --workspace` + `cargo clippy --workspace
+--all-targets -- -D warnings` (new tests: `is_scannable_path` refuses
+`/root`/`/etc`, accepts home and `/tmp`).
 
-**Validé en direct sur les deux VMs** : `StartScan(["/root"])` en tant
-qu'utilisateur `test` → refusé (`path not allowed`) ; `StartScan` sur son
-propre `Documents` → toujours accepté. Non-régression fonctionnelle
-confirmée pour les deux TOCTOU corrigés : reverse shell déposé → toujours
-détecté et quarantiné par YARA sur les deux VMs ; burst de 16 fichiers
-haute-entropie (avec le seed de baseline plaintext requis par
-`require_directory_baseline`, oublié puis corrigé dans le test lui-même
-sur `ubuntu25.10` - pas une vraie régression, juste un test mal formé la
-première fois) → 15-16/16 fichiers quarantinés sur les deux VMs.
+**Validated live on both VMs**: `StartScan(["/root"])` as the `test`
+user → refused (`path not allowed`); `StartScan` on their own
+`Documents` → still accepted. Functional non-regression confirmed for
+both fixed TOCTOUs: reverse shell dropped → still detected and
+quarantined by YARA on both VMs; burst of 16 high-entropy files (with
+the plaintext baseline seed required by `require_directory_baseline`,
+forgotten then fixed in the test itself on `ubuntu25.10` — not a real
+regression, just a malformed test the first time) → 15-16/16 files
+quarantined on both VMs.
 
-## Backlog MEDIUM traité (22 août, suite 3) - oracle StartScan résiduel, padding YARA, unattended-upgrades
+## MEDIUM backlog handled (Aug 22, continued 3) — residual StartScan oracle, YARA padding, unattended-upgrades
 
-Sur directive explicite de l'utilisateur ("commence le backlog MEDIUM"),
-3 findings MEDIUM corrigés, testés en Docker, et validés en direct sur
-les VMs :
+On the user's explicit direction ("start the MEDIUM backlog"), 3 MEDIUM
+findings fixed, tested in Docker, and validated live on the VMs:
 
-**Oracle/DoS résiduel `StartScan` (`warden-yara::scan.rs`)** - deux trous
-distincts dans `scan_paths`/`walk` : (1) le check `is_symlink()` existant
-ne s'appliquait qu'aux entrées *découvertes pendant* la marche d'un
-répertoire, jamais à la racine `root` elle-même - une racine de scan qui
-est elle-même un symlink (vers `/proc` ou ailleurs) passait donc au
-travers du filtre `is_excluded` (qui ne voit que le chemin littéral du
-symlink, jamais sa cible) et était suivie sans broncher ; (2) aucun
-plafond de taille de fichier avant `scanner.scan_file(&path)` - un seul
-fichier énorme (image disque de VM, base de données, log multi-Go)
-pouvait bloquer un thread de scan indéfiniment. **Fix** : `scan_paths`
-vérifie maintenant `std::fs::symlink_metadata(root)` avant d'appeler
-`walk` sur chaque racine ; `walk` lit `entry.metadata().len()` et ignore
-tout fichier au-dessus de `MAX_FILE_SIZE_BYTES` (100 Mo) sans le scanner.
-3 nouveaux tests (`a_symlinked_scan_root_is_not_followed`,
+**Residual `StartScan` oracle/DoS (`warden-yara::scan.rs`)** — two
+distinct holes in `scan_paths`/`walk`: (1) the existing `is_symlink()`
+check only applied to entries *discovered while* walking a directory,
+never to the `root` itself — a scan root that is itself a symlink (to
+`/proc` or elsewhere) slipped right through the `is_excluded` filter
+(which only sees the symlink's literal path, never its target) and was
+followed without complaint; (2) no file-size cap before
+`scanner.scan_file(&path)` — a single huge file (VM disk image,
+database, multi-GB log) could block a scan thread indefinitely.
+**Fix**: `scan_paths` now checks `std::fs::symlink_metadata(root)`
+before calling `walk` on each root; `walk` reads
+`entry.metadata().len()` and skips any file above `MAX_FILE_SIZE_BYTES`
+(100 MB) without scanning it. 3 new tests
+(`a_symlinked_scan_root_is_not_followed`,
 `a_real_directory_root_is_still_scanned_normally`,
-`a_file_larger_than_the_size_cap_is_skipped_rather_than_scanned` - ce
-dernier utilise un fichier sparse via `set_len` pour ne pas écrire 100 Mo
-réels à chaque run de test).
+`a_file_larger_than_the_size_cap_is_skipped_rather_than_scanned` — the
+last one uses a sparse file via `set_len` to avoid actually writing 100
+MB on every test run).
 
-**Règle YARA `Bash_Dev_Tcp_Reverse_Shell` contournable par padding** - la
-condition `filesize < 65536` exemptait le fichier *entier* dès qu'il
-dépassait 64 Ko, donc un vrai reverse shell fonctionnel restait détecté
-tant qu'il faisait moins de 64 Ko, mais un attaquant pouvait garder le
-payload intact et juste ajouter du contenu de bourrage après (commentaire,
-here-doc, n'importe quoi que bash n'exécute jamais) pour repasser au-dessus
-du seuil et faire ignorer le scan entièrement - payload inchangé, toujours
-fonctionnel, mais silencieusement plus détecté. **Fix** : remplacé
-`filesize < 65536` par `$tcp_redir in (0..65536)` / `$udp_redir in
-(0..65536)` / `$exec in (0..65536)` (syntaxe supportée par yara-x,
-confirmée en inspectant les tests du parser vendored dans le cache Cargo)
-- borne désormais *où* les motifs doivent apparaître (toujours dans les
-premiers 64 Ko) plutôt que d'exempter le fichier entier une fois un seuil
-de taille dépassé. Nouveau test de non-régression
+**`Bash_Dev_Tcp_Reverse_Shell` YARA rule bypassable via padding** — the
+`filesize < 65536` condition exempted the *entire* file as soon as it
+exceeded 64 KB, so a genuine working reverse shell stayed detected as
+long as it was under 64 KB, but an attacker could keep the payload
+intact and just append padding content afterward (a comment, a
+here-doc, anything bash never executes) to push it back over the
+threshold and get the scan skipped entirely — payload unchanged, still
+functional, but silently no longer detected. **Fix**: replaced
+`filesize < 65536` with `$tcp_redir in (0..65536)` / `$udp_redir in
+(0..65536)` / `$exec in (0..65536)` (syntax supported by yara-x,
+confirmed by inspecting the vendored parser's tests in the Cargo cache)
+— now bounds *where* the patterns must appear (always within the first
+64 KB) rather than exempting the whole file once a size threshold is
+crossed. New non-regression test
 `still_flags_a_genuine_reverse_shell_padded_past_the_old_filesize_cutoff`
-(payload réel + bourrage jusqu'à 70 Ko, doit toujours matcher).
+(real payload + padding up to 70 KB, must still match).
 
-**`unattended-upgrade` jamais reconnu par `is_active()`** - cause
-confirmée : script Python (`#!/usr/bin/python3`), donc `/proc/<pid>/exe`
-résout vers l'interpréteur (`/usr/bin/python3.13`), jamais vers le script
-lui-même. **Fix** : `is_active()` tente maintenant un fallback quand
-`exe_name` est un interpréteur connu (`is_known_interpreter` : `python3`
-ou `python3.NN`) - il lit `/proc/<pid>/cmdline`, prend `argv[1]` (le
-chemin du script, toujours en première position après l'interpréteur pour
-une ligne shebang simple sans indirection `env`) via
-`interpreted_script_path`, et applique à *ce* chemin les deux mêmes
-vérifications que `exe` (nom connu ET répertoire canonicalisant vers
-`SYSTEM_BIN_DIRS`) - un `python3 /tmp/evil` qui prétend s'appeler
-"unattended-upgrade" via `argv` ne peut toujours pas faire canonicaliser
-`/tmp` en dossier système. Nouveaux tests unitaires
+**`unattended-upgrade` never recognized by `is_active()`** — confirmed
+cause: a Python script (`#!/usr/bin/python3`), so `/proc/<pid>/exe`
+resolves to the interpreter (`/usr/bin/python3.13`), never to the
+script itself. **Fix**: `is_active()` now attempts a fallback when
+`exe_name` is a known interpreter (`is_known_interpreter`: `python3` or
+`python3.NN`) — it reads `/proc/<pid>/cmdline`, takes `argv[1]` (the
+script's path, always in first position after the interpreter for a
+simple shebang line without `env` indirection) via
+`interpreted_script_path`, and applies the same two checks to *that*
+path as to `exe` (known name AND a directory canonicalizing to
+`SYSTEM_BIN_DIRS`) — a `python3 /tmp/evil` pretending to be named
+"unattended-upgrade" via `argv` still can't make `/tmp` canonicalize to
+a system directory. New unit tests
 (`recognizes_versioned_python_interpreter_names`,
 `interpreted_script_path_reads_argv1_from_cmdline`,
 `interpreted_script_path_returns_none_when_there_is_no_second_argv`).
-**Validé en direct sur `debian13`** : capture du `comm`/`exe`/`cmdline`
-réels d'un `unattended-upgrade --debug --dry-run` en cours d'exécution -
-`COMM=unattended-upgr`, `EXE=/usr/bin/python3.13`,
+**Validated live on `debian13`**: captured the real
+`comm`/`exe`/`cmdline` of a running `unattended-upgrade --debug
+--dry-run` — `COMM=unattended-upgr`,
+`EXE=/usr/bin/python3.13`,
 `CMDLINE=/usr/bin/python3|/usr/bin/unattended-upgrade|--debug|--dry-run|`
-- confirme exactement la forme que le fix suppose (et que l'ancien code,
-qui ne vérifiait que le basename brut de `exe`, ne pouvait jamais
-reconnaître).
+— confirms exactly the shape the fix assumes (and that the old code,
+which only checked `exe`'s raw basename, could never recognize).
 
-Testé : `cargo build --workspace` + `cargo clippy --workspace
---all-targets -- -D warnings` propres + `cargo test --workspace` (57
-tests, tous verts, y compris les 8 nouveaux ci-dessus). Déployé et
-redémarré proprement sur `debian13` et `ubuntu25.10` (`systemctl
-is-active` → `active` sur les deux, logs de démarrage sans erreur pour
-les 4 modules).
+Tested: clean `cargo build --workspace` + `cargo clippy --workspace
+--all-targets -- -D warnings` + `cargo test --workspace` (57 tests, all
+green, including the 8 new ones above). Deployed and cleanly restarted
+on `debian13` and `ubuntu25.10` (`systemctl is-active` → `active` on
+both, clean startup logs for the 4 modules).
 
-Note utilisateur en cours de session : `/usr/bin` est refusé par
-`StartScan` ("path not allowed (must be under your home directory or
-/tmp)") - **c'est le comportement voulu**, hérité du fix de l'oracle
-`StartScan` (backlog HIGH, section précédente), pas de ce lot MEDIUM. À
-laisser tel quel sur confirmation explicite de l'utilisateur.
+User note mid-session: `/usr/bin` is refused by `StartScan` ("path not
+allowed (must be under your home directory or /tmp)") — **this is the
+intended behavior**, inherited from the `StartScan` oracle fix (HIGH
+backlog, previous section), not from this MEDIUM batch. Left as-is on
+the user's explicit confirmation.
 
-## Backlog MEDIUM/LOW traité en totalité (22 août, suite 4)
+## MEDIUM/LOW backlog fully handled (Aug 22, continued 4)
 
-Sur directive explicite de l'utilisateur ("fait toute la ligne
-medium/low"), les 9 findings restants du backlog HIGH/MEDIUM/LOW sont
-tous corrigés, testés en Docker, et validés en direct sur les deux VMs :
+**`pidfd_open` failing no longer signaled anything at all**
+(`warden-common::process`) — a confirmed regression compared to the old
+best-effort `kill(pid)`: any `pidfd_open` failure (not just "process
+already dead") made `stop_then_kill` give up without sending any
+signal at all. **Fix**: new `raw_kill` function (kill by raw PID, less
+safe against PID reuse than the pidfd path but strictly better than
+nothing) used as a fallback when `pidfd_open` fails. Directly tested
+(`raw_kill_fallback_actually_terminates_a_real_child_process`) — no
+portable way to force a genuine `pidfd_open` failure on a really-alive
+process from a unit test, so the fallback is tested in isolation, same
+logic as the existing `pidfd_open_*` tests.
 
-**`pidfd_open` qui échoue ne signalait plus rien du tout**
-(`warden-common::process`) - régression confirmée par rapport à l'ancien
-`kill(pid)` best-effort : n'importe quel échec de `pidfd_open` (pas
-seulement "process déjà mort") faisait abandonner `stop_then_kill` sans
-envoyer aucun signal. **Fix** : nouvelle fonction `raw_kill` (kill par
-PID brut, moins sûr face au PID reuse que la voie pidfd mais strictement
-meilleur que rien) utilisée en fallback quand `pidfd_open` échoue. Testé
-directement (`raw_kill_fallback_actually_terminates_a_real_child_process`)
-- pas de moyen portable de forcer un vrai échec `pidfd_open` sur un
-process réellement vivant depuis un test unitaire, donc le fallback est
-testé isolément, même logique que les tests `pidfd_open_*` existants.
+**`control::run`'s `accept()` permanently killed the IPC listener**
+(`warden-core::control`) — a single error (typically `EMFILE`/`ENFILE`)
+propagated via `?` terminated the entire control loop for the rest of
+the daemon's life. **Fix**: retry loop with increasing backoff (capped
+at 2s), the same pattern already used for `fanotify::read_events`'s
+retry.
 
-**`control::run`'s `accept()` tuait le listener IPC en permanence**
-(`warden-core::control`) - une seule erreur (`EMFILE`/`ENFILE` typiquement)
-propagée via `?` terminait toute la boucle de contrôle pour le reste de
-la vie du démon. **Fix** : boucle de retry avec backoff croissant
-(plafonné à 2s), même schéma que le retry déjà en place sur
-`fanotify::read_events`.
+**TOCTOU on the control socket's permissions** between `bind()` and
+`chmod`/`chown` (`warden-core::control`) — **fix**: `umask(0o077)` set
+right before `bind()`, restored right after — the socket is born already
+inaccessible to group/others, no window. **Validated live on both VMs**:
+`stat` on `/run/warden/control.sock` right after startup → `600
+test:test` on both.
 
-**TOCTOU sur les permissions du socket de contrôle** entre `bind()` et
-`chmod`/`chown` (`warden-core::control`) - **fix** : `umask(0o077)` posé
-juste avant `bind()`, restauré juste après - le socket naît déjà
-non-accessible au groupe/others, sans fenêtre. **Validé en direct sur les
-deux VMs** : `stat` sur `/run/warden/control.sock` juste après démarrage
-→ `600 test:test` sur les deux.
-
-**Contournement par forgerie de format container plus large que
-documenté** (`warden-ransomware::detector`) - `observe_container_format_write`
-ne trackait QUE par répertoire et globalement, aucun compteur par-PID,
-contrairement à `observe_high_entropy_write`. Un process non-forké qui
-forge une signature ZIP/PDF sur chaque fichier chiffré bénéficiait donc
-d'un seuil 3x plus faible que prévu simplement parce que le signal le
-plus direct (par-PID) manquait totalement sur ce chemin. **Fix** :
-compteur `recent_container_format_writes_by_pid` ajouté au même seuil
-élevé que les deux autres, `files_for_pid`/`forget` mis à jour pour le
-fusionner - restaure aussi l'attribution correcte pour la réponse
-(quarantaine). Testé
+**Container-format-forgery bypass wider than documented**
+(`warden-ransomware::detector`) — `observe_container_format_write` only
+tracked per-folder and globally, no per-PID counter, unlike
+`observe_high_entropy_write`. A non-forked process forging a ZIP/PDF
+signature on every encrypted file therefore benefited from a threshold
+3x lower than intended simply because the most direct signal (per-PID)
+was entirely missing on this path. **Fix**:
+`recent_container_format_writes_by_pid` counter added at the same high
+threshold as the other two, `files_for_pid`/`forget` updated to merge
+it in — also restores correct attribution for the response
+(quarantine). Tested
 (`container_format_burst_from_a_single_pid_is_attributed_to_that_pid`).
 
-**Dossier de règles YARA custom illisible faisait échouer tout le
-module** (`warden-yara::rules`) - `read_dir` sur un dossier existant mais
-illisible (ACL cassée, montage réseau) propageait via `?`, faisant
-échouer `compile()` entièrement - même les règles builtin. Scénario
-plausible en prod : `custom_rules_dir` hors du périmètre
-`ReadWritePaths=` de `ProtectSystem=strict` renvoie `EACCES` même à root
-au niveau du mount namespace, pas des permissions DAC classiques (donc
-pas reproductible par un simple `chmod 000` en root dans un test unitaire
-- documenté honnêtement plutôt que simulé). **Fix** : dégrade vers
-builtin-only avec un `warn!`, comme le cas "dossier absent" déjà géré.
-Testés : dossier absent (`nonexistent_custom_rules_dir_falls_back_to_builtin_only`)
-et dossier valide avec une règle custom
-(`a_valid_custom_rule_file_loads_alongside_builtins`) - aucun test
-n'existait avant pour le chemin custom-rules-dir du tout.
+**Unreadable custom YARA rules folder failed the entire module**
+(`warden-yara::rules`) — `read_dir` on a folder that exists but is
+unreadable (broken ACL, network mount) propagated via `?`, making
+`compile()` fail entirely — even the built-in rules. Plausible
+production scenario: `custom_rules_dir` outside `ProtectSystem=strict`'s
+`ReadWritePaths=` scope returns `EACCES` even to root at the mount
+namespace level, not classic DAC permissions (so not reproducible with
+a simple `chmod 000` as root in a unit test — honestly documented
+rather than simulated). **Fix**: degrades to builtin-only with a
+`warn!`, like the already-handled "folder absent" case. Tested: folder
+absent (`nonexistent_custom_rules_dir_falls_back_to_builtin_only`) and a
+valid folder with a custom rule
+(`a_valid_custom_rule_file_loads_alongside_builtins`) — no test existed
+before for the custom-rules-dir path at all.
 
-**`NOTIFY_SOCKET` hérité par `warden-notify-helper`/`warden-gui` malgré
-la chute de privilèges** (`warden-common::notify`) - systemd pose
-`NOTIFY_SOCKET` dans l'environnement du process root ; sans
-`env_remove`, le helper (privilèges tombés vers l'utilisateur cible) en
-héritait, lui donnant un canal pour envoyer de faux `WATCHDOG=1`/
-`READY=1` à l'unité systemd de ce démon root. **Fix** :
-`command.env_remove("NOTIFY_SOCKET")` avant le `pre_exec` de drop de
-privilèges - `warden-gui` (lancé PAR le helper, jamais directement par
-`warden-core`) en hérite naturellement l'absence. **Validé en direct sur
-`debian13`** : déclenché une vraie détection YARA (reverse shell déposé),
-capturé `/proc/<pid du helper>/environ` → `NOTIFY_SOCKET` absent, contre
-présent dans l'environ de `warden` lui-même (`/run/systemd/notify`) pour
-comparaison.
+**`NOTIFY_SOCKET` inherited by `warden-notify-helper`/`warden-gui`
+despite the privilege drop** (`warden-common::notify`) — systemd sets
+`NOTIFY_SOCKET` in the root process's environment; without
+`env_remove`, the helper (privileges dropped to the target user)
+inherited it, giving it a channel to send fake `WATCHDOG=1`/`READY=1`
+to this root daemon's systemd unit. **Fix**:
+`command.env_remove("NOTIFY_SOCKET")` before the privilege-dropping
+`pre_exec` — `warden-gui` (launched BY the helper, never directly by
+`warden-core`) naturally inherits its absence too. **Validated live on
+`debian13`**: triggered a real YARA detection (reverse shell dropped),
+captured `/proc/<helper's pid>/environ` → `NOTIFY_SOCKET` absent,
+versus present in `warden`'s own environ (`/run/systemd/notify`) for
+comparison.
 
-**`--quarantine-file` : check d'exemption sur un chemin non-canonicalisé**
-(`warden-core::main`) - contrairement à `--add-exception`/
-`--remove-exception` (qui canonicalisent avant de comparer), un chemin
-relatif ou avec `..` passé à `--quarantine-file` pouvait faire échouer
-silencieusement la reconnaissance d'une exception active existante,
-contournant le garde-fou "refuse d'agir sur un chemin exempté". **Fix** :
-canonicalisation ajoutée avant `is_exempt`/`quarantine.take`, cohérent
-avec le reste du CLI.
+**`--quarantine-file`: exemption check on a non-canonicalized path**
+(`warden-core::main`) — unlike `--add-exception`/`--remove-exception`
+(which canonicalize before comparing), a relative path or one with `..`
+passed to `--quarantine-file` could silently fail to recognize an
+existing active exception, bypassing the "refuse to act on an exempted
+path" safeguard. **Fix**: canonicalization added before
+`is_exempt`/`quarantine.take`, consistent with the rest of the CLI.
 
-**Fichiers manifest de quarantaine pas durcis à `0600`**
-(`warden-common::quarantine`) - `manifest.jsonl` et son fichier de
-réécriture temporaire (`rewrite_manifest`) n'avaient pas de mode explicite.
-**Fix initial** : `.mode(0o600)` sur les `OpenOptions`. **Piège trouvé en
-validant en direct** : `.mode()` ne s'applique QUE si `open()` crée
-réellement le fichier - un `manifest.jsonl` déjà existant sur `debian13`
-(accumulé pendant toute cette session) restait à `644` après le premier
-redéploiement, `.mode(0o600)` n'ayant simplement rien à faire sur un
-fichier déjà là. **Fix corrigé** : `f.set_permissions(0o600)` réappliqué
-explicitement sur le handle déjà ouvert, à chaque appel, même logique que
-`Quarantine::new()` pour le dossier lui-même ("ne jamais faire confiance
-à ce qui a survécu, toujours la réaffirmer"). **Re-validé en direct sur
-les deux VMs après correction** : nouvelle détection déclenchée →
-`manifest.jsonl` bien à `600 root:root` sur `debian13` ET `ubuntu25.10`.
+**Quarantine manifest files not hardened to `0600`**
+(`warden-common::quarantine`) — `manifest.jsonl` and its temporary
+rewrite file (`rewrite_manifest`) had no explicit mode. **Initial fix**:
+`.mode(0o600)` on the `OpenOptions`. **Trap found while validating
+live**: `.mode()` only applies if `open()` actually creates the file —
+a `manifest.jsonl` already existing on `debian13` (accumulated
+throughout this whole session) stayed at `644` after the first
+redeployment, `.mode(0o600)` simply having nothing to do on a file
+already there. **Corrected fix**: `f.set_permissions(0o600)`
+re-applied explicitly on the already-open handle, on every call, same
+logic as `Quarantine::new()` for the folder itself ("never trust what
+survived, always reassert it"). **Re-validated live on both VMs after
+the correction**: new detection triggered → `manifest.jsonl` properly
+at `600 root:root` on both `debian13` AND `ubuntu25.10`.
 
-**Perte d'entrées manifest sous accès concurrent `take()`/`restore()`**
-(`warden-common::quarantine`) - 6 process différents (`warden`,
-`warden-exec`, `warden-network`, et chaque module de détection dans son
-propre process) partagent le même répertoire de quarantaine sans aucun
-verrou. `restore()` lit tout le manifest, déplace le fichier, puis
-réécrit le manifest SANS l'entrée restaurée - un `take()` concurrent qui
-ajoute une entrée entre cette lecture et cette réécriture se faisait
-silencieusement écraser par la réécriture basée sur l'instantané périmé.
-Second problème trouvé en marge : `append_manifest` utilisait `writeln!`
-directement sur le fichier, ce qui émet DEUX appels `write(2)` séparés
-(la ligne JSON, puis le `\n`) - chacun atomique individuellement sous
-`O_APPEND`, mais pas la paire, laissant une fenêtre où l'écriture d'un
-autre process pouvait s'intercaler entre les deux et corrompre les deux
-lignes. **Fix** : verrou `flock(2)` exclusif partagé
-(`manifest.lock`, nouveau fichier) posé sur toute la section
-lire-modifier-écrire de `restore()` et autour de chaque appel à
-`append_manifest` ; `append_manifest` construit la ligne complète
-(JSON + `\n`) et l'écrit en un seul `write_all`. Testés :
+**Loss of manifest entries under concurrent `take()`/`restore()`
+access** (`warden-common::quarantine`) — 6 different processes
+(`warden`, `warden-exec`, `warden-network`, and each detection module in
+its own process) share the same quarantine folder with no lock at all.
+`restore()` reads the whole manifest, moves the file, then rewrites the
+manifest WITHOUT the restored entry — a concurrent `take()` adding an
+entry between this read and this rewrite got silently overwritten by
+the rewrite based on the stale snapshot. Second issue found along the
+way: `append_manifest` used `writeln!` directly on the file, which
+issues TWO separate `write(2)` calls (the JSON line, then the `\n`) —
+each individually atomic under `O_APPEND`, but not the pair, leaving a
+window where another process's write could interleave between the two
+and corrupt both lines. **Fix**: exclusive shared `flock(2)` lock
+(`manifest.lock`, new file) placed around the entire
+read-modify-write section of `restore()` and around every call to
+`append_manifest`; `append_manifest` now builds the complete line
+(JSON + `\n`) and writes it in a single `write_all`. Tested:
 `concurrent_appends_do_not_lose_or_corrupt_entries` (8 threads × 20
-écritures, aucune perdue) et `concurrent_take_during_restore_does_not_lose_the_new_entry`
-(reproduit précisément le scénario de perte confirmé) - un `flock` posé
-via un `open()` frais par appel se comporte identiquement entre threads
-et process séparés, donc ces tests reproduisent fidèlement la course
-inter-process réelle.
+writes, none lost) and
+`concurrent_take_during_restore_does_not_lose_the_new_entry` (precisely
+reproduces the confirmed loss scenario) — a `flock` set via a fresh
+`open()` per call behaves identically across threads and separate
+processes, so these tests faithfully reproduce the real inter-process
+race.
 
-**Drip-feed lent et kill symbolique pour un process déjà mort** :
-confirmés comme limitations structurelles (détection par fenêtre
-glissante, quarantaine des fichiers reste la vraie protection dans ce
-cas) plutôt que des bugs à corriger - acceptées, documentées, pas de
-changement de code.
+**Slow drip-feed and symbolic kill for an already-dead process**:
+confirmed as structural limitations (sliding-window detection, file
+quarantine remains the real protection in that case) rather than bugs
+to fix — accepted, documented, no code change.
 
-Testé : `cargo build --workspace` + `cargo clippy --workspace
---all-targets -- -D warnings` propres + `cargo test --workspace` (63
-tests, tous verts). Déployé et revalidé en direct sur `debian13` ET
-`ubuntu25.10` : socket de contrôle `600`, `Ping`/`Pong` fonctionnel,
-détection reverse-shell toujours opérationnelle (quarantaine effective),
-`manifest.jsonl`/`manifest.lock` à `600 root:root` sur les deux,
-`NOTIFY_SOCKET` absent de l'environnement de `warden-notify-helper`.
+Tested: clean `cargo build --workspace` + `cargo clippy --workspace
+--all-targets -- -D warnings` + `cargo test --workspace` (63 tests, all
+green). Deployed and revalidated live on both `debian13` AND
+`ubuntu25.10`: control socket `600`, `Ping`/`Pong` functional, reverse
+shell detection still operational (effective quarantine),
+`manifest.jsonl`/`manifest.lock` at `600 root:root` on both,
+`NOTIFY_SOCKET` absent from `warden-notify-helper`'s environment.
 
-## Prochaine session : par où reprendre
+## Next session: where to pick back up
 
-Le backlog HIGH/MEDIUM/LOW documenté depuis le début de cette vague est
-maintenant **entièrement traité** (7 critiques + 3 HIGH + 12 MEDIUM/LOW,
-2 de ces derniers acceptés comme limitations structurelles plutôt que
-corrigés). Ce lot a été committé (`89059a0`).
+1. New, complete red-team audit on both VMs (within the
+   `warden-redteam` container/the VMs only — user directive: nothing
+   downloaded from the internet/GitHub for red-teaming, only `apt`
+   packages and homemade tools).
+2. Regenerate `/home/user/warden.zip` and `install.sh` on the Desktop if
+   further code changes are made (currently up to date with `4f68624`,
+   but to re-check before final publication on GitHub).
+3. Evaluate a simplified Sigma detection layer (YARA done, see above).
+4. Privesc: Linux capabilities (`setcap`) in addition to SUID/SGID.
+5. `cargo-deny` alongside `cargo-audit` (licenses, crate bans).
+6. Infostealer module (reading browser/SSH/cloud-CLI credential stores)
+   — discussed and scoped with the user (notify-only mode first, no
+   synchronous blocking, allowlist for legitimate accessors), but
+   explicitly declined for now ("can't be bothered, we're doing nothing
+   about it... it's an extra layer of defense, not a replacement for
+   human vigilance"). Don't bring it up again unless the user reopens
+   the topic themselves.
 
-## `install.sh`/`uninstall.sh` validés de bout en bout sur les 4 familles de gestionnaires de paquets + création d'un désinstalleur (23 août)
+## `install.sh`/`uninstall.sh` validated end-to-end across the 4 package-manager families + an uninstaller built (Aug 23)
 
-Plutôt que de tester bêtement les 7 noms de distro un par un, `install.sh`
-n'a en réalité que 4 branches de gestionnaire de paquets distinctes
-(apt/dnf/pacman/zypper) - chacune validée une fois pour de vrai plutôt
-que dupliquée inutilement :
+Rather than bluntly testing the 7 distro names one by one, `install.sh`
+really only has 4 distinct package-manager branches (apt/dnf/pacman/
+zypper) — each validated once for real rather than needlessly
+duplicated:
 
-- **apt** (Debian/Ubuntu/Kali/Mint/Pop) - `install.sh` exécuté pour de
-  vrai (pas le script de déploiement manuel habituel) sur les deux VMs
-  réelles `debian13` et `ubuntu25.10`, y compris le build eBPF complet
-  (`warden-exec`/`warden-network`, rustup nightly + bpf-linker déjà en
-  place sur ces VMs depuis les sessions précédentes) et la GUI GTK4.
-  Détection reverse-shell confirmée fonctionnelle après install sur les
-  deux.
-- **dnf** (Fedora/RHEL/Rocky/Alma/CentOS) - nouveau
-  `docker/Dockerfile.test.fedora` (systemd réel comme PID1, pattern
-  repris de `~/ransomshield/docker/Dockerfile.debian`: masquer les
-  units matériel-dépendantes inutiles en conteneur, `STOPSIGNAL
+- **apt** (Debian/Ubuntu/Kali/Mint/Pop) — `install.sh` actually run (not
+  the usual manual deployment script) on both real VMs `debian13` and
+  `ubuntu25.10`, including the full eBPF build (`warden-exec`/
+  `warden-network`, rustup nightly + bpf-linker already in place on
+  these VMs from previous sessions) and the GTK4 GUI. Reverse-shell
+  detection confirmed working after install on both.
+- **dnf** (Fedora/RHEL/Rocky/Alma/CentOS) — new
+  `docker/Dockerfile.test.fedora` (real systemd as PID1, pattern
+  reused from `~/ransomshield/docker/Dockerfile.debian`: masking
+  irrelevant hardware-dependent units in a container, `STOPSIGNAL
   SIGRTMIN+3`, `VOLUME ["/sys/fs/cgroup"]`, `CMD ["/sbin/init"]`).
-  `install.sh` exécuté pour de vrai (`cargo`/`rustc` distro via `dnf`,
-  eBPF sauté proprement - pas de rustup nightly configuré, comportement
-  attendu et documenté dans le script) : build complet workspace + GUI
-  GTK4/libadwaita, unit systemd installée et démarrée, détection
-  reverse-shell confirmée (fichier quarantiné).
-- **pacman** (Arch/Manjaro) - `docker/Dockerfile.test.arch`, même
-  validation complète.
-- **zypper** (openSUSE Tumbleweed/SLES) - `docker/Dockerfile.test.opensuse`,
-  même validation complète.
+  `install.sh` actually run (distro `cargo`/`rustc` via `dnf`, eBPF
+  cleanly skipped — no rustup nightly configured, expected and
+  documented behavior in the script): full workspace + GTK4/libadwaita
+  GUI build, systemd unit installed and started, reverse-shell
+  detection confirmed (file quarantined).
+- **pacman** (Arch/Manjaro) — `docker/Dockerfile.test.arch`, same full
+  validation.
+- **zypper** (openSUSE Tumbleweed/SLES) —
+  `docker/Dockerfile.test.opensuse`, same full validation.
 
-**Nouveau : `uninstall.sh`** (sur demande explicite) - désinstalleur
-propre : arrête/désactive les services AVANT de toucher un fichier (même
-raisonnement qu'`install.sh` : persistence surveille activement
-`/etc/systemd/system`), retire binaires/units/icônes GUI, et laisse
-`/etc/warden` (config) et `/var/lib/warden` (quarantaine, historique,
-seed honeypot) intacts par défaut - un fichier quarantiné peut être la
-seule copie survivante d'un incident réel. Un `--purge` optionnel
-supprime aussi ces deux-là, mais seulement après confirmation explicite
-(`yes` tapé, ou `-y`/`--yes` pour l'usage non-interactif). Tous les
-chemins agis dessus sont des constantes fixes en tête de script - jamais
-construits depuis une variable qui pourrait être vide, pour qu'aucun
-`rm -rf` ne puisse jamais s'élargir accidentellement. Ne tente pas de
-reconstruire/supprimer les dossiers honeypot dans le `$HOME` de
-l'utilisateur (leur nommage est un algorithme dérivé d'un seed
-aléatoire dans `honeypot.rs` - le dupliquer en bash serait une
-seconde implémentation risquant de diverger silencieusement de la
-vraie ; un pattern-match sur des dossiers arbitraires dans un home
-réel pour les supprimer automatiquement est aussi le genre de pari
-qu'un script de nettoyage ne devrait pas faire) - documenté
-explicitement dans le message final plutôt que laissé sous silence.
+**New: `uninstall.sh`** (on explicit request) — a clean uninstaller:
+stops/disables services BEFORE touching any file (same reasoning as
+`install.sh`: persistence actively watches
+`/etc/systemd/system`), removes binaries/units/GUI icons, and leaves
+`/etc/warden` (config) and `/var/lib/warden` (quarantine, history,
+honeypot seed) intact by default — a quarantined file can be the only
+surviving copy of a real incident. An optional `--purge` also removes
+those two, but only after explicit confirmation (`yes` typed, or
+`-y`/`--yes` for non-interactive use). Every path acted on is a fixed
+constant at the top of the script — never built from a variable that
+could be empty, so no `rm -rf` can ever accidentally widen. Doesn't
+attempt to rebuild/delete honeypot folders in the user's `$HOME` (their
+naming is an algorithm derived from a random seed in `honeypot.rs` —
+duplicating it in bash would be a second implementation risking silent
+divergence from the real one; pattern-matching arbitrary folders in a
+real home to auto-delete them is also the kind of gamble a cleanup
+script shouldn't take) — explicitly documented in the final message
+rather than left unsaid.
 
-**SAST** : `shellcheck` propre (exit 0) sur `uninstall.sh`.
+**SAST**: `shellcheck` clean (exit 0) on `uninstall.sh`.
 
-**Validé en conditions réelles** (installation réelle → détection réelle
-→ désinstallation → vérification qu'il ne reste plus rien → re-exécution
-pour prouver l'idempotence → réinstallation pour laisser la machine
-protégée) sur :
-- Fedora, Arch, openSUSE (conteneurs Docker, `--purge` testé - jetables,
-  aucune donnée réelle à perdre).
-- `debian13`, `ubuntu25.10` (VMs réelles, **sans** `--purge` - ces VMs
-  ont des mois de preuves de tests red-team accumulées dans leur
-  quarantaine ; 69 et 73 fichiers respectivement, comptés avant/après
-  pour confirmer qu'aucun n'a été perdu par la désinstallation par
-  défaut). Les deux VMs ont été réinstallées ensuite via `install.sh`
-  pour repartir protégées.
+**Validated under real conditions** (real install → real detection →
+uninstall → verify nothing is left → re-run to prove idempotence →
+reinstall to leave the machine protected) on:
+- Fedora, Arch, openSUSE (Docker containers, `--purge` tested —
+  disposable, no real data to lose).
+- `debian13`, `ubuntu25.10` (real VMs, **without** `--purge` — these VMs
+  have months of accumulated red-team test evidence in their quarantine;
+  69 and 73 files respectively, counted before/after to confirm none was
+  lost by the default uninstall). Both VMs were then reinstalled via
+  `install.sh` to leave them protected again.
 
-Incident opérationnel en cours de route, pour référence future : la
-toute première tentative d'exécuter `install.sh` sur `ubuntu25.10` via
-`paramiko.exec_command` (sans `setsid`/`nohup`/`disown`) a subi un
-`PipeTimeout` côté client sans que le process distant meure - il a
-continué à tourner en arrière-plan, orphelin, pendant plusieurs heures
-en parallèle d'une seconde tentative relancée par erreur, gonflant
-artificiellement la durée totale sans qu'aucun des deux builds ne soit
-réellement bloqué. Leçon retenue : toujours lancer une commande longue
-sur une VM distante via `setsid nohup ... & disown` avec sortie
-redirigée vers un fichier, jamais en gardant le process attaché à la
-session SSH/paramiko elle-même - une commande longue ne doit jamais
-dépendre de la survie de la connexion qui l'a lancée.
+Operational incident along the way, for future reference: the very
+first attempt to run `install.sh` on `ubuntu25.10` via
+`paramiko.exec_command` (without `setsid`/`nohup`/`disown`) suffered a
+`PipeTimeout` client-side without the remote process dying — it kept
+running in the background, orphaned, for several hours in parallel with
+a second attempt mistakenly relaunched, artificially inflating the
+total duration without either build actually being stuck. Lesson
+learned: always launch a long-running command on a remote VM via
+`setsid nohup ... & disown` with output redirected to a file, never
+keeping the process attached to the SSH/paramiko session itself that
+launched it — a long command should never depend on the survival of the
+connection that started it.
 
-Lot install/uninstall committé (`f20282f`). README réécrit et committé
-(`78cb91c`). `PUSH_TO_GITHUB.txt` et `/home/user/warden.zip` préparés
-(zip validé de bout en bout : contenu extrait à froid dans un conteneur
-neuf, `install.sh` exécuté depuis cette copie, détection réelle
-confirmée - le zip est un livrable autoportant complet).
+Install/uninstall batch committed (`f20282f`). README rewritten and
+committed (`78cb91c`). `PUSH_TO_GITHUB.txt` and `/home/user/warden.zip`
+prepared (zip validated end-to-end: content extracted cold in a fresh
+container, `install.sh` run from that copy, real detection confirmed —
+the zip is a fully self-contained deliverable).
 
-## `pkexec`/PolicyKit manquant - trouvé en testant la GUI en direct (23 août)
+## Missing `pkexec`/PolicyKit — found while testing the GUI live (Aug 23)
 
-L'utilisateur a testé la GUI en conditions réelles sur `debian13` -
-Restore et Switch mode échouaient tous les deux avec "Could not run
-pkexec: Aucun fichier ou dossier de ce nom". Cause : `pkexec` (utilisé
-par TOUTES les actions authentifiées de la GUI - restore, exceptions,
-quarantine manuel, changement de mode, voir `run_pkexec_warden` dans
-`warden-gui/src/ui.rs`) n'était installé par aucune branche
-d'`install_packages()` - jamais un vrai paquet requis pour BUILD Warden,
-seulement pour l'UTILISER une fois installé, donc invisible tant qu'une
-machine a déjà un environnement de bureau complet qui l'apporte comme
-dépendance (le cas de toutes les vraies machines desktop, mais pas de
-cette VM minimale ni des conteneurs de test de cette nuit).
+The user tested the GUI under real conditions on `debian13` — Restore
+and Switch mode both failed with "Could not run pkexec: No such file or
+directory". Cause: `pkexec` (used by ALL of the GUI's authenticated
+actions — restore, exceptions, manual quarantine, mode switch, see
+`run_pkexec_warden` in `warden-gui/src/ui.rs`) wasn't installed by any
+branch of `install_packages()` — never a real package required to BUILD
+Warden, only to USE it once installed, so it stayed invisible as long as
+a machine already had a full desktop environment bringing it in as a
+dependency (the case for every real desktop machine, but not this
+minimal VM nor tonight's test containers).
 
-**Piège en corrigeant** : `policykit-1` n'existe plus tel quel sur
-Debian 13 (trixie) - scindé en `pkexec` + `polkitd` séparés. Un simple
-ajout de `policykit-1` à la liste de paquets aurait fait échouer
-`apt-get install` EN ENTIER (un seul nom de paquet introuvable annule
-toute la commande), cassant tout l'install sur trixie pour ce détail.
-**Fix** : nouvelle fonction `install_polkit_apt()` isolée, essaie
-`policykit-1` puis retombe sur `pkexec`+`polkitd`, best-effort (avertit
-sans faire échouer le reste de l'install). `polkit` ajouté directement
-pour dnf/pacman/zypper - vérifié en direct (requête au dépôt de chaque
-distro, pas juste supposé) que c'est le bon nom sur les 3.
+**Trap while fixing**: `policykit-1` no longer exists as such on Debian
+13 (trixie) — split into separate `pkexec` + `polkitd` packages. A
+simple addition of `policykit-1` to the package list would have made
+`apt-get install` fail ENTIRELY (a single missing package name cancels
+the whole command), breaking the whole install on trixie over this one
+detail. **Fix**: new isolated `install_polkit_apt()` function, tries
+`policykit-1` then falls back to `pkexec`+`polkitd`, best-effort (warns
+without failing the rest of the install). `polkit` added directly for
+dnf/pacman/zypper — verified live (querying each distro's repo, not
+just assumed) that it's the right name on all 3.
 
-**Incident opérationnel en marge** : pour tester le fix proprement,
-`pkexec` a été désinstallé de `debian13` pour simuler une machine
-neuve - sans prévenir l'utilisateur que c'était fait sur la VM qu'il
-testait activement, ce qui a cassé la GUI sous ses yeux pendant le
-test. Réinstallé immédiatement. Leçon : une action destructive/perturbatrice
-sur une machine que l'utilisateur utilise activement en direct doit être
-annoncée AVANT de la faire, même pour un test, même réversible en
-quelques secondes.
+**Side incident**: to test the fix cleanly, `pkexec` was uninstalled
+from `debian13` to simulate a fresh machine — without warning the user
+that this was being done on the VM they were actively testing, which
+broke the GUI in front of them mid-test. Reinstalled immediately.
+Lesson: a destructive/disruptive action on a machine the user is
+actively using live must be announced BEFORE doing it, even for a test,
+even if reversible within seconds.
 
-**Validé en direct sur `debian13`** : `pkexec` désinstallé, vrai
-`install.sh` relancé de bout en bout (build complet + `install_polkit_apt`
-+ démarrage des 3 services), `pkexec` de retour, détection reverse-shell
-toujours fonctionnelle. Un agent d'authentification PolicyKit
-(`polkit-kde-authentication-agent-1`) était déjà actif dans la session
-KDE Plasma de la VM, confirmant que `pkexec` seul était bien la pièce
-manquante. Committé (`4f68624`).
+**Validated live on `debian13`**: `pkexec` uninstalled, real
+`install.sh` rerun end-to-end (full build + `install_polkit_apt` + the
+3 services started), `pkexec` back, reverse-shell detection still
+working. A PolicyKit authentication agent
+(`polkit-kde-authentication-agent-1`) was already active in the VM's
+KDE Plasma session, confirming `pkexec` alone was indeed the missing
+piece. Committed (`4f68624`).
 
-## Prochaine session : par où reprendre
+## Next session: where to pick back up
 
-1. Nouvel audit red team complet sur les deux VMs (dans le conteneur
-   `warden-redteam`/les VMs uniquement - directive utilisateur : rien
-   téléchargé depuis internet/GitHub pour le red team, uniquement des
-   paquets `apt` et des outils écrits maison).
-2. Régénérer `/home/user/warden.zip` et `install.sh` sur le Bureau si
-   d'autres changements de code sont faits (actuellement à jour avec
-   `4f68624`, mais à revérifier avant publication finale sur GitHub).
-3. Évaluer une détection Sigma simplifiée (YARA fait, voir plus haut).
-4. Privesc : capabilities Linux (`setcap`) en complément du SUID/SGID.
-5. `cargo-deny` en complément de `cargo-audit` (licences, bans de crates).
-6. Module infostealer (lecture des stores de credentials navigateur/SSH/
-   cloud CLI) - discuté et scopé avec l'utilisateur (mode notify d'abord,
-   pas de blocage synchrone, liste de confiance pour les accesseurs
-   légitimes), mais explicitement refusé pour l'instant ("la flemme, on
-   fait rien... c'est une défense en plus, pas un remplacement de la
-   vigilance humaine"). Ne pas reproposer sans que l'utilisateur relance
-   le sujet lui-même.
+1. New, complete red-team audit on both VMs (within the
+   `warden-redteam` container/the VMs only — user directive: nothing
+   downloaded from the internet/GitHub for red-teaming, only `apt`
+   packages and homemade tools).
+2. Regenerate `/home/user/warden.zip` and `install.sh` on the Desktop if
+   further code changes are made (currently up to date with `4f68624`,
+   but to re-check before final publication on GitHub).
+3. Evaluate a simplified Sigma detection layer (YARA done, see above).
+4. Privesc: Linux capabilities (`setcap`) in addition to SUID/SGID.
+5. `cargo-deny` alongside `cargo-audit` (licenses, crate bans).
+6. Infostealer module (reading browser/SSH/cloud-CLI credential stores)
+   — discussed and scoped with the user (notify-only mode first, no
+   synchronous blocking, allowlist for legitimate accessors), but
+   explicitly declined for now ("can't be bothered, we're doing nothing
+   about it... it's an extra layer of defense, not a replacement for
+   human vigilance"). Don't bring it up again unless the user reopens
+   the topic themselves.
 
-## Audit externe (issue #1, PR #2, audit "Fable") - analysé, corrigé, validé en direct (23 août)
+## External audit (issue #1, PR #2, "Fable" audit) — analyzed, fixed, validated live (Aug 23)
 
-Le dépôt a été poussé sur GitHub entre-temps (`Spellskite-coding/Warden`).
-Un ami a ouvert une issue de sécurité réelle sur le burst detector, une PR
-avec un correctif, et fait passer une revue de code plus large ("Fable")
-sur l'architecture générale. Les trois ont été lus et vérifiés contre le
-code réel avant toute action - pas pris pour argent comptant.
+The repo was pushed to GitHub in the meantime
+(`Spellskite-coding/Warden`). A friend opened a real security issue on
+the burst detector, a PR with a fix, and ran a broader code review
+("Fable") on the overall architecture. All three were read and checked
+against the real code before any action — not taken at face value.
 
-**Issue #1 / PR #2 - burst detector aveugle aux nouveaux répertoires.**
-Confirmé exact par lecture directe : `observe_high_entropy_write` et
-`observe_container_format_write` retournaient `Verdict::Clean`
-immédiatement si `has_baseline()` était faux, court-circuitant même le
-compteur global - un répertoire fraîchement créé (jamais vu avec un
-contenu en clair) était invisible au burst detector, quel que soit le
-nombre de fichiers chiffrés dedans.
+**Issue #1 / PR #2 — burst detector blind to new directories.**
+Confirmed exact by direct reading: `observe_high_entropy_write` and
+`observe_container_format_write` returned `Verdict::Clean` immediately
+if `has_baseline()` was false, short-circuiting even the global counter
+— a freshly created directory (never seen with plaintext content) was
+invisible to the burst detector, regardless of how many files got
+encrypted inside it.
 
-La PR proposait un correctif plus fin que l'issue elle-même : compteur
-per-pid rendu inconditionnel, deux maps globales séparées (baseline vs
-sans baseline) pour éviter un verdict qui dépend de l'ordre d'écriture.
-Bonne architecture, mais un défaut réel dans les seuils choisis : la PR
-mettait le seuil "sans baseline" à 2x le seuil normal (30 fichiers au
-lieu de 15) - ce qui rouvre le bug qu'elle corrige, juste avec un budget
-plus grand : un attaquant qui cible systématiquement des répertoires
-neufs obtient une allocation double. Repris la structure de la PR (maps
-séparées, per-pid inconditionnel) mais avec le MÊME seuil des deux côtés
-- pas d'incitation mécanique à préférer les répertoires neufs.
+The PR proposed a fix finer than the issue itself: the per-pid counter
+made unconditional, two separate global maps (baseline vs. no-baseline)
+to avoid a verdict depending on write order. Good architecture, but a
+real flaw in the chosen thresholds: the PR set the "no baseline"
+threshold to 2x the normal threshold (30 files instead of 15) — which
+reopens the very bug it fixes, just with a bigger budget: an attacker
+systematically targeting fresh directories gets a double allowance.
+Kept the PR's structure (separate maps, unconditional per-pid) but with
+the SAME threshold on both sides — no mechanical incentive to prefer
+fresh directories.
 
-Reproduit en direct sur `debian13` (mode enforce, `test` protégé) :
-`mkdir` + 20x `dd if=/dev/urandom` dans un répertoire neuf sous
-`Documents/` - AVANT le correctif ça serait passé silencieusement (bug
-confirmé par lecture de code, pas re-testé sur l'ancien binaire pour ne
-pas perdre de temps). APRÈS : détection déclenchée pile au 15e fichier
-(`recent_writes_global_unbaselined`, seuil identique au cas avec
-baseline), les 20 fichiers mis en quarantaine. 6 nouveaux tests unitaires
-ajoutés dans `detector.rs` (bypass global sans baseline, container-format
-sans baseline, per-pid seul, seuils identiques baseline/sans-baseline,
-répertoire type Pictures jamais baseliné).
+Reproduced live on `debian13` (enforce mode, `test` protected): `mkdir`
++ 20x `dd if=/dev/urandom` in a fresh directory under `Documents/` —
+BEFORE the fix this would have passed silently (bug confirmed by code
+reading, not re-tested on the old binary to save time). AFTER: detection
+triggered right at the 15th file
+(`recent_writes_global_unbaselined`, same threshold as the with-baseline
+case), all 20 files quarantined. 6 new unit tests added in
+`detector.rs` (global bypass with no baseline, container-format with no
+baseline, per-pid alone, identical thresholds baseline/no-baseline, a
+Pictures-type directory never baselined).
 
-**Fuite mémoire dans le détecteur (trouvé par l'audit "Fable", confirmé
-réel).** `record_and_check` purge la map interne d'une clé à chaque écriture
-sur cette même clé, mais ne retire jamais la clé externe elle-même une
-fois son contenu vidé - un PID qui écrit une fois puis ne revient jamais
-(l'écrasante majorité des PIDs sur un poste actif) laisse une entrée
-permanente dans `recent_writes_by_pid`. Ajouté `Detector::prune_expired`,
-appelé une fois par fenêtre de burst dans la boucle fanotify (throttled,
-pas à chaque évènement). Testé : 500 PIDs distincts, un seul appel après
-expiration de la fenêtre, la map est vide ensuite.
+**Memory leak in the detector (found by the "Fable" audit, confirmed
+real).** `record_and_check` purges a key's internal map entry on every
+write to that same key, but never removes the outer key itself once its
+content is emptied — a PID that writes once and never comes back (the
+overwhelming majority of PIDs on an active workstation) leaves a
+permanent entry in `recent_writes_by_pid`. Added
+`Detector::prune_expired`, called once per burst window in the fanotify
+loop (throttled, not on every event). Tested: 500 distinct PIDs, a
+single call after the window expires, the map is empty afterward.
 
-**Contournement complet de l'auto-quarantine par un utilisateur non
-privilégié (audit "Fable", confirmé réel et plus grave que documenté).**
-`package_manager::is_active()` ne vérifiait jamais l'UID du processus -
-`while :; do /usr/bin/rpm --version >/dev/null; done &` lancé par
-n'importe quel compte local suffisait à maintenir `is_active()` à `true`
-en continu, sans aucun privilège, suspendant l'auto-quarantine
-persistence/privesc en mode Enforce indéfiniment. Ajouté une vérification
-d'UID (0 = root, via le propriétaire du répertoire `/proc/<pid>`, pas
-`/proc/<pid>/status` - moins cher et pas falsifiable par le processus
-lui-même) - chaque cas légitime (apt/dnf/pacman réel, unattended-upgrade,
-update-initramfs) tourne déjà en root au moment où ça compte. Testé en
-plaçant un faux binaire nommé correctement dans un vrai `SYSTEM_BIN_DIRS`
-et en le lançant sous l'uid 65534 ("nobody") - passe tous les autres
-checks, rejeté uniquement par le nouveau contrôle d'UID.
+**Complete auto-quarantine bypass by an unprivileged user ("Fable"
+audit, confirmed real and worse than documented).**
+`package_manager::is_active()` never checked the process's UID —
+`while :; do /usr/bin/rpm --version >/dev/null; done &` launched by any
+local account was enough to keep `is_active()` continuously `true`,
+with no privileges at all, suspending persistence/privesc
+auto-quarantine in Enforce mode indefinitely. Added a UID check (0 =
+root, via the owner of the `/proc/<pid>` directory, not
+`/proc/<pid>/status` — cheaper and not forgeable by the process itself)
+— every legitimate case (real apt/dnf/pacman, unattended-upgrade,
+update-initramfs) already runs as root when it matters. Tested by
+placing a correctly-named fake binary in a real `SYSTEM_BIN_DIRS` and
+launching it under uid 65534 ("nobody") — passes every other check,
+rejected only by the new UID check.
 
-**Nom de fichier des honeypots fixe malgré le dossier randomisé (audit
-"Fable", confirmé réel).** Le dossier parent était bien randomisé par
-seed (`Confidential_Backup_<hex>`, 225 combinaisons), mais le fichier
-*à l'intérieur* était toujours littéralement `passwords_export.csv` ou
-`releve_compte.csv` - un `find / -name passwords_export.csv` trouve tous
-les honeypots sur la machine sans jamais avoir besoin du seed ni de
-connaître le schéma de nommage du dossier. Ajouté deux pools de noms de
-fichiers plausibles (`HONEYPOT_FILENAMES`, `HOME_HONEYPOT_FILENAMES`),
-dérivés du seed avec une rotation indépendante de celle du nom de
-dossier. Testé en direct sur `debian13` : honeypot re-provisionné sous
-`Documents/Classified_Contracts/vault_export.csv`, écriture dedans
-détectée et mis en quarantaine normalement (`honeypot touched:
-.../vault_export.csv`). Note : après mise à jour, l'ancien fichier au nom
-fixe reste orphelin dans le même dossier (pas de logique de migration
-ajoutée exprès - même raisonnement que pour les autres artefacts de
-honeypot déjà documenté : pas grave, pas de nettoyage automatique risqué).
+**Fixed honeypot filename despite the randomized folder ("Fable" audit,
+confirmed real).** The parent folder was properly seed-randomized
+(`Confidential_Backup_<hex>`, 225 combinations), but the file *inside*
+was always literally `passwords_export.csv` or `releve_compte.csv` — a
+`find / -name passwords_export.csv` finds every honeypot on the machine
+without ever needing the seed or knowing the folder naming scheme.
+Added two pools of plausible filenames (`HONEYPOT_FILENAMES`,
+`HOME_HONEYPOT_FILENAMES`), derived from the seed with a rotation
+independent from the folder name's. Tested live on `debian13`: honeypot
+re-provisioned under
+`Documents/Classified_Contracts/vault_export.csv`, writing to it
+detected and quarantined normally (`honeypot touched:
+.../vault_export.csv`). Note: after the update, the old fixed-name file
+stays orphaned in the same folder (no migration logic added on purpose
+— same reasoning as already documented for other honeypot artifacts:
+not serious, no risky automatic cleanup).
 
-**Échantillonnage d'entropie contournable en préfixant le fichier (audit
-"Fable", confirmé réel).** `read_sample_via_fd` ne lisait que les 8 Kio
-au tout début du fichier (offset 0). Un ransomware préfixant chaque
-fichier chiffré d'un en-tête en clair de 8 Kio (ou laissant le début du
-fichier original intact) passait systématiquement sous
-`entropy_threshold`, et pire, chaque écriture de ce type empoisonnait la
-baseline du répertoire via `note_plaintext_activity`. Remplacé par
-`sample_entropy_via_fd` : échantillonne 3 zones réparties (début, milieu,
-fin), retourne l'entropie MAXIMALE des trois (pas la moyenne, qui serait
-elle aussi contournable en diluant une zone à haute entropie avec du
-remplissage). Le sniffing de format container (ZIP/PDF/JPEG) reste basé
-sur le premier chunk (offset 0), où vivent les magic bytes de toute façon.
+**Entropy sampling bypassable by prefixing the file ("Fable" audit,
+confirmed real).** `read_sample_via_fd` only read the first 8 KiB at
+the very start of the file (offset 0). A ransomware prefixing every
+encrypted file with an 8 KiB plaintext header (or leaving the start of
+the original file intact) systematically slipped under
+`entropy_threshold`, and worse, every such write poisoned the
+directory's baseline via `note_plaintext_activity`. Replaced with
+`sample_entropy_via_fd`: samples 3 spread-out zones (start, middle,
+end), returns the MAXIMUM entropy of the three (not the average, which
+would also be bypassable by diluting a high-entropy zone with padding).
+Container-format sniffing (ZIP/PDF/JPEG) stays based on the first chunk
+(offset 0), where the magic bytes live anyway.
 
-**Sortie propre d'un module = perte de protection silencieuse (audit
-"Fable", confirmé - non atteignable aujourd'hui mais le type le
-permettait).** Chaque boucle de module est un `loop {}` sans `break`, donc
-un retour `Ok(())` propre n'était pas atteignable en pratique - mais le
-code le traitait comme un arrêt normal (`exit(0)`) si jamais ça arrivait,
-et `Restart=on-failure` de systemd ne redémarre PAS sur un exit 0. Corrigé
-: un retour `Ok(())` d'une boucle de module est maintenant traité comme
-fatal (exit non-zéro), pour que `Restart=on-failure` fonctionne quelle que
-soit la raison de l'arrêt. Ajouté un `WatchdogSec=30` avec ping
-périodique côté `main.rs` (`sd_notify::watchdog_enabled()`), et
-`StartLimitIntervalSec=120`/`StartLimitBurst=10` pour laisser une vraie
-chance de redémarrage après un échec transitoire sans non plus
-crash-looper indéfiniment.
+**Clean module exit = silent loss of protection ("Fable" audit,
+confirmed — not reachable today but the type allowed it).** Every
+module loop is a `loop {}` with no `break`, so a clean `Ok(())` return
+wasn't practically reachable — but the code treated it as a normal stop
+(`exit(0)`) if it ever happened, and systemd's `Restart=on-failure`
+does NOT restart on exit 0. Fixed: a module loop returning `Ok(())` is
+now treated as fatal (non-zero exit), so `Restart=on-failure` works
+regardless of the stop reason. Added a `WatchdogSec=30` with periodic
+ping on the `main.rs` side (`sd_notify::watchdog_enabled()`), and
+`StartLimitIntervalSec=120`/`StartLimitBurst=10` to give a real chance
+of restart after a transient failure without crash-looping forever
+either.
 
-**Durcissement systemd supplémentaire (audit "Fable") - une régression
-réelle trouvée en la testant en direct, corrigée avant de la garder.**
-Ajouté `RestrictAddressFamilies=AF_UNIX` et `ProtectProc=invisible` - les
-deux validés en direct (socket de contrôle, détection des 4 modules,
-lecture `/proc/<pid>` d'autres utilisateurs via `CAP_SYS_PTRACE` pour
-`package_manager`). `MemoryDenyWriteExecute=true` a été essayé aussi,
-mais **casse complètement le module yara** : `yara-x` compile les règles
-via un JIT `wasmtime`, qui a besoin de rendre une page mémoire
-inscriptible PUIS exécutable - exactement ce que cette directive bloque.
-Résultat en direct : le module yara panique au démarrage ("WASM module is
-not valid: unable to make memory executable"), ce qui - combiné au fait
-qu'un panic de module est fatal pour tout le démon - a fait entrer
-`warden.service` en crash-loop toutes les ~2s. Directive retirée avant de
-committer. Leçon confirmée une fois de plus : chaque directive de
-durcissement doit être testée en démarrant vraiment le service et en
-vérifiant que les 4 modules rapportent "ready", pas seulement que le
-process a démarré.
+**Additional systemd hardening ("Fable" audit) — a real regression
+found by testing it live, fixed before keeping it.** Added
+`RestrictAddressFamilies=AF_UNIX` and `ProtectProc=invisible` — both
+validated live (control socket, detection across the 4 modules,
+`/proc/<pid>` reads of other users via `CAP_SYS_PTRACE` for
+`package_manager`). `MemoryDenyWriteExecute=true` was also tried, but
+**completely breaks the yara module**: `yara-x` compiles rules via a
+`wasmtime` JIT, which needs to make a memory page writable THEN
+executable — exactly what this directive blocks. Result live: the yara
+module panics at startup ("WASM module is not valid: unable to make
+memory executable"), which — combined with the fact that a module
+panic is fatal for the whole daemon — sent `warden.service` into a
+crash-loop every ~2s. Directive removed before committing. Lesson
+confirmed once again: every hardening directive must be tested by
+actually starting the service and checking that all 4 modules report
+"ready", not just that the process started.
 
-**Ce qui a été délibérément documenté plutôt que codé (limitations
-d'architecture, pas des bugs).**
-- Le mode Enforce ne peut que constater après coup (fanotify
-  `FAN_CLASS_NOTIF`, pas `FAN_CLASS_CONTENT`/permission events) - un vrai
-  blocage synchrone existe côté kernel mais avec un risque de deadlock et
-  un coût de perf différents ; pas de changement d'architecture pour
-  aujourd'hui, seulement à documenter honnêtement dans le README (le
-  README actuel dit déjà "kills/quarantines it immediately", ce qui est
-  globalement correct - la détection est quasi-instantanée à l'échelle
-  humaine même si techniquement post-hoc).
-- Le seuil de burst est un débit (N fichiers / fenêtre), pas un volume
-  cumulatif long terme - un ransomware très lent (1 fichier/s) resterait
-  sous le radar indéfiniment. Un vrai compteur cumulatif long terme
-  demanderait de la persistance entre redémarrages pour ne pas être
-  trivialement contournable (redémarrer le service reset le compteur) -
-  hors scope pour cette passe, les honeypots restent le filet de sécurité
-  pour ce cas.
-- Coût CPU/fd du double mark fanotify filesystem-wide (ransomware + yara)
-  sur une machine très active en écriture - déjà `FAN_UNLIMITED_QUEUE`,
-  pas d'autre optimisation évidente sans changer d'approche (marks
-  par-répertoire, qui casserait la détection des sous-répertoires créés
-  après coup).
-- `ReadWritePaths` du service systemd : vérifié, déjà strictement le
-  minimum nécessaire (correspond exactement à ce que `package_manager`/
-  `quarantine`/`honeypot` touchent réellement) - pas une vraie régression
-  malgré ce que l'audit "Fable" laissait entendre.
-- Symlink loop dans `warden-ransomware/src/baseline.rs::seed()` - **vérifié
-  et non reproductible** : `DirEntry::metadata()` sur Unix utilise `lstat`
-  (ne suit pas les symlinks), confirmé par un test Rust minimal compilé
-  dans le conteneur de build (`entry.metadata().is_dir()` retourne `false`
-  pour un symlink, même pointant vers un répertoire réel). L'audit avait
-  tort sur ce point précis - noté pour ne pas perdre de temps dessus si ça
-  revient.
-- Ratio commentaires/code élevé (~26%, relevé par l'audit) - décision
-  délibérée de ne pas réduire : les commentaires de ce projet portent
-  presque tous une justification de sécurité durement acquise (un bypass
-  trouvé en red-team, une raison précise pour un choix de seuil...), pas
-  du bruit. Retirer ce contexte pour améliorer un ratio ferait perdre
-  exactement l'information qui a le plus de valeur pour un futur lecteur
-  ou contributeur.
+**What was deliberately documented rather than coded (architectural
+limitations, not bugs).**
+- Enforce mode can only act after the fact (fanotify `FAN_CLASS_NOTIF`,
+  not `FAN_CLASS_CONTENT`/permission events) — real synchronous
+  blocking exists kernel-side but with a different deadlock risk and
+  perf cost; no architecture change for today, just to document
+  honestly in the README (the current README already says "kills/
+  quarantines it immediately", which is broadly accurate — detection is
+  near-instant at human scale even if technically post-hoc).
+- The burst threshold is a rate (N files / window), not a long-term
+  cumulative volume — a very slow ransomware (1 file/s) would stay
+  under the radar indefinitely. A real long-term cumulative counter
+  would need persistence across restarts to not be trivially bypassed
+  (restarting the service resets the counter) — out of scope for this
+  pass, honeypots remain the safety net for this case.
+- CPU/fd cost of the double filesystem-wide fanotify mark (ransomware +
+  yara) on a very write-active machine — already `FAN_UNLIMITED_QUEUE`,
+  no other obvious optimization without changing approach (per-folder
+  marks, which would break detection of subdirectories created
+  afterward).
+- The systemd service's `ReadWritePaths`: checked, already strictly the
+  minimum necessary (matches exactly what `package_manager`/
+  `quarantine`/`honeypot` actually touch) — not a real regression
+  despite what the "Fable" audit implied.
+- Symlink loop in `warden-ransomware/src/baseline.rs::seed()` —
+  **checked and not reproducible**: `DirEntry::metadata()` on Unix uses
+  `lstat` (doesn't follow symlinks), confirmed by a minimal Rust test
+  compiled in the build container (`entry.metadata().is_dir()` returns
+  `false` for a symlink, even one pointing to a real directory). The
+  audit was wrong on this specific point — noted so as not to waste
+  time on it if it comes up again.
+- High comment-to-code ratio (~26%, flagged by the audit) — a
+  deliberate decision not to reduce it: this project's comments almost
+  all carry a hard-won security justification (a bypass found in
+  red-teaming, a precise reason for a threshold choice...), not noise.
+  Removing that context to improve a ratio would lose exactly the
+  information most valuable to a future reader or contributor.
 
-**Hygiène du dépôt - ajouté ce qui était mécanique et peu risqué.**
-`.github/workflows/test.yml` (build+test+clippy+cargo-audit sur tout le
-workspace, y compris `warden-gui` avec les dépendances GTK4/libadwaita -
-plus large que le `.yml` de la PR, qui ne couvrait que
-`warden-ransomware`). `--locked` ajouté aux trois invocations de `cargo
-build` dans `install.sh`. `cargo fmt --all -- --check` délibérément PAS
-ajouté à la CI : le style existant du projet (lignes larges, signatures
-sur une ligne) ne correspond pas aux réglages par défaut de rustfmt, et
-personne n'a demandé de reformater tout le dépôt - une CI rouge dès le
-premier push serait pire que pas de check du tout.
+**Repo hygiene — added what was mechanical and low-risk.**
+`.github/workflows/test.yml` (build+test+clippy+cargo-audit on the
+whole workspace, including `warden-gui` with its GTK4/libadwaita
+dependencies — broader than the PR's `.yml`, which only covered
+`warden-ransomware`). `--locked` added to the three `cargo build`
+invocations in `install.sh`. `cargo fmt --all -- --check` deliberately
+NOT added to CI: the project's existing style (wide lines, single-line
+signatures) doesn't match rustfmt's default settings, and nobody asked
+for the whole repo to be reformatted — a CI turning red on the very
+first push would be worse than no check at all.
 
-**Validation.** `cargo build/clippy -D warnings/test --workspace --locked`
-propres dans le conteneur Rocky Linux (72 tests, tous verts). `shellcheck`
-propre sur `install.sh`/`uninstall.sh`. Testé en direct de bout en bout
-sur `debian13` (KDE Plasma, utilisateur protégé `test`) : upgrade en place
-via `install.sh` (piège trouvé : `TARGET_USER` reprend `$SUDO_USER`, donc
-relancer `sudo ./install.sh` en étant connecté en SSH sous un autre compte
-que l'utilisateur protégé écrase la config pour le mauvais utilisateur -
-rattrapé avant que le drop-in systemd soit réécrit, relancé avec
-`WARDEN_TARGET_USER=test` explicite), reproduction du PoC exact de
-l'issue #1 (corrigé), honeypot au nouveau nom de fichier (détecté),
-restore-from-quarantine (toujours fonctionnel). Matrice dnf/pacman/zypper (Fedora/Arch/openSUSE, conteneurs
-systemd-as-PID1) relancée avec le code à jour : les trois passent propre
-(`install.sh` exit 0, service `active`, `uninstall.sh --purge` exit 0,
-aucun résidu - binaires/units/`/etc/warden`/`/var/lib/warden` tous
-absents après). Les 4 familles de gestionnaires de paquets sont donc
-validées avec le code d'aujourd'hui : apt en direct sur la VM (le seul
-test poussé jusqu'au bout fonctionnel, pas juste installation/suppression
-- PoC, honeypot, restore), dnf/pacman/zypper via la matrice Docker
-(installation/démarrage/suppression propres, pas de test fonctionnel
-poussé aussi loin que sur la VM - couverture jugée suffisante puisque le
-code Rust est strictement le même binaire partout, seule la partie
-gestionnaire de paquets d'`install.sh` change réellement d'un OS à
-l'autre).
+**Validation.** Clean `cargo build/clippy -D warnings/test --workspace
+--locked` in the Rocky Linux container (72 tests, all green).
+`shellcheck` clean on `install.sh`/`uninstall.sh`. Tested live
+end-to-end on `debian13` (KDE Plasma, protected user `test`): in-place
+upgrade via `install.sh` (trap found: `TARGET_USER` falls back to
+`$SUDO_USER`, so rerunning `sudo ./install.sh` while SSH'd in as a
+different account than the protected user overwrites the config for the
+wrong user — caught before the systemd drop-in got rewritten, rerun
+with an explicit `WARDEN_TARGET_USER=test`), reproduction of issue #1's
+exact PoC (fixed), honeypot under the new filename (detected),
+restore-from-quarantine (still working). dnf/pacman/zypper matrix
+(Fedora/Arch/openSUSE, systemd-as-PID1 containers) rerun with the
+up-to-date code: all three pass cleanly (`install.sh` exit 0, service
+`active`, `uninstall.sh --purge` exit 0, no residue — binaries/units/
+`/etc/warden`/`/var/lib/warden` all absent afterward). The 4
+package-manager families are therefore validated with today's code: apt
+live on the VM (the only test pushed all the way through functionally,
+not just install/remove — PoC, honeypot, restore), dnf/pacman/zypper via
+the Docker matrix (clean install/start/removal, not pushed as far
+functionally as on the VM — coverage judged sufficient since the Rust
+code is strictly the same binary everywhere, only `install.sh`'s
+package-manager part actually differs from one OS to another).
 
-## `install.sh` - choix interactif du mode (enforce/monitor) à l'install (25 août)
+## `install.sh` — interactive mode choice (enforce/monitor) at install time (Aug 25)
 
-Demande utilisateur : pouvoir choisir enforce ou monitor pendant
-l'installation plutôt que de toujours démarrer en enforce, pour que les
-gens qui veulent juste observer sans risque de faux positif puissent le
-faire dès le départ (le mode reste interchangeable après coup depuis la
-GUI ou `--set-mode`, donc ce choix n'est jamais définitif).
+User request: be able to choose enforce or monitor during installation
+rather than always starting in enforce, so people who just want to
+observe without risk of a false positive can do so from the start (the
+mode stays switchable afterward from the GUI or `--set-mode`, so this
+choice is never final).
 
-Ajouté un prompt interactif (`[ -t 0 ]`-gated, même pattern que le prompt
-rustup existant) juste avant l'écriture de `config.toml`, uniquement sur
-une install neuve - un re-run sur une install existante ne touche jamais
-le config déjà là, donc ce prompt ne peut pas surprendre-basculer une
-machine déjà protégée. Ajouté `WARDEN_INSTALL_MODE` (valeurs valides:
-`enforce`/`monitor`) comme override non-interactif, même précédence que
-`WARDEN_TARGET_USER`. Sans TTY et sans variable d'env, retombe sur
-enforce (comportement identique à avant ce changement) - un install
-scripté/CI n'est pas affecté.
+Added an interactive prompt (`[ -t 0 ]`-gated, same pattern as the
+existing rustup prompt) right before writing `config.toml`, only on a
+fresh install — rerunning on an existing install never touches the
+config already there, so this prompt can't surprise-flip an already
+protected machine. Added `WARDEN_INSTALL_MODE` (valid values:
+`enforce`/`monitor`) as a non-interactive override, same precedence as
+`WARDEN_TARGET_USER`. Without a TTY and without the env variable, falls
+back to enforce (identical behavior to before this change) — a
+scripted/CI install is unaffected.
 
-Pas de nouvelle surface de sécurité : ce code ne s'exécute qu'après le
-check `[ "$(id -u)" -eq 0 ]`, donc déjà en tant que root ; le choix
-"monitor" n'est pas une nouvelle capacité (déjà possible après coup via
-la GUI ou `--set-mode`, tous deux pkexec-gated) ; l'entrée est validée
-strictement contre `enforce`/`monitor` avant d'être écrite dans le TOML.
+No new security surface: this code only runs after the
+`[ "$(id -u)" -eq 0 ]` check, so already as root; choosing "monitor"
+isn't a new capability (already possible afterward via the GUI or
+`--set-mode`, both pkexec-gated); the input is strictly validated
+against `enforce`/`monitor` before being written to the TOML.
 
-**Testé en direct sur `debian13`, les 4 chemins :**
-- `WARDEN_INSTALL_MODE=monitor` (override, sans tty) → `mode = "monitor"`.
-- Prompt interactif, réponse "m" → `mode = "monitor"`, 4 modules ready.
-- Prompt interactif, Entrée (défaut) → `mode = "enforce"`.
-- Sans tty et sans override → `mode = "enforce"` avec warning, pas de
-  hang.
+**Tested live on `debian13`, all 4 paths:**
+- `WARDEN_INSTALL_MODE=monitor` (override, no tty) → `mode = "monitor"`.
+- Interactive prompt, answer "m" → `mode = "monitor"`, 4 modules ready.
+- Interactive prompt, Enter (default) → `mode = "enforce"`.
+- No tty and no override → `mode = "enforce"` with a warning, no hang.
 
-**Effet de bord découvert en testant "root direct vs sudo" (question
-explicite de l'utilisateur) :** en relançant `install.sh` en tant que
-root littéral (`su -`, sans passer par `sudo` - `$SUDO_USER` vide dans ce
-cas), la résolution de `TARGET_USER` retombe correctement sur le prompt
-"Desktop username..." (déjà le comportement voulu, code inchangé,
-confirmé en direct). Mais la détection cargo/rustc a trouvé un `cargo`
-système (paquet `cargo` installé sur cette VM, sans rapport avec
-`install.sh` - `dpkg -S /usr/bin/cargo` confirme que ce n'est pas un
-paquet que ce script installe) trop ancien (1.85.0) pour le `Cargo.lock`
-actuel (a besoin de 1.91.0), faisant échouer le build avec une erreur de
-résolution de dépendances cargo assez peu claire plutôt qu'un message
-explicite. Root a son propre rustup maintenant installé sur cette VM
-pour continuer le test - le script fonctionne bien une fois un toolchain
-compatible sur le PATH. Reste une vraie limitation générale
-(indépendante de root vs sudo) : `install.sh` vérifie seulement que
-`cargo` existe, jamais sa version, avant de tenter le build - sur une
-machine où un `cargo` système trop vieux traîne déjà sur le PATH, l'échec
-serait confus. Pas corrigé pour l'instant (hors scope de la demande du
-jour), signalé à l'utilisateur pour décision.
+**Side effect discovered while testing "direct root vs sudo" (an
+explicit user question):** when rerunning `install.sh` as literal root
+(`su -`, not through `sudo` — `$SUDO_USER` empty in that case),
+`TARGET_USER` resolution correctly falls back to the "Desktop
+username..." prompt (already the intended behavior, code unchanged,
+confirmed live). But the cargo/rustc detection found a system `cargo`
+(the `cargo` package installed on this VM, unrelated to `install.sh` —
+`dpkg -S /usr/bin/cargo` confirms it's not a package this script
+installs) too old (1.85.0) for the current `Cargo.lock` (needs
+1.91.0), making the build fail with a fairly unclear cargo
+dependency-resolution error rather than an explicit message. Root now
+has its own rustup installed on this VM to continue testing — the
+script works fine once a compatible toolchain is on the PATH. A real
+general limitation remains (independent of root vs sudo):
+`install.sh` only checks that `cargo` exists, never its version, before
+attempting the build — on a machine where an old system `cargo` already
+lingers on the PATH, the failure would be confusing. Not fixed for now
+(out of scope for today's request), flagged to the user for a decision.
 
-## Correctif du `cargo` système périmé, validé de bout en bout (25-26 août)
+## Fix for the outdated system `cargo`, validated end-to-end (Aug 25-26)
 
-Suite demandée par l'utilisateur ("corrige ça stp") : `install.sh`
-préfère maintenant systématiquement le toolchain rustup de
-`$INSTALL_FOR_USER` (`$INSTALL_FOR_HOME/.cargo/bin`) même quand un
-`cargo` est déjà trouvable sur le PATH courant - avant ce fix, il ne
-regardait `~/.cargo/bin` qu'en dernier recours, si `command -v cargo`
-avait déjà échoué, laissant un `cargo` distro-packagé plus tôt sur le
-PATH gagner silencieusement à chaque fois. Ajouté aussi un vrai check de
-version minimale (`MIN_RUSTC_VERSION`, actuellement 1.91.0) via
-`sort -V` - un `cargo` trop vieux est maintenant traité exactement comme
-"absent" (même prompt/même flux d'installation rustup), au lieu de
-foncer dans un `cargo build` voué à l'échec avec un mur d'erreurs de
-résolution de dépendances peu clair.
+Follow-up requested by the user ("fix that please"): `install.sh` now
+systematically prefers `$INSTALL_FOR_USER`'s rustup toolchain
+(`$INSTALL_FOR_HOME/.cargo/bin`) even when a `cargo` is already
+findable on the current PATH — before this fix, it only looked at
+`~/.cargo/bin` as a last resort, if `command -v cargo` had already
+failed, silently letting a distro-packaged `cargo` earlier on the PATH
+win every time. Also added a real minimum-version check
+(`MIN_RUSTC_VERSION`, currently 1.91.0) via `sort -V` — a too-old
+`cargo` is now treated exactly like "absent" (same prompt/same rustup
+install flow), instead of charging straight into a `cargo build`
+doomed to fail with a wall of unclear dependency-resolution errors.
 
-**Validé en direct sur `debian13`, dans un environnement non confondu**
-(via `sudo bash -c` non-login, PATH vanilla sans `.profile`/`.bashrc` -
-`which cargo` y résolvait bien `/usr/bin/cargo` 1.85.0 avant le fix) :
-process `cargo build` observé en train d'utiliser
-`/home/claude/.rustup/toolchains/stable-.../cargo`, pas le `/usr/bin/cargo`
-périmé. Build complet + install + démarrage des 3 services réussi,
-`mode=enforce`, les 4 modules ready, aucun panic.
+**Validated live on `debian13`, in an unconfounded environment** (via a
+non-login `sudo bash -c`, vanilla PATH without `.profile`/`.bashrc` —
+`which cargo` resolved to `/usr/bin/cargo` 1.85.0 there before the
+fix): observed the `cargo build` process actually using
+`/home/claude/.rustup/toolchains/stable-.../cargo`, not the outdated
+`/usr/bin/cargo`. Full build + install + start of the 3 services
+succeeded, `mode=enforce`, all 4 modules ready, no panic.
 
-**Incident pendant cette validation, signalé par l'utilisateur avant que
-je m'en rende compte moi-même** : une commande SSH lancée sans
-`setsid nohup ... & disown` (la même erreur déjà identifiée et évitée
-plus tôt dans cette session) a été tuée silencieusement quand la
-connexion a expiré côté client - le process distant est mort sans que je
-le remarque, et j'ai continué à dire "ça tourne encore" en me basant sur
-une hypothèse plutôt qu'une vérification. L'utilisateur a relevé "c'est
-pas normal que ce soit si long" / "ça a jamais pris plus de 20 minutes"
-avant que je vérifie l'état réel du process - vérification qui a
-confirmé qu'il était bien mort. Relancé correctement en détaché, terminé
-en ~5 minutes (3m17s pour le workspace principal + 1m28s pour l'eBPF),
-cohérent avec l'attente de l'utilisateur. Leçon reconfirmée : toujours
-vérifier l'état réel du process distant plutôt que de supposer qu'il
-tourne encore, surtout après un silence prolongé - et faire confiance au
-signal de l'utilisateur quand une durée lui semble anormale plutôt que
-de la rationaliser.
+**Incident during this validation, flagged by the user before I noticed
+it myself**: an SSH command launched without `setsid nohup ... &
+disown` (the same mistake already identified and avoided earlier in
+this session) got silently killed when the client-side connection timed
+out — the remote process died without me noticing, and I kept saying
+"it's still running" based on an assumption rather than a check. The
+user pointed out "this isn't normal, it's taking too long" / "it's
+never taken more than 20 minutes" before I checked the process's real
+state — a check that confirmed it was indeed dead. Relaunched correctly
+detached, finished in ~5 minutes (3m17s for the main workspace + 1m28s
+for eBPF), consistent with the user's expectation. Lesson reconfirmed:
+always check the remote process's actual state rather than assuming
+it's still running, especially after a prolonged silence — and trust
+the user's signal when a duration feels off to them rather than
+rationalizing it away.
 
-`README.md` mis à jour pour refléter le nouveau choix de mode interactif
-à l'install (n'affirme plus que `enforce` démarre "immédiatement" sans
-nuance) et pour mentionner `.github/workflows/test.yml`.
+`README.md` updated to reflect the new interactive mode choice at
+install (no longer claims `enforce` starts "immediately" without
+nuance) and to mention `.github/workflows/test.yml`.
 
-## SAST complet + 3 correctifs (WD-01/02/03), validés en direct sur `debian13` (26 août)
+## Full SAST + 3 fixes (WD-01/02/03), validated live on `debian13` (Aug 26)
 
-Suite à la demande explicite de l'utilisateur d'un SAST poussé (failles
-de sécurité, erreurs métier, robustesse), une lecture attentive de tout
-le workspace (~8700 lignes, 9 crates + le workspace eBPF séparé) a
-identifié 3 failles réelles ne recoupant aucun des points déjà fermés
-ci-dessus. Un rapport PDF détaillé avait été généré dans une session
-précédente mais son fichier temporaire a été perdu entre deux sessions
-(nettoyage du `/tmp` éphémère) - cette section fait donc foi comme trace
-durable des 3 findings et de leurs correctifs.
+Following the user's explicit request for a deep SAST pass (security
+flaws, logic errors, robustness), a careful read of the entire
+workspace (~8700 lines, 9 crates + the separate eBPF workspace)
+identified 3 real flaws not overlapping any of the points already
+closed above. A detailed PDF report had been generated in a previous
+session but its temp file was lost between sessions (ephemeral `/tmp`
+cleanup) — this section therefore stands as the durable record of the 3
+findings and their fixes.
 
-**WD-01 (CRITIQUE) - Bypass total du mode Enforce via nom de quarantaine
-trop long.** `Quarantine::take()` (`warden-common/src/quarantine.rs`)
-construisait `quarantine_name` en aplatissant le chemin original complet
-en un seul nom de fichier (`{stamp}_{module}_{pid}_{sanitized}`), sans
-jamais vérifier `NAME_MAX` (255 octets, la limite du noyau pour un seul
-composant de chemin). N'importe quel fichier détecté sous un chemin
-assez long faisait échouer `fs::rename` **et** le fallback `copy` avec
-`ENAMETOOLONG`, silencieusement (l'erreur n'était que loggée) - pour
-`persistence`/`privesc`/`yara` (aucun process à tuer, la quarantaine est
-leur seule remédiation), un contournement fiable à 100% du mode Enforce.
-Corrigé : le nom est maintenant tronqué à 255 octets (troncature au
-dernier point de coupure UTF-8 valide, jamais en plein milieu d'un
-caractère multi-octets), avec une empreinte (`DefaultHasher` du
-`&Path` original complet, avant troncature) insérée dans le nom pour
-garantir qu'aucune troncature ne peut faire collisionner deux chemins
-distincts sur le même nom de quarantaine. Tests ajoutés :
+**WD-01 (CRITICAL) — total Enforce-mode bypass via an overlong
+quarantine name.** `Quarantine::take()`
+(`warden-common/src/quarantine.rs`) built `quarantine_name` by
+flattening the entire original path into a single filename
+(`{stamp}_{module}_{pid}_{sanitized}`), without ever checking
+`NAME_MAX` (255 bytes, the kernel limit for a single path component).
+Any file detected under a long-enough path made `fs::rename` **and**
+the `copy` fallback fail with `ENAMETOOLONG`, silently (the error was
+only logged) — for `persistence`/`privesc`/`yara` (no process to kill,
+quarantine is their only remediation), a 100%-reliable Enforce-mode
+bypass. Fixed: the name is now truncated to 255 bytes (truncated at the
+last valid UTF-8 boundary, never mid-multi-byte-character), with a
+fingerprint (`DefaultHasher` of the full original `&Path`, before
+truncation) inserted into the name to guarantee no truncation can ever
+collide two distinct paths onto the same quarantine name. Tests added:
 `take_succeeds_on_an_overlong_original_path`,
 `truncated_overlong_names_still_stay_unique`.
-**Validé en direct** : fichier EICAR déposé sous `/tmp` avec un nom de
-254 caractères (composant aplati de 259 octets, au-delà de `NAME_MAX`)
-- détecté et **effectivement quarantiné** (`file quarantined
-original=/tmp/AAAA...(254 car).txt quarantined_as=.../1787768861_yara_
--1_486ea380b2efa725__tmp_AAAA...(tronqué).txt`), aucun `ENAMETOOLONG`,
-fichier original bien disparu du système de fichiers.
+**Validated live**: an EICAR file dropped under `/tmp` with a 254-
+character name (a 259-byte flattened component, past `NAME_MAX`) —
+detected and **actually quarantined** (`file quarantined
+original=/tmp/AAAA...(254 chars).txt quarantined_as=.../1787768861_yara_
+-1_486ea380b2efa725__tmp_AAAA...(truncated).txt`), no `ENAMETOOLONG`,
+original file genuinely gone from the filesystem.
 
-**WD-02 (MOYEN) - TOCTOU sur le scan YARA à la demande.**
-`warden-yara/src/scan.rs::walk()` vérifiait qu'un fichier n'était pas un
-symlink via `lstat` (`entry.file_type()`), puis rouvrait le fichier par
-chemin via `scanner.scan_file(&path)` - une deuxième résolution du
-chemin, séparée dans le temps de la première. N'importe quel process
-avec accès en écriture au répertoire scanné pouvait remplacer le
-fichier par un symlink entre les deux, faisant lire au démon (root, un
-scan à la demande peut être pointé n'importe où sous le home de
-l'appelant) un fichier arbitraire de son choix. Les moniteurs fanotify
-temps réel avaient déjà été corrigés pour ce même problème (lecture via
-fd `dup()`, cf. plus haut) ; ce chemin de code-là ne l'avait pas été.
-Corrigé : ouverture avec `O_NOFOLLOW` (le noyau refuse atomiquement
-d'ouvrir si le composant final est un symlink - plus de fenêtre entre
-un check et un open séparés), lecture et scan (`scanner.scan(&bytes)`,
-même approche que `read_via_fd`) via le descripteur déjà ouvert, jamais
-une deuxième résolution du chemin. Tests ajoutés :
-`opening_a_symlink_with_o_nofollow_is_deterministically_refused` (prouve
-le mécanisme sans course, de façon déterministe),
+**WD-02 (MEDIUM) — TOCTOU on the on-demand YARA scan.**
+`warden-yara/src/scan.rs::walk()` checked that a file wasn't a symlink
+via `lstat` (`entry.file_type()`), then reopened the file by path via
+`scanner.scan_file(&path)` — a second path resolution, separated in
+time from the first. Any process with write access to the scanned
+directory could swap the file for a symlink between the two, making the
+daemon (root, an on-demand scan can be pointed anywhere under the
+caller's home) read an arbitrary file of its choosing. The real-time
+fanotify monitors had already been fixed for this exact problem (read
+via a `dup()`'d fd, see above); this code path hadn't been. **Fix**:
+opened with `O_NOFOLLOW` (the kernel atomically refuses to open if the
+final component is a symlink — no more window between a separate check
+and open), read and scan (`scanner.scan(&bytes)`, same approach as
+`read_via_fd`) via the already-open descriptor, never a second path
+resolution. Tests added:
+`opening_a_symlink_with_o_nofollow_is_deterministically_refused`
+(proves the race-free mechanism deterministically),
 `a_symlinked_file_inside_a_real_directory_is_not_followed`.
-**Validé en direct** via le socket de contrôle (`StartScan` en tant que
-`test`, uid gate) : un répertoire ne contenant qu'un symlink vers un
-fichier EICAR situé hors de la racine scannée donne `files_scanned=0,
-matches_found=0` (le lien n'est pas suivi) ; un répertoire contenant un
-vrai fichier EICAR donne `files_scanned=1, matches_found=1` et
-l'entrée d'historique attendue (`module=yara-scan, action_taken=false`)
-- confirme qu'`O_NOFOLLOW` n'a introduit aucune régression fonctionnelle
-sur un scan légitime.
+**Validated live** via the control socket (`StartScan` as `test`, uid
+gate): a directory containing only a symlink to an EICAR file located
+outside the scanned root gives `files_scanned=0, matches_found=0` (the
+link isn't followed); a directory containing a real EICAR file gives
+`files_scanned=1, matches_found=1` and the expected history entry
+(`module=yara-scan, action_taken=false`) — confirms `O_NOFOLLOW`
+introduced no functional regression on a legitimate scan.
 
-**WD-03 (MOYEN) - DoS structurel du scan à la demande via panic non
-catché.** `ScanState::spawn()` (`warden-core/src/scan.rs`) lançait le
-scan sur un thread bloquant (`spawn_blocking`) sans jamais attendre son
-`JoinHandle`, et ne remettait `state.running` à `false` que sur un
-retour normal de la closure. Une panique n'importe où dans
-`scan_paths` (y compris dans `yara-x` lui-même, sur du contenu de
-fichier arbitraire) aurait unwind directement au-delà du `store(false,
-...)`, bloquant `running` à `true` pour toujours - plus aucun
-`StartScan` possible jusqu'au redémarrage du démon. Corrigé : l'appel à
-`scan_paths` tourne maintenant dans `std::panic::catch_unwind`, et
-`state.running.store(false, ...)` est déplacé hors du `catch_unwind`
-pour s'exécuter dans tous les cas (succès, `Err` métier, ou panique).
-Pas de test automatisé ajouté ici : forcer une vraie panique dans
-`yara-x` nécessiterait d'injecter un point de défaillance artificiel
-rien que pour la testabilité, ce qui serait de la sur-ingénierie pour
-ce dépôt (cf. philosophie KISS du projet) ; la correction est un
-idiome Rust standard, simple à vérifier par relecture, et validée
-indirectement en direct : les deux scans du test WD-02 ci-dessus
-montrent tous deux `running: false` après complétion normale, et un
-second `StartScan` immédiatement après le premier a bien été accepté
-(`ScanStarted`, pas `Error`) - donc `running` se réinitialise
-correctement sur le chemin normal. Comme lors de l'audit initial, aucun
-déclencheur de panique réel n'a été trouvé dans `yara-x` - ce risque
-reste structurel, pas démontré en conditions réelles.
+**WD-03 (MEDIUM) — structural DoS of the on-demand scan via an
+uncaught panic.** `ScanState::spawn()` (`warden-core/src/scan.rs`)
+launched the scan on a blocking thread (`spawn_blocking`) without ever
+awaiting its `JoinHandle`, and only reset `state.running` to `false` on
+a normal return from the closure. A panic anywhere in `scan_paths`
+(including inside `yara-x` itself, on arbitrary file content) would
+unwind straight past the `store(false, ...)`, leaving `running` stuck
+at `true` forever — no more `StartScan` possible until the daemon
+restarts. **Fixed**: the call to `scan_paths` now runs inside
+`std::panic::catch_unwind`, and `state.running.store(false, ...)` is
+moved outside `catch_unwind` to run in every case (success, business
+`Err`, or panic). No automated test added here: forcing a genuine panic
+in `yara-x` would require injecting an artificial failure point purely
+for testability, which would be over-engineering for this repo (per the
+project's KISS philosophy); the fix is a standard Rust idiom, easy to
+verify by reading, and indirectly validated live: both scans in the
+WD-02 test above show `running: false` after normal completion, and a
+second `StartScan` immediately after the first was properly accepted
+(`ScanStarted`, not `Error`) — so `running` does reset correctly on the
+normal path. As with the initial audit, no real panic trigger was found
+in `yara-x` — this risk stays structural, not demonstrated under real
+conditions.
 
-**Méthodologie de validation** : `cargo build/clippy -D warnings/test
---workspace/audit` dans `warden-build:rockylinux` (0 warning, 0 échec,
-aucune nouvelle alerte `cargo-audit` au-delà du `bincode` "unmaintained"
-déjà présent avant ces changements) ; puis build + `cargo test
---workspace` natif sur `debian13` (0 échec) - avec une découverte
-notable au passage : le démon Warden réel, actif sur cette VM et
-surveillant `/tmp` (module yara), quarantine les fichiers EICAR des
-tests unitaires en quelques dizaines de millisecondes, faisant
-échouer `scan::tests::a_real_directory_root_is_still_scanned_normally`
-par interférence (confirmé reproductible avec l'ancien ET le nouveau
-code - pas une régression, un conflit d'environnement entre le produit
-live et sa propre suite de tests). Services arrêtés le temps du `cargo
-test` natif, puis binaire `release` reconstruit et redéployé sur
-`debian13`, services redémarrés, et les 3 correctifs validés en direct
-contre le démon réel (voir ci-dessus) avant nettoyage complet des
-artefacts de test et confirmation finale : `mode=enforce`, 3 services
-`active`, aucun fichier setuid résiduel.
+**Validation methodology**: `cargo build/clippy -D warnings/test
+--workspace/audit` in `warden-build:rockylinux` (0 warnings, 0
+failures, no new `cargo-audit` alert beyond the already-present
+"unmaintained" `bincode` one) prior to these changes); then a native
+build + `cargo test --workspace` on `debian13` (0 failures) — with a
+notable discovery along the way: the real Warden daemon, active on this
+VM and watching `/tmp` (yara module), quarantines the unit tests' EICAR
+files within a few dozen milliseconds, making
+`scan::tests::a_real_directory_root_is_still_scanned_normally` fail by
+interference (confirmed reproducible with BOTH the old AND the new code
+— not a regression, an environment conflict between the live product
+and its own test suite). Services stopped for the duration of the
+native `cargo test`, then the `release` binary rebuilt and redeployed on
+`debian13`, services restarted, and the 3 fixes validated live against
+the real daemon (see above) before fully cleaning up test artifacts and
+final confirmation: `mode=enforce`, 3 services `active`, no residual
+setuid file.
 
-**Effet de bord découvert et corrigé au passage, sans rapport avec
-WD-01/02/03** : les tests de `warden-common/src/history.rs`
-utilisaient un chemin directement sous `std::env::temp_dir()` (`/tmp`)
-comme fichier cible ; `HistoryStore::new` réaffirme `0700` sur le
-répertoire parent de son chemin (même pattern que `Quarantine::new`),
-ce qui revenait à tenter un `chmod` sur `/tmp` lui-même - silencieusement
-inoffensif quand les tests tournent en root (le conteneur Docker), mais
-un `EPERM` garanti pour le cas bien plus ordinaire d'un développeur non-
-root lançant `cargo test` localement (exactement ce qui s'est produit
-sur `debian13`). Corrigé en donnant à chaque test son propre
-sous-répertoire qu'il possède réellement, comme le fait déjà
-`quarantine.rs`.
+**Side effect discovered and fixed along the way, unrelated to
+WD-01/02/03**: `warden-common/src/history.rs`'s tests used a path
+directly under `std::env::temp_dir()` (`/tmp`) as the target file;
+`HistoryStore::new` reasserts `0700` on its path's parent directory
+(the same pattern as `Quarantine::new`), which amounted to attempting a
+`chmod` on `/tmp` itself — silently harmless when tests run as root
+(the Docker container), but a guaranteed `EPERM` for the far more
+ordinary case of a non-root developer running `cargo test` locally
+(exactly what happened on `debian13`). Fixed by giving each test its
+own subdirectory that it genuinely owns, as `quarantine.rs` already
+does.
 
-Fichiers modifiés dans cette session :
+Files modified in this session:
 `warden-common/src/quarantine.rs`, `warden-common/src/history.rs`,
 `warden-core/src/scan.rs`, `warden-yara/src/scan.rs`.
