@@ -161,7 +161,17 @@ fn populate_dashboard(content: &gtk::Box, status: &StatusInfo) {
     modules_group.set_title("Modules");
     for m in &status.modules {
         let row = adw::ActionRow::builder().use_markup(false).title(&m.name).build();
-        let icon = gtk::Image::from_icon_name(if m.ready { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+        // Not `gtk::Image::from_icon_name` (`emblem-ok-symbolic` /
+        // `dialog-warning-symbolic`): those names resolve against the
+        // active GTK icon theme, and confirmed live on XFCE (which, unlike
+        // GNOME/KDE, has no hard dependency pulling in a theme that
+        // actually ships them) they fell back to GTK's generic "missing
+        // icon" glyph instead. A plain glyph in a `Label` has no icon-theme
+        // dependency at all, so it renders identically everywhere - the
+        // `success`/`warning` CSS classes (libadwaita's semantic color
+        // classes) apply the same way to a `Label` as they did to the
+        // `Image`.
+        let icon = gtk::Label::new(Some(if m.ready { "✓" } else { "⚠" }));
         icon.add_css_class(if m.ready { "success" } else { "warning" });
         row.add_suffix(&icon);
         row.set_subtitle(if m.ready { "Active" } else { "Not running" });
