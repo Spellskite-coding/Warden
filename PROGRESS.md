@@ -1791,3 +1791,151 @@ does.
 Files modified in this session:
 `warden-common/src/quarantine.rs`, `warden-common/src/history.rs`,
 `warden-core/src/scan.rs`, `warden-yara/src/scan.rs`.
+
+## Real-world install bug reports: zombie processes, a missing icon theme on XFCE, and Dismiss/Dismiss-all (Aug 29)
+
+The user installed Warden on their actual host (a real-world, full-scale
+test - `git clone` from the project's own GitHub remote, `sudo
+./install.sh`) and reported three problems from that use, plus one
+feature request. Reproduced and fixed all four; all validation for this
+session happened on `debian13`, never in Docker on the host - see the
+incident note below for why.
+
+**Zombie processes accumulating from desktop notifications (the
+headline bug).** Confirmed live: a burst of `privesc` detections
+(Docker's overlay2 storage driver placing a container's writable layer
+on the same filesystem `/tmp` lives on - see the incident note below -
+briefly exposed the container image's real setuid binaries under
+`/tmp/containerd-mountNNNNNNNNN`) produced dozens of Critical-severity
+notifications. Critical notifications never auto-expire (`expire_ms =
+0`) - a deliberate choice, a security alert shouldn't silently vanish -
+but with no distinct "just close this" affordance, the only way to make
+one go away was invoking the "default" action, which launches
+`warden-gui`. The user had to interact with every one of ~294
+notifications by hand to clear them, and every single one leaked a
+`[warden-gui] <defunct>` process:
+
+- `warden-notify-helper::launch_gui` called `std::process::Command::spawn()`
+  and immediately dropped the returned `Child` - nothing ever called
+  `wait()`/`waitpid()` on it, so the OS kept every exited `warden-gui`
+  around as a zombie forever. **Fixed**: switched to
+  `tokio::process::Command`, and the returned `Child` is now moved into
+  its own detached task that awaits `child.wait()` - reaped
+  unconditionally, without blocking the click-listener loop.
+- The root daemon's own `Notifier` (`warden-common/src/notify.rs`) had
+  the same class of bug one level up: it only reaped
+  `warden-notify-helper` when a *later* `notify()` call happened to
+  detect a broken stdin pipe - if no further detection ever fired, the
+  child stayed unreaped indefinitely. **Fixed**: the spawned `Child` now
+  moves into its own dedicated task immediately, which reaps it either
+  on its own exit or on an explicit kill request (a new `kill_tx`
+  oneshot channel replaces the previous direct `handle.child.start_kill()`).
+- **Feature added alongside the fix, requested by the user**: `dismiss`
+  and `dismiss-all` actions on every notification (`CloseNotification`
+  over D-Bus - the only daemon-independent way to actually close a
+  popup on command, not assumed as a side effect of any action). Handled
+  entirely inside `warden-notify-helper`, before ever reaching the
+  `launch_gui` path, so using them never spawns anything.
+
+**Validated live on `debian13`** (real KDE Plasma/D-Bus session, the
+target user `test`): captured the actual `Notify` D-Bus call live,
+confirmed the `dismiss`/`dismiss-all` actions are present in the real
+call. Forging the `ActionInvoked` click signal itself turned out to be
+not just impractical but actually impossible to do honestly: D-Bus
+refuses to let an unrelated connection claim to be the notification
+daemon (the bus stamps the true sender, `dbus-send`/`gdbus` can't spoof
+it), so the click→`launch_gui`→reap path couldn't be exercised through
+a forged signal - correctly so, that's exactly the guarantee that
+prevents any other local process from faking a click too. Instead,
+validated the reaping mechanism directly with a standalone reproduction
+(not shipped, run in a scratch directory on the VM) mirroring both
+patterns exactly: firing 300 fire-and-forget children the way
+`launch_gui` now does left 0 zombies; the same 300 spawns with the *old*
+pattern (`std::process::Command::spawn()`, `Child` dropped unawaited) -
+run as a negative control - left exactly 300, matching the user's real
+294 within the same order of magnitude. A third check killed a
+long-lived child mid-flight via `kill_tx`, mirroring `Notifier` on a
+broken pipe: reaped cleanly, 0 zombies.
+
+**Missing module-status icons on XFCE.** The Dashboard's per-module
+status icon (`emblem-ok-symbolic` / `dialog-warning-symbolic`, via
+`gtk::Image::from_icon_name`) rendered as GTK's generic "missing icon"
+glyph on the user's XFCE desktop, while working fine on GNOME/KDE -
+confirmed by screenshot. Root cause: those names resolve against
+whatever GTK icon theme is active, and unlike GNOME/KDE, XFCE has no
+hard dependency pulling one in that actually ships them. **Fixed**:
+replaced the `Image` with a `Label` showing a plain Unicode glyph (✓/⚠),
+keeping the same `success`/`warning` libadwaita CSS classes for color -
+zero icon-theme dependency, renders identically on every desktop
+environment. Not independently re-verified on a live XFCE session this
+round (the VM runs KDE Plasma) - the fix removes the dependency that
+caused the failure entirely, and doesn't touch anything KDE-specific,
+but the user should confirm on their actual XFCE desktop after
+deploying. `go-next-symbolic`/`view-refresh-symbolic` elsewhere in
+`warden-gui/src/ui.rs` use the same icon-name mechanism and were *not*
+touched - not confirmed broken on XFCE in what the user showed, flagged
+to them as worth checking rather than changed speculatively.
+
+**Install-time mode prompt "never appeared".** The user's fresh
+`install.sh` run ended up with `mode = "monitor"` but reported never
+being asked. Investigated rather than assumed: `git diff` confirmed
+`install.sh` on the host exactly matches this repo's current code (no
+drift), and `mode = "monitor"` is actually proof the interactive prompt
+*did* run - the only silent, non-interactive path (`[ -t 0 ]` false)
+unconditionally defaults to `enforce`, never `monitor`, so a silent
+fallback can be ruled out by the result alone. Isolated the exact prompt
+block (lines 493-514) into a standalone script and exercised all 4
+paths live on `debian13`: no tty + no override -> `enforce` with a
+warning; no tty + `WARDEN_INSTALL_MODE=monitor` -> `monitor`; a real
+pty answering "m" -> `monitor`. All behaved exactly as documented - no
+bug found in the script itself. Most likely explanation: the prompt did
+show and was answered, just not consciously noticed among the rest of
+the install output.
+
+**Docker/`privesc` interaction - investigated, deliberately not
+changed.** The user asked what "process" to add as an exception for the
+`containerd-mount*` false positives. Clarified rather than acted on
+literally: `privesc` is poll-based (no fanotify, see the `FAN_ATTRIB`
+limitation noted earlier in this file), so it has no PID attribution at
+all - there is no "process" to exempt in Warden's model. The exceptions
+system (`warden-common/src/exceptions.rs`) only supports an exact `File`
+(path + SHA-256) or `Directory` (exact path prefix, no glob) - since
+`containerd-mountNNNNNNNNN`'s suffix is different on every `docker run`,
+no durable exception is possible without either exempting the whole of
+`/tmp` (defeats the actual protection `privesc` gives there) or adding
+glob/prefix support to the exceptions matcher (a real change to a
+security-relevant matcher, not made without being asked). **User's
+explicit decision: leave `privesc`'s `/tmp` coverage and the exceptions
+system exactly as they are** - this EDR isn't meant to coexist with
+heavy Docker/dev workloads on the same machine, and that's fine as
+given.
+
+**Incident: Docker on the host is not isolated from Warden's own live
+detection, contradicting an initial (wrong) claim.** Mid-session, a
+`docker run ... cargo test --workspace` on the host (inside
+`warden-build:rockylinux`, believed safely sandboxed) produced a live
+burst of real Warden detections and, from an earlier occurrence the same
+day, the ~294-zombie incident this session exists to fix. Checked
+`ls` on the host immediately after a throwaway container had already
+exited and `--rm`-removed itself, found nothing, and incorrectly
+reported container/host `/tmp` isolation as confirmed intact. The user
+caught this by pointing at a live detection for the exact throwaway path
+just used inside that same container, timestamped to the same second.
+Root cause: Docker's overlay2 driver commonly places a container's
+writable layer on the same underlying filesystem as the host's `/tmp`
+(when `/var/lib/docker` isn't on its own mount) - `warden-yara`/
+`warden-ransomware` mark that whole filesystem via fanotify's
+`FAN_MARK_FILESYSTEM`, which operates below mount-namespace path
+virtualization, so a write inside a container's own `/tmp` view is
+still caught live while the container is alive, even though the same
+path is already gone from a plain `ls` moments later once the container
+is torn down - a post-hoc existence check is not a valid way to verify
+this kind of isolation. **Rule going forward, for as long as Warden is
+installed and live on the host**: all Warden build/test/lint validation
+happens on the dedicated `debian13` VM, never via Docker on the host,
+regardless of how well-isolated it appears.
+
+Files modified in this session:
+`warden-notify-helper/src/main.rs`, `warden-notify-helper/Cargo.toml`,
+`warden-common/src/notify.rs`, `warden-common/Cargo.toml`,
+`warden-gui/src/ui.rs`.
