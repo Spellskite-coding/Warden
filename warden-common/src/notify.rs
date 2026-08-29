@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -35,8 +35,18 @@ pub struct Notifier {
 }
 
 struct ChildHandle {
-    child: Child,
     stdin: tokio::process::ChildStdin,
+    /// Signals the background reaper task (spawned in `spawn_helper`) to
+    /// kill and wait on the child. A `oneshot::Sender` rather than keeping
+    /// the `Child` here directly: the `Child` itself lives inside that
+    /// task instead, so it is *always* under an active `wait()`/`select!`
+    /// and therefore always reaped the moment it exits - whether that's
+    /// because the parent asked it to die (this channel) or because it
+    /// died on its own (killed externally, crashed, ...). Keeping the
+    /// `Child` here and only calling `wait()` on the narrow "we detected a
+    /// broken pipe" path would leave it unreaped for as long as no further
+    /// notification happens to be sent afterward.
+    kill_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 #[derive(serde::Serialize)]
@@ -116,7 +126,29 @@ fn spawn_helper(target_uid: u32, target_gid: u32) -> Result<ChildHandle> {
     let stdout = child.stdout.take().context("helper has no stdout")?;
     tokio::spawn(read_clicks(stdout));
 
-    Ok(ChildHandle { child, stdin })
+    // A review found this daemon spawns `warden-notify-helper` but never
+    // unconditionally reaps it - only when a subsequent `notify()` call
+    // happened to detect a broken stdin pipe, which never happens at all
+    // if nothing gets detected again afterward. This root daemon must
+    // never leave a child process it spawned as a zombie, independent of
+    // its own later activity - so `child` moves into its own task here,
+    // which owns it for its entire remaining lifetime and reaps it either
+    // when it exits on its own or when asked to via `kill_tx`.
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) => info!(%status, "warden-notify-helper exited"),
+                Err(e) => warn!(error = %e, "waiting on warden-notify-helper failed"),
+            },
+            _ = kill_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+    });
+
+    Ok(ChildHandle { stdin, kill_tx })
 }
 
 /// Reads `ActionInvoked` lines the helper prints when the target user
@@ -194,8 +226,9 @@ impl Notifier {
         let Some(handle) = guard.as_mut() else { return };
         if let Err(e) = handle.stdin.write_all(line.as_bytes()).await {
             warn!(error = %e, uid = self.target_uid, "warden-notify-helper pipe broken, will respawn on next notification");
-            let _ = handle.child.start_kill();
-            *guard = None;
+            if let Some(handle) = guard.take() {
+                let _ = handle.kill_tx.send(());
+            }
         }
     }
 }
