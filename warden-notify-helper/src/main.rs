@@ -61,7 +61,20 @@ async fn send_notification(connection: &Connection, req: &NotifyRequest) -> Resu
     let expire_ms: i32 = if req.urgency == 2 { 0 } else { 10_000 };
     let mut hints: HashMap<&str, Value> = HashMap::new();
     hints.insert("urgency", Value::from(req.urgency));
-    let actions = vec!["default", "View details"];
+    // A review found that Critical detections (`urgency == 2` above) never
+    // auto-expire by design (a security alert silently vanishing on its
+    // own would be worse than one that lingers) - but with no visible
+    // "just close this" affordance, the only way to make one go away used
+    // to be invoking the "default" action, which launches the GUI. Under
+    // a burst of many detections (confirmed live: Docker temporarily
+    // exposing container image setuid binaries under a
+    // `containerd-mount*` bind mount, flagged by `privesc`), that meant
+    // clicking through dozens of notifications just to clear them off
+    // screen, leaking one `warden-gui` process per click (see
+    // `launch_gui`'s fix). `dismiss`/`dismiss-all` give a way to close a
+    // notification (or every currently open one) without ever launching
+    // anything.
+    let actions = vec!["default", "View details", "dismiss", "Dismiss", "dismiss-all", "Dismiss all"];
 
     let reply = connection
         .call_method(
@@ -135,6 +148,18 @@ async fn run_listener(correlations: Arc<Mutex<HashMap<u32, (String, Instant)>>>)
     }
 }
 
+/// `CloseNotification` is the only reliable, daemon-independent way to
+/// make a popup go away on command - relying on the notification daemon
+/// to auto-close on any action invocation is common but not something
+/// the freedesktop spec actually guarantees, and it would leave
+/// `dismiss-all` (which has to close notifications *other than* the one
+/// the user actually clicked) with nothing to do at all.
+async fn close_notification(connection: &Connection, id: u32) {
+    let _ = connection
+        .call_method(Some("org.freedesktop.Notifications"), "/org/freedesktop/Notifications", Some("org.freedesktop.Notifications"), "CloseNotification", &(id,))
+        .await;
+}
+
 async fn run_listener_once(correlations: &Arc<Mutex<HashMap<u32, (String, Instant)>>>) -> Result<()> {
     let connection = connect().await?;
     let proxy = Proxy::new(
@@ -152,6 +177,20 @@ async fn run_listener_once(correlations: &Arc<Mutex<HashMap<u32, (String, Instan
     let mut stdout = tokio::io::stdout();
     while let Some(msg) = stream.next().await {
         let Ok((notif_id, action)) = msg.body().deserialize::<(u32, String)>() else { continue };
+
+        if action == "dismiss-all" {
+            let ids: Vec<u32> = correlations.lock().ok().map(|mut m| std::mem::take(&mut *m).into_keys().collect()).unwrap_or_default();
+            for id in ids {
+                close_notification(&connection, id).await;
+            }
+            continue;
+        }
+        if action == "dismiss" {
+            correlations.lock().ok().and_then(|mut m| m.remove(&notif_id));
+            close_notification(&connection, notif_id).await;
+            continue;
+        }
+
         let incident = correlations.lock().ok().and_then(|mut map| map.remove(&notif_id));
         let Some((incident_id, _)) = incident else { continue };
 
@@ -227,14 +266,33 @@ fn session_environment() -> Vec<(String, String)> {
 /// itself. Best-effort: a user who hasn't installed the GUI yet, or
 /// whose desktop session can't launch it for some reason, must never
 /// take this listener down over it.
+///
+/// Uses `tokio::process::Command`, not `std::process::Command`: a review
+/// found the previous code called `.spawn()` and immediately dropped the
+/// returned `Child`, which means nothing ever calls `wait()`/`waitpid()`
+/// on it - the OS keeps every exited `warden-gui` around as a zombie
+/// until *something* reaps it, and dropping a `std::process::Child`
+/// never does. Confirmed live: closing (or a notification daemon
+/// auto-invoking the "default" action on) a burst of alerts left
+/// hundreds of `[warden-gui] <defunct>` entries behind. Spawning the
+/// reap itself as its own task (rather than awaiting it inline) matters
+/// too - this function must return immediately either way, since
+/// `warden-gui` normally stays open until the user closes it, and this
+/// is called from the single-threaded click-listener loop that must keep
+/// handling further clicks in the meantime.
 fn launch_gui(incident_id: &str) {
-    let mut command = std::process::Command::new(gui_path());
+    let mut command = tokio::process::Command::new(gui_path());
     command.arg("--incident").arg(incident_id);
     for (key, value) in session_environment() {
         command.env(key, value);
     }
     match command.spawn() {
-        Ok(_) => info!(incident_id, "launched warden-gui for clicked notification"),
+        Ok(mut child) => {
+            info!(incident_id, "launched warden-gui for clicked notification");
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
         Err(e) => warn!(incident_id, error = %e, "failed to launch warden-gui"),
     }
 }
